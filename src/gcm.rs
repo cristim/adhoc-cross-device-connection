@@ -135,6 +135,52 @@ pub fn open_truncated(
     Some(plaintext)
 }
 
+/// Encrypt-and-tag with a truncated tag — the inverse of [`open_truncated`],
+/// used by M3 to build our own Handoff advert. Returns `(ciphertext, tag)`
+/// where `tag` is `tag_len` bytes (1 for a Handoff advert).
+///
+/// Like the open path, this is spec-derived and UNVALIDATED against real Apple
+/// traffic; a seal/open round-trip is the only guarantee so far.
+pub fn seal_truncated(
+    key: &[u8],
+    iv: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+    tag_len: usize,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    if key.len() != 16 || tag_len == 0 || tag_len > BLOCK {
+        return None;
+    }
+    let cipher = Aes128::new(aes::cipher::generic_array::GenericArray::from_slice(key));
+    let h = aes_block(&cipher, &[0u8; BLOCK]);
+    let j0 = j0_short_iv(&h, iv);
+
+    // CTR encrypt from inc32(J0).
+    let mut ciphertext = Vec::with_capacity(plaintext.len());
+    let mut counter = inc32(j0);
+    for chunk in plaintext.chunks(BLOCK) {
+        let ks = aes_block(&cipher, &counter);
+        let mut block = chunk.to_vec();
+        xor_into(&mut block, &ks[..chunk.len()]);
+        ciphertext.extend_from_slice(&block);
+        counter = inc32(counter);
+    }
+
+    // S = GHASH_H(A_padded || C_padded || [len(A)]_64 || [len(C)]_64)
+    let mut blocks: Vec<[u8; BLOCK]> = Vec::new();
+    pad_blocks(aad, &mut blocks);
+    pad_blocks(&ciphertext, &mut blocks);
+    let mut len_block = [0u8; BLOCK];
+    len_block[..8].copy_from_slice(&((aad.len() as u64) * 8).to_be_bytes());
+    len_block[8..].copy_from_slice(&((ciphertext.len() as u64) * 8).to_be_bytes());
+    blocks.push(len_block);
+    let s = ghash(&h, &blocks);
+
+    let mut full_tag = aes_block(&cipher, &j0);
+    xor_into(&mut full_tag, &s);
+    Some((ciphertext, full_tag[..tag_len].to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +226,17 @@ mod tests {
 
         // A wrong tag must be rejected.
         assert!(open_truncated(&key, &iv, &aad, &ct, &[tag[0] ^ 0xff]).is_none());
+    }
+
+    #[test]
+    fn seal_then_open() {
+        let key = [0x22u8; 16];
+        let iv = [0x13u8, 0x37];
+        let aad = [0x08u8];
+        let plaintext = b"clipboard!"; // 10 bytes
+        let (ct, tag) = seal_truncated(&key, &iv, &aad, plaintext, 1).expect("seal");
+        assert_eq!(tag.len(), 1);
+        let out = open_truncated(&key, &iv, &aad, &ct, &tag).expect("open");
+        assert_eq!(out, plaintext);
     }
 }
