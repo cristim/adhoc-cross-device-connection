@@ -126,6 +126,10 @@ cargo test               # runs the gcm + advert unit tests
 
 # Offline decrypt of a single captured advert:
 ./target/release/handoff-clip decrypt --keys keys.json --data 0c0e08....
+
+# No keys needed:
+./target/release/handoff-clip capture     # grab a raw advert to validate the decrypt
+./target/release/handoff-clip discover     # browse _companion-link._tcp (the M2 AWDL test)
 ```
 
 Requires a running `bluetoothd` (BlueZ) and a Bluetooth adapter. Set
@@ -152,22 +156,36 @@ Produce a `keys.json`:
 
 ## Roadmap
 
-- **M1 — discover + decrypt adverts** *(current)*. Detect on Linux when a nearby
-  same-Apple-ID device copies to the Universal Clipboard. BLE only; no content.
-- **M2 — pull clipboard content.** After a copy is announced, act as the
-  companion-link client: discover the `_companion-link._tcp` service over
-  mDNS, run Apple's **Pair-Verify** handshake (Curve25519 ECDH authenticated
-  with the Ed25519 long-term keys from the `RPIdentity-SameAccountDevice`
-  keychain identities), derive session keys, and pull the clipboard payload
-  (**ChaCha20-Poly1305**, **OPACK**-encoded). Hand the result to `wl-copy`.
-  - **Transport risk:** Apple normally runs this over **AWDL**. The Asahi Wi-Fi
-    driver (`brcmfmac`) has **no monitor mode**, so the open-source AWDL stack
-    (OWL) won't run here. **First test whether the exchange also works over the
-    regular Wi-Fi / mDNS path** before committing to any AWDL work — if
-    `_companion-link._tcp` is reachable over the LAN, M2 is tractable; if it's
-    AWDL-only, it becomes a driver-level project.
-- **M3 — reverse direction (Linux → Apple).** Emit our own Handoff adverts and
-  serve companion-link requests so a copy on Linux pastes on the iPhone/Mac.
+- **M1 — discover + decrypt adverts** *(code complete; crypto unvalidated)*.
+  Detect on Linux when a nearby same-Apple-ID device copies to the Universal
+  Clipboard. BLE only; no content. `scan`, `capture`, `decrypt` subcommands.
+- **M2 — pull clipboard content** *(scaffolded; blocked on keys + AWDL test)*.
+  After a copy is announced, act as the companion-link client: discover
+  `_companion-link._tcp` over mDNS, run Apple's **Pair-Verify** handshake
+  (Curve25519 ECDH authenticated with the Ed25519 long-term keys from the
+  `RPIdentity-SameAccountDevice` identities), derive session keys, and pull the
+  clipboard payload (**ChaCha20-Poly1305**, **OPACK**-encoded), then `wl-copy`.
+  - **Built and offline-tested now:** `opack.rs`, `tlv8.rs`, and `companion.rs`
+    (HKDF-SHA512, the ChaCha20-Poly1305 content channel, ContinuityPacket
+    framing, and the Pair-Verify M1–M4 client with a full local loopback test).
+    The `discover` subcommand is **live-runnable** with no keys.
+  - **Still missing:** the real `RPIdentity` key export (only the BLE key is
+    exported today); the TCP client that actually drives Pair-Verify against a
+    device; and the clipboard-fetch OPACK request/response. None of the
+    companion-link crypto is validated against a real device, and the
+    Pair-Verify ChaCha nonce construction is an explicit TODO.
+  - **Transport risk (the gating experiment):** Apple normally runs this over
+    **AWDL**. The Asahi Wi-Fi driver (`brcmfmac`) has **no monitor mode**, so
+    the open-source AWDL stack (OWL) won't run here. **Run `handoff-clip
+    discover` first** — if `_companion-link._tcp` resolves over the ordinary
+    LAN while your devices are awake and nearby, M2 is tractable; if nothing
+    ever resolves, the transport is AWDL-only and M2 becomes a driver-level
+    project.
+- **M3 — reverse direction (Linux → Apple)** *(advert builder only)*.
+  `advertise.rs` builds our own Handoff advert bytes via `gcm::seal_truncated`
+  (round-trip tested). Actually broadcasting via BlueZ LE advertising, and
+  serving the companion-link pull, are documented stubs pending keys and a
+  validated receive path.
 
 ---
 
