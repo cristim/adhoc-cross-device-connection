@@ -152,6 +152,23 @@ Produce a `keys.json`:
 
 (The loader also accepts a raw exported keychain binary plist directly.)
 
+### Key handling & anti-leak
+
+The exported AES keys are sensitive, so they never touch an unencrypted or
+synced location:
+
+- `export-keys.sh` writes only into `~/Library/Application Support/handoff-clip`
+  (inside FileVault, **not** iCloud-synced `~/Desktop`/`~/Documents`), `chmod
+  600`, and `tmutil`-excluded so Time Machine won't back it up.
+- It arms a **one-shot LaunchAgent** that deletes the export on your next macOS
+  login and then removes itself — the keys survive exactly one Linux session.
+- On Linux, [`scripts/import-keys-from-macos.sh`](scripts/import-keys-from-macos.sh)
+  mounts the macOS volume **read-only** (`apfs-fuse`, FileVault-unlocked) and
+  reads `keys.json` in place, so it never leaves encrypted storage in transit.
+- Caveat: `rm` on an APFS SSD is **not** a cryptographic erase (copy-on-write +
+  wear-leveling). FileVault-at-rest is the real protection; the auto-wipe is
+  hygiene. Re-exporting is cheap, so we wipe aggressively.
+
 ---
 
 ## Roadmap

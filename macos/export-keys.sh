@@ -3,14 +3,92 @@
 # same Apple ID as your iPhone) to export the Continuity BLE encryption keys
 # that handoff-clip needs on the Linux side.
 #
-# The keys are long-term and iCloud-synced, so you only need to re-run this if
-# they rotate (rare) or you add a device. Copy the resulting keys.json to your
-# Linux/Asahi partition.
+# Key handling / anti-leak design:
+#   * Keys are written ONLY inside your FileVault-encrypted home, never to a
+#     synced or shared folder, so they are encrypted at rest.
+#       - target dir: ~/Library/Application Support/handoff-clip
+#       - NOT ~/Desktop or ~/Documents (iCloud-synced when Desktop&Documents on)
+#   * The dir is excluded from Time Machine (tmutil) so no backup copy leaks.
+#   * File mode is 600 (owner-only).
+#   * A one-shot LaunchAgent is installed that, on your NEXT macOS login,
+#     deletes the exported keys and then removes itself. So the export survives
+#     exactly one Linux session and macOS wipes it automatically afterwards.
+#   * Caveat: on an SSD with APFS copy-on-write + wear-leveling, deletion does
+#     NOT cryptographically erase the bytes. FileVault-at-rest is the actual
+#     protection; the auto-wipe is hygiene, not a secure erase. Re-exporting is
+#     cheap (keys are long-term + iCloud-synced), so we wipe aggressively.
 #
-# There are two extraction paths. Try A first; if it comes up empty, use B.
+# On Linux/Asahi, pull the file with scripts/import-keys-from-macos.sh, which
+# mounts this volume READ-ONLY so the key never leaves encrypted storage.
+#
+# Two extraction paths below. Try A first; if it comes up empty, use B.
 
 set -euo pipefail
-OUT="${1:-keys.json}"
+
+EXPORT_DIR="$HOME/Library/Application Support/handoff-clip"
+LABEL="app.handoffclip.cleanup"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+CLEANUP_SH="$EXPORT_DIR/cleanup.sh"
+
+mkdir -p "$EXPORT_DIR"
+chmod 700 "$EXPORT_DIR"
+# Keep Time Machine from backing up the keys.
+tmutil addexclusion "$EXPORT_DIR" 2>/dev/null || true
+
+# install_autowipe: drop a one-shot LaunchAgent that fires on the NEXT login
+# (we do NOT launchctl-load it now, so it won't wipe the file we just wrote).
+install_autowipe() {
+    cat > "$CLEANUP_SH" <<CLEAN
+#!/bin/bash
+# One-shot: erase the handoff-clip key export, then remove self.
+/bin/rm -f "$EXPORT_DIR/keys.json" "$EXPORT_DIR/keys.plist" "$EXPORT_DIR/dump.json" 2>/dev/null
+/bin/launchctl bootout "gui/\$(id -u)/$LABEL" 2>/dev/null || true
+/bin/rm -f "$AGENT_PLIST"
+/bin/rm -f "$CLEANUP_SH"
+/bin/rmdir "$EXPORT_DIR" 2>/dev/null || true
+CLEAN
+    chmod 700 "$CLEANUP_SH"
+
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat > "$AGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$CLEANUP_SH</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+    echo
+    echo "Auto-wipe armed: next macOS login will delete the export and remove the agent."
+    echo "  (to wipe right now instead:  bash \"$CLEANUP_SH\" )"
+}
+
+secure_finish() {
+    # $1 = path just written
+    chmod 600 "$1"
+    install_autowipe
+    echo
+    echo "Exported to: $1"
+    echo "On Linux:    ./scripts/import-keys-from-macos.sh   (mounts this volume read-only)"
+}
+
+# Called as `export-keys.sh --arm-autowipe-only` after a manual Path B
+# conversion: just arm the auto-wipe for the file already in place, then stop.
+if [ "${1:-}" = "--arm-autowipe-only" ]; then
+    [ -f "$EXPORT_DIR/keys.json" ] && chmod 600 "$EXPORT_DIR/keys.json"
+    install_autowipe
+    echo "Armed auto-wipe for $EXPORT_DIR/keys.json"
+    exit 0
+fi
 
 echo "== Path A: security CLI (works if the items are readable in your login keychain)"
 # The Continuity keys are generic-password items under this service. They are
@@ -18,20 +96,17 @@ echo "== Path A: security CLI (works if the items are readable in your login key
 # them depending on macOS version and ACL. We ask for the raw data blob (a
 # binary plist) and let the Rust side parse it.
 if security find-generic-password -s "com.apple.continuity.encryption" -w >/tmp/hc_key.hex 2>/dev/null; then
-    xxd -r -p /tmp/hc_key.hex > /tmp/hc_key.plist
-    plutil -convert xml1 /tmp/hc_key.plist -o /tmp/hc_key.xml
-    echo "Exported one raw keychain item to /tmp/hc_key.plist"
+    xxd -r -p /tmp/hc_key.hex > "$EXPORT_DIR/keys.plist"
+    rm -f /tmp/hc_key.hex
+    echo "Exported one raw keychain item."
     echo "NOTE: security CLI returns only ONE item. If you have multiple devices,"
     echo "      use Path B to capture all keys."
-    # Emit our JSON with just this one; keyData is inside the plist, so we hand
-    # the raw plist to handoff-clip instead:
-    cp /tmp/hc_key.plist "${OUT%.json}.plist"
-    echo "Wrote ${OUT%.json}.plist — pass THAT file to handoff-clip (it parses plists too)."
-    rm -f /tmp/hc_key.hex
+    echo "handoff-clip parses this plist directly (pass it as --keys)."
+    secure_finish "$EXPORT_DIR/keys.plist"
     exit 0
 fi
 
-cat <<'EOF'
+cat <<EOF
 Path A returned nothing (expected on recent macOS — the item ACL blocks the
 plain security CLI).
 
@@ -40,28 +115,28 @@ plain security CLI).
 This uses seemoo-lab's keychain_access tool, which hooks SecItemCopyMatching in
 rapportd and prints every Continuity key for all your iCloud devices.
 
-  1. Disable SIP once (Recovery -> Terminal -> `csrutil disable`, reboot).
+  1. Disable SIP once (Recovery -> Terminal -> \`csrutil disable\`, reboot).
   2. pip3 install frida-tools    # or: brew install frida
   3. git clone https://github.com/seemoo-lab/apple-continuity-tools
   4. In System Settings -> General -> AirDrop & Handoff, turn Handoff OFF.
-  5. sudo python3 apple-continuity-tools/keychain_access/keychain_access.py rapportd -o dump.json
+  5. sudo python3 apple-continuity-tools/keychain_access/keychain_access.py rapportd \\
+         -o "$EXPORT_DIR/dump.json"
   6. Turn Handoff back ON. rapportd reloads the keys; they print into dump.json.
   7. Ctrl-D to stop.
 
-Then convert dump.json to handoff-clip's keys.json with the bundled converter
-(pure Python stdlib; runs on macOS or Linux):
+Then convert the dump to keys.json IN THE SECURE DIR (pure Python stdlib):
 
-    python3 "$(dirname "$0")/dump-to-keys.py" dump.json -o keys.json
+    python3 "$(dirname "$0")/dump-to-keys.py" \\
+        "$EXPORT_DIR/dump.json" -o "$EXPORT_DIR/keys.json"
+    chmod 600 "$EXPORT_DIR/keys.json"
+    rm -f "$EXPORT_DIR/dump.json"          # the dump holds ALL keys in plaintext
+    bash "$(dirname "$0")/export-keys.sh" --arm-autowipe-only
 
   dump-to-keys.py walks the whole dump, decodes every hex/base64/plist blob it
-  finds, and keeps the ones that parse to a keychain item carrying `keyData`
+  finds, and keeps the ones that parse to a keychain item carrying \`keyData\`
   (service "com.apple.continuity.encryption"). It skips wrapped keys (not
-  directly usable) and unrelated items automatically, and emits:
+  directly usable) and unrelated items automatically.
 
-    { "keys": [ { "id": "<keyIdentifier>", "key": "<keyData as hex>" }, ... ] }
-
-  Add --include-wrapped to inspect wrapped keys if the usable set comes up empty.
-
-Copy keys.json to your Linux partition and run:  handoff-clip scan --keys keys.json
+Then on Linux:  ./scripts/import-keys-from-macos.sh
 EOF
 exit 1
