@@ -48,16 +48,19 @@ rapportd and prints every Continuity key for all your iCloud devices.
   6. Turn Handoff back ON. rapportd reloads the keys; they print into dump.json.
   7. Ctrl-D to stop.
 
-Then convert dump.json to handoff-clip's format:
+Then convert dump.json to handoff-clip's keys.json with the bundled converter
+(pure Python stdlib; runs on macOS or Linux):
 
-  Each captured item with service "com.apple.continuity.encryption" has a
-  binary-plist value containing keyData (the AES key) and keyIdentifier.
-  Produce keys.json shaped like:
+    python3 "$(dirname "$0")/dump-to-keys.py" dump.json -o keys.json
+
+  dump-to-keys.py walks the whole dump, decodes every hex/base64/plist blob it
+  finds, and keeps the ones that parse to a keychain item carrying `keyData`
+  (service "com.apple.continuity.encryption"). It skips wrapped keys (not
+  directly usable) and unrelated items automatically, and emits:
 
     { "keys": [ { "id": "<keyIdentifier>", "key": "<keyData as hex>" }, ... ] }
 
-  (A small jq/python one-liner in the README does this once you see the dump
-  structure — it varies slightly by macOS version.)
+  Add --include-wrapped to inspect wrapped keys if the usable set comes up empty.
 
 Copy keys.json to your Linux partition and run:  handoff-clip scan --keys keys.json
 EOF
