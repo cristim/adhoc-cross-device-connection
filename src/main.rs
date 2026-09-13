@@ -9,9 +9,14 @@
 //! README roadmap.
 
 mod advert;
+mod advertise;
+mod companion;
+mod discover;
 mod gcm;
 mod keystore;
+mod opack;
 mod scan;
+mod tlv8;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -35,6 +40,10 @@ enum Cmd {
     /// Capture raw Handoff adverts as hex (no keys needed), to grab a packet
     /// for validating the decrypt against your own devices.
     Capture,
+    /// Browse for `_companion-link._tcp` over mDNS (no keys needed). The live
+    /// test of whether the M2 content channel is reachable over plain LAN vs.
+    /// AWDL-only. See src/discover.rs.
+    Discover,
     /// Decrypt a single advertisement supplied as a hex string (offline test).
     Decrypt {
         #[arg(short, long)]
@@ -73,6 +82,12 @@ async fn main() -> Result<()> {
             let scanner = scan::Scanner::new_capture().await?;
             tokio::select! {
                 r = scanner.run_capture() => r?,
+                _ = tokio::signal::ctrl_c() => tracing::info!("stopping"),
+            }
+        }
+        Cmd::Discover => {
+            tokio::select! {
+                r = discover::run() => r?,
                 _ = tokio::signal::ctrl_c() => tracing::info!("stopping"),
             }
         }
