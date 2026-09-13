@@ -1,6 +1,12 @@
 //! BLE scanning via BlueZ (D-Bus). Listens for Apple manufacturer data, tries
-//! to parse it as a Handoff/Universal-Clipboard advertisement, and decrypts it
-//! with every key we hold until one authenticates.
+//! to parse it as a Handoff/Universal-Clipboard advertisement, and (in scan
+//! mode) decrypts it with every key we hold until one authenticates.
+//!
+//! Two modes share the discovery loop:
+//!   * `run()` – decrypt-and-report (needs keys).
+//!   * `run_capture()` – print each raw Handoff advert as hex, ready to paste
+//!     into `handoff-clip decrypt --data <hex>`. Needs no keys; used to grab a
+//!     validation packet from your own devices.
 
 use anyhow::{Context, Result};
 use bluer::{Adapter, AdapterEvent, DeviceEvent, DeviceProperty};
@@ -9,27 +15,47 @@ use std::collections::HashMap;
 
 use crate::advert::{self, HandoffBle, HandoffPayload};
 use crate::gcm;
-use crate::keystore::KeyStore;
+use crate::keystore::{HandoffKey, KeyStore};
 
 pub struct Scanner {
     adapter: Adapter,
-    store: KeyStore,
+    keys: Vec<HandoffKey>,
+    capture: bool,
 }
 
 impl Scanner {
     pub async fn new(store: KeyStore) -> Result<Self> {
+        Self::build(store.keys, false).await
+    }
+
+    /// Keyless capture mode: just surface raw Handoff adverts as hex.
+    pub async fn new_capture() -> Result<Self> {
+        Self::build(Vec::new(), true).await
+    }
+
+    async fn build(keys: Vec<HandoffKey>, capture: bool) -> Result<Self> {
         let session = bluer::Session::new().await.context("connecting to bluetoothd")?;
         let adapter = session.default_adapter().await.context("no BLE adapter")?;
         adapter.set_powered(true).await.context("powering on adapter")?;
         tracing::info!(adapter = %adapter.name(), "using BLE adapter");
-        Ok(Scanner { adapter, store })
+        Ok(Scanner { adapter, keys, capture })
     }
 
     pub async fn run(&self) -> Result<()> {
+        tracing::info!("scanning for Apple Continuity advertisements (Ctrl-C to stop)");
+        self.discover_loop().await
+    }
+
+    pub async fn run_capture(&self) -> Result<()> {
+        tracing::info!("capture mode: printing raw Handoff adverts (Ctrl-C to stop)");
+        println!("# paste a line into: handoff-clip decrypt --keys keys.json --data <hex>");
+        self.discover_loop().await
+    }
+
+    async fn discover_loop(&self) -> Result<()> {
         let discover = self.adapter.discover_devices().await?;
         pin_mut!(discover);
 
-        tracing::info!("scanning for Apple Continuity advertisements (Ctrl-C to stop)");
         while let Some(evt) = discover.next().await {
             let AdapterEvent::DeviceAdded(addr) = evt else {
                 continue;
@@ -38,26 +64,21 @@ impl Scanner {
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            // Inspect current manufacturer data, then follow changes.
             if let Ok(Some(md)) = device.manufacturer_data().await {
-                self.handle(addr, &md);
+                self.worker().handle(addr, &md);
             }
-            let store_empty = self.store.is_empty();
             let events = match device.events().await {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            // Spawn a lightweight follower per device so multiple phones/Macs
-            // can announce concurrently.
-            let this = self.clone_lite();
+            // One lightweight follower per device so several phones/Macs can
+            // announce concurrently.
+            let worker = self.worker();
             tokio::spawn(async move {
                 pin_mut!(events);
                 while let Some(ev) = events.next().await {
                     if let DeviceEvent::PropertyChanged(DeviceProperty::ManufacturerData(md)) = ev {
-                        this.handle(addr, &md);
-                        if store_empty {
-                            // Nothing to decrypt with; still useful to see hits.
-                        }
+                        worker.handle(addr, &md);
                     }
                 }
             });
@@ -65,27 +86,21 @@ impl Scanner {
         Ok(())
     }
 
-    /// A cheap clone that shares the keys by value (keys are small).
-    fn clone_lite(&self) -> ScannerLite {
-        ScannerLite {
-            keys: self.store.keys.clone(),
+    fn worker(&self) -> Worker {
+        Worker {
+            keys: self.keys.clone(),
+            capture: self.capture,
         }
-    }
-
-    fn handle(&self, addr: bluer::Address, md: &HashMap<u16, Vec<u8>>) {
-        ScannerLite {
-            keys: self.store.keys.clone(),
-        }
-        .handle(addr, md);
     }
 }
 
 #[derive(Clone)]
-struct ScannerLite {
-    keys: Vec<crate::keystore::HandoffKey>,
+struct Worker {
+    keys: Vec<HandoffKey>,
+    capture: bool,
 }
 
-impl ScannerLite {
+impl Worker {
     fn handle(&self, addr: bluer::Address, md: &HashMap<u16, Vec<u8>>) {
         let Some(data) = advert::apple_manufacturer_data(md) else {
             return;
@@ -94,6 +109,11 @@ impl ScannerLite {
             return;
         };
         tracing::debug!(%addr, status = ble.status, ctr = ?ble.counter_iv, "handoff advert");
+
+        if self.capture {
+            self.capture_line(addr, data, &ble);
+            return;
+        }
 
         // Try each key until the 1-byte tag authenticates.
         for k in &self.keys {
@@ -110,6 +130,30 @@ impl ScannerLite {
                 }
             }
         }
+    }
+
+    /// Print a raw advert for offline validation. We emit the normalized
+    /// `0c ..` TLV (what `decrypt --data` and `HandoffBle::parse` accept),
+    /// plus the decoded framing so byte-order assumptions can be eyeballed.
+    fn capture_line(&self, addr: bluer::Address, raw: &[u8], ble: &HandoffBle) {
+        let mut tlv = Vec::with_capacity(2 + ble.ciphertext.len() + 4);
+        let len = (1 + 2 + 1 + ble.ciphertext.len()) as u8; // status+iv+tag+ct
+        tlv.push(0x0c);
+        tlv.push(len);
+        tlv.push(ble.status);
+        tlv.extend_from_slice(&ble.counter_iv);
+        tlv.extend_from_slice(&ble.tag);
+        tlv.extend_from_slice(&ble.ciphertext);
+        println!(
+            "{addr}  {tlv}   # raw_mfg={raw} status={status:#04x} iv={iv} tag={tag} ct={ct}",
+            addr = addr,
+            tlv = hex::encode(&tlv),
+            raw = hex::encode(raw),
+            status = ble.status,
+            iv = hex::encode(ble.counter_iv),
+            tag = hex::encode(ble.tag),
+            ct = hex::encode(&ble.ciphertext),
+        );
     }
 
     fn report(&self, addr: bluer::Address, key_id: &str, p: &HandoffPayload) {

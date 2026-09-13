@@ -32,6 +32,9 @@ enum Cmd {
         #[arg(short, long, default_value = "keys.json")]
         keys: PathBuf,
     },
+    /// Capture raw Handoff adverts as hex (no keys needed), to grab a packet
+    /// for validating the decrypt against your own devices.
+    Capture,
     /// Decrypt a single advertisement supplied as a hex string (offline test).
     Decrypt {
         #[arg(short, long)]
@@ -63,6 +66,13 @@ async fn main() -> Result<()> {
             let scanner = scan::Scanner::new(store).await?;
             tokio::select! {
                 r = scanner.run() => r?,
+                _ = tokio::signal::ctrl_c() => tracing::info!("stopping"),
+            }
+        }
+        Cmd::Capture => {
+            let scanner = scan::Scanner::new_capture().await?;
+            tokio::select! {
+                r = scanner.run_capture() => r?,
                 _ = tokio::signal::ctrl_c() => tracing::info!("stopping"),
             }
         }
