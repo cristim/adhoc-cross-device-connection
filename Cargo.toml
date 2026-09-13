@@ -1,0 +1,25 @@
+[package]
+name = "handoff-clip"
+version = "0.1.0"
+edition = "2021"
+description = "Receive Apple Universal Clipboard / Handoff BLE announcements on Linux by reusing keys exported from macOS"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+futures = "0.3"
+bluer = { version = "0.17", features = ["bluetoothd"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+plist = "1"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# AES-GCM built from primitives: Apple uses a 2-byte IV and a 1-byte
+# authentication tag, neither of which the high-level `aes-gcm` crate supports.
+aes = "0.8"
+ghash = "0.5"
+cipher = "0.4"
