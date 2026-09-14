@@ -160,8 +160,8 @@ def main():
         entry = {"id": kid, "key": key.hex()}
         if wrapped:
             entry["wrapped"] = True
-        if len(key) != 16:
-            entry["note"] = f"unexpected key length {len(key)} (BLE key is AES-128 = 16 bytes)"
+        if len(key) not in (16, 24, 32):
+            entry["note"] = f"unexpected key length {len(key)} (expected a 16, 24 or 32-byte AES key; macOS 26.1 exports 32)"
         keys.append(entry)
 
     if not keys:

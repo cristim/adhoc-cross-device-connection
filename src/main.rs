@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
                     &[ble.status],
                     &ble.ciphertext,
                     &ble.tag,
-                ) {
+                )? {
                     let payload = advert::HandoffPayload::parse(&plain);
                     println!("decrypted with key {}: {}", k.id, hex::encode(&plain));
                     if let Some(p) = payload {

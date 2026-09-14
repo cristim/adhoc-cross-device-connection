@@ -18,14 +18,14 @@ use crate::gcm;
 pub const FLAG_CLIPBOARD_AVAILABLE: u8 = 0x08;
 
 pub struct HandoffAdvertBuilder {
-    /// AES-128 BLE key (same `keyData` used to decrypt).
-    key: [u8; 16],
+    /// BLE key (same `keyData` used to decrypt): 16, 24 or 32 bytes.
+    key: Vec<u8>,
     /// Monotonic advertisement counter, used as the GCM IV.
     counter: u16,
 }
 
 impl HandoffAdvertBuilder {
-    pub fn new(key: [u8; 16]) -> Self {
+    pub fn new(key: Vec<u8>) -> Self {
         HandoffAdvertBuilder { key, counter: 0 }
     }
 
@@ -33,8 +33,8 @@ impl HandoffAdvertBuilder {
     /// `activity_hash` is the 7-byte truncated SHA-512 of the activity string;
     /// `flags` is the payload flag byte (set `FLAG_CLIPBOARD_AVAILABLE`).
     ///
-    /// Returns `None` if sealing fails (bad key length only).
-    pub fn build(&mut self, activity_hash: [u8; 7], flags: u8) -> Option<Vec<u8>> {
+    /// Fails only on a bad key length.
+    pub fn build(&mut self, activity_hash: [u8; 7], flags: u8) -> Result<Vec<u8>, gcm::GcmError> {
         let status = 0x08u8; // "data copied" plaintext status (status A convention)
         let iv = self.counter.to_le_bytes();
 
@@ -56,7 +56,7 @@ impl HandoffAdvertBuilder {
         tlv.extend_from_slice(&ct);
 
         self.counter = self.counter.wrapping_add(1);
-        Some(tlv)
+        Ok(tlv)
     }
 
     /// The Apple company id (0x004c) our manufacturer data must be registered
@@ -80,8 +80,8 @@ mod tests {
 
     #[test]
     fn build_parses_and_decrypts_back() {
-        let key = [0x5Au8; 16];
-        let mut b = HandoffAdvertBuilder::new(key);
+        let key = vec![0x5Au8; 16];
+        let mut b = HandoffAdvertBuilder::new(key.clone());
         let hash = [1, 2, 3, 4, 5, 6, 7];
         let tlv = b.build(hash, FLAG_CLIPBOARD_AVAILABLE).expect("build");
 
@@ -89,6 +89,7 @@ mod tests {
         let ble = HandoffBle::parse(&tlv).expect("parse");
         // ...and the truncated tag must verify, yielding the payload we put in.
         let plain = gcm::open_truncated(&key, &ble.counter_iv, &[ble.status], &ble.ciphertext, &ble.tag)
+            .expect("valid key")
             .expect("decrypt");
         assert_eq!(&plain[1..8], &hash);
         assert!(HandoffFlags::from_byte(plain[8]).clipboard_available());
@@ -96,7 +97,7 @@ mod tests {
 
     #[test]
     fn counter_increments_across_adverts() {
-        let mut b = HandoffAdvertBuilder::new([0u8; 16]);
+        let mut b = HandoffAdvertBuilder::new(vec![0u8; 16]);
         let a1 = b.build([0; 7], 0).unwrap();
         let a2 = b.build([0; 7], 0).unwrap();
         // IV bytes (indices 3..5 of the TLV) must differ.

@@ -67,7 +67,7 @@ see it start at the `0c` TLV — the parser accepts both framings.)
 
 | Parameter | Value |
 |-----------|-------|
-| Key       | `keyData` from the keychain (AES-128, 16 bytes) |
+| Key       | `keyData` from the keychain, used as-is: 16, 24 or 32 bytes (AES-128/192/256, selected by length, as the seemoo-lab reference does via CryptoSwift). A real macOS 26.1 export yielded 32-byte keys, i.e. AES-256, matching Apple's Platform Security guide ("AES-256 in GCM mode") |
 | IV        | the 2-byte advertisement counter (as-is, little-endian on the wire) |
 | AAD       | the single plaintext `STATUS` byte |
 | Tag       | **truncated to 1 byte** |
