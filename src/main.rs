@@ -17,6 +17,8 @@ mod keystore;
 mod opack;
 mod scan;
 mod tlv8;
+mod transfer;
+mod transfer_ble;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -44,6 +46,17 @@ enum Cmd {
     /// test of whether the M2 content channel is reachable over plain LAN vs.
     /// AWDL-only. See src/discover.rs.
     Discover,
+    /// Receive an exported `keys.json` from a Mac over Bluetooth LE.
+    ///
+    /// Runs a GATT server; on the Mac run `ac-dc send-key`. An ephemeral X25519
+    /// handshake protects the untrusted BLE link; both ends print a 6-digit
+    /// code (SAS) that you must compare before confirming. keys.json is written
+    /// (mode 0600) only after you confirm the codes matched.
+    ReceiveKey {
+        /// Where to write the received key file.
+        #[arg(short, long, default_value = "keys.json")]
+        out: PathBuf,
+    },
     /// Decrypt a single advertisement supplied as a hex string (offline test).
     Decrypt {
         #[arg(short, long)]
@@ -88,6 +101,12 @@ async fn main() -> Result<()> {
         Cmd::Discover => {
             tokio::select! {
                 r = discover::run() => r?,
+                _ = tokio::signal::ctrl_c() => tracing::info!("stopping"),
+            }
+        }
+        Cmd::ReceiveKey { out } => {
+            tokio::select! {
+                r = transfer_ble::receive_key(&out) => r?,
                 _ = tokio::signal::ctrl_c() => tracing::info!("stopping"),
             }
         }
