@@ -1,12 +1,23 @@
 # M2 transport spike: reaching companion-link over AWDL on Linux
 
 **Status:** research spike + plan. Nothing here has been built or validated
-against a real device. This documents on-machine diagnostics, a feasibility
-call between two routes to AWDL on Linux, and a concrete first-implementation
+against a real device. This documents on-machine diagnostics and a feasibility
+call between three routes to AWDL on Linux, plus a concrete first-implementation
 plan for the recommended route.
 
 **Machine under test:** Apple MacBook Pro (13-inch, M1, 2020) — `apple,j293` /
 `apple,t8103` — running Asahi/Arch, kernel `7.1.13-1-1-ARCH`.
+
+> **Update (Route C supersedes A and B).** A later read-only spike found that the
+> built-in BCM4378's Apple firmware *already contains the AWDL subsystem*, and
+> that the Asahi `brcmfmac` driver already exposes a userspace path to send
+> arbitrary firmware iovars (the same BCDC control channel macOS drives AWDL
+> over). This reframes the whole problem: instead of reimplementing AWDL on a
+> second radio in monitor mode (Route B) or patching firmware (Route A), we may
+> be able to **turn on the firmware's native AWDL by mimicking the `awdl*`
+> iovars macOS sends** — no monitor mode, no nexmon, no firmware patch, no
+> second dongle. See **§7 "Route C"**, which is now the RECOMMENDED route.
+> Routes A and B below are retained for context but are superseded by C.
 
 ---
 
@@ -305,7 +316,15 @@ as a follow-up after inline text works.
 
 ---
 
-## 6. Recommendation
+## 6. Recommendation (SUPERSEDED — see §7)
+
+> This section originally recommended Route B. A later spike (§7) found a more
+> direct, lower-cost route — **Route C: drive the built-in firmware's native
+> AWDL from the host over iovars** — and **Route C is now the recommended
+> route.** Route B remains the best *fallback* if Route C's firmware AWDL
+> stack turns out to be unreachable or too incomplete to peer.
+
+*Original text, retained for the record:*
 
 Pursue **Route B**. Buy an **AR9271** (`ath9k_htc`) USB dongle, stand up **OWL**
 on it to get an `awdl0` interface, and use `ac-dc discover` (triggered by a copy
@@ -316,3 +335,316 @@ socket driver against the existing Pair-Verify state machine. Route A (patching
 `brcmfmac`/nexmon for the BCM4378) is a multi-month, possibly-infeasible
 research project with no existing foundation for this chip and an Apple-signed
 firmware obstacle — not recommended.
+
+Note that the RPIdentity export (§4.1), the companion-link TCP socket driver
+(§4.2), and the `_companion-link._tcp` mDNS-over-`awdl0` work are **transport-
+independent**: they are needed no matter whether `awdl0` comes from OWL-on-a-
+dongle (B) or from the built-in firmware (C), so that work proceeds in parallel
+regardless of which transport wins.
+
+---
+
+## 7. Route C — firmware-native AWDL via host iovars (macOS-mimic) — **RECOMMENDED**
+
+**Verdict: this is the route to pursue first.** It needs *no* second radio, *no*
+monitor mode, *no* nexmon, and *no* firmware patch to *reach* the AWDL engine.
+The premise, backed by the on-machine evidence and prior art below, is that the
+BCM4378's own Apple firmware already implements the AWDL subsystem, and that
+macOS turns it on by sending proprietary `awdl*` **iovars** down the ordinary
+Broadcom **BCDC control channel** — the same channel the Asahi `brcmfmac` driver
+already speaks and already exposes to userspace. So "enable AWDL" reduces to
+"replay the iovar sequence macOS sends," host-side, against the radio the machine
+already has.
+
+This supersedes Route A (no firmware patching — we *use* Apple's firmware as-is)
+and Route B (no dongle needed to bring up `awdl0`). **But note the honest wall in
+§7.3/§7.7: two existing projects get the AWDL *control* plane working this way yet
+neither gets the *data* plane (actual unicast transfer) working** — which is
+exactly what a companion-link TCP pull needs. So C is recommended to *try first*
+(it is cheap and prototypable today), with B retained as the fallback (§7.8).
+
+### 7.1 Evidence 1 — the firmware contains the AWDL subsystem
+
+All read-only (`strings`, no sudo, no driver/firmware/network changes).
+
+Firmware selected for this board (`apple,j293`, confirmed via
+`/proc/device-tree/compatible`) is the `brcmfmac4378b1-pcie.apple,*` family;
+representative file inspected: `brcmfmac4378b1-pcie.apple,atlantisb.bin`. Its
+embedded build tag:
+
+```
+<FW-TAG>4378b1-roml/config_pcie_perf_udm Version=18.20.383.15.7.8.150
+        Date=2023-05-13T07:25:54Z FWID=01-b37727a5
+```
+
+AWDL-related plain strings present in the 4378 image:
+
+```
+awdl
+awdl_doiovar_patch
+awdl_psf_dwell
+```
+
+The **4364** sibling (`brcmfmac4364b3-pcie.apple,hanauma.bin`), less aggressively
+packed, exposes more of the same subsystem:
+
+```
+awdl              awdl_doiovar_patch   awdl_psf_dwell
+wlc_awdl_attach   wlc_awdl_aw_set      master_slice_mask_2g / master_slice_mask_5g
+```
+
+What these tell us:
+
+- **`awdl_doiovar_patch`** — the name of the firmware's **AWDL iovar dispatch
+  handler** (`do_iovar` for the `awdl` namespace). Its existence confirms AWDL is
+  *driven by iovars*, i.e. host-issued BCDC commands. Linchpin of the route.
+- **`wlc_awdl_attach`** — the WLC-layer AWDL module init: AWDL is a first-class
+  firmware subsystem (`wlc_awdl_*`), same shape as `wlc_p2p_*`.
+- **`wlc_awdl_aw_set`** — sets the AWDL **Availability Window** (channel-hop
+  schedule); **`awdl_psf_dwell`** — the **Periodic Sync Frame** dwell timing;
+  **`master_slice_mask_*`** — per-band channel-slice masks. These being firmware
+  parameters means PSF tx and fine TSF are **handled in firmware** (§7.4).
+
+**Honesty about compression.** These `.bin` images are largely compressed/packed
+(the 1.37 MB 4378 image yields only ~8.3k printable strings; reclaim/relocated
+sections read as garbage — `@CYBYA`, `Reclaim section %s: returned %d bytes`).
+The AWDL strings above are only the ones in the **uncompressed loader/patch
+region**. The *full* `awdl` **iovar name table** lives in the compressed body and
+the firmware's internal dispatch table, **not as plain strings** — so `strings`
+alone cannot enumerate the sub-iovar surface. We *confirmed the subsystem is
+present and iovar-driven*; the exact sub-iovar catalog comes from RE (§7.2/§7.6),
+not from this machine's strings. The board **nvram** `.txt`
+(`...atlantisb-RASP-m.txt`) is pure RF/board calibration with **no AWDL knobs** —
+consistent with AWDL being enabled at runtime by iovar, not nvram.
+
+### 7.2 Evidence 2 — the Asahi `brcmfmac` already lets userspace send iovars (**the crux**)
+
+This is what makes Route C *prototypable today without a kernel rebuild.* The
+loaded module `/lib/modules/7.1.13-1-1-ARCH/.../brcmfmac/brcmfmac.ko` (vermagic
+`7.1.13-1-1-ARCH … aarch64`) contains all of:
+
+```
+# nl80211 VENDOR-COMMAND passthrough to the BCDC control channel:
+brcmf_cfg80211_vndr_cmds_dcmd_handler   brcmf_vndr_cmds   brcmf_vndr_dcmd_hdr
+BRCMF_VNDR_CMDS_DCMD (enum: UNSPEC/DCMD/LAST)   oui_type / "%s: invalid OUI"
+# the in-kernel iovar API, EXPORTED to other modules:
+brcmf_fil_iovar_data_set  (__ksymtab_… -> EXPORT_SYMBOL)   brcmf_fil_iovar_data_get
+# the BCDC control channel underneath:
+brcmf_proto_bcdc_{set,query}_dcmd   brcmf_msgbuf_{set,query}_dcmd
+```
+
+Two userspace-reachable paths therefore exist in the shipped driver with **no
+patch required to *send iovars***:
+
+1. **nl80211 vendor command** — `NL80211_CMD_VENDOR` with the **Broadcom OUI
+   `0x00:10:18`**, subcommand `BRCMF_VNDR_CMDS_DCMD` (=1), and a
+   `NL80211_ATTR_VENDOR_DATA` blob shaped as `struct brcmf_vndr_dcmd_hdr {uint
+   cmd; int len; uint offset; uint set; uint magic;}` + payload. An iovar SET is
+   `cmd = WLC_SET_VAR (263)`, payload `"awdl\0"` + body; `WLC_GET_VAR (262)` to
+   read. Nested attrs `BRCMF_NLATTR_LEN=1` / `BRCMF_NLATTR_DATA=2`; max request
+   ≈ `BRCMF_DCMD_MAXLEN` 8192. **Recommended prototyping surface** — pure
+   userspace, `CAP_NET_ADMIN`, no build. (`iw dev wlan0 vendor …`, a small libnl
+   program, or the ready-made `brcmiovar.py` from the prior-art project below.)
+2. **A tiny out-of-tree kmod** could instead call the exported
+   `brcmf_fil_iovar_data_set(ifp, "awdl", buf, len)` directly — the literal call
+   the driver makes internally.
+
+Confirmed interface state (read-only): only `wlan0` (type `managed`, associated
+to the user's AP); **no `awdl0`**; `iw` 6.17 present. The Apple vendor sub-module
+`brcmfmac-wcc.ko` is only a firmware/feature selector (`feat_attach`) — no AWDL
+logic of its own; the AWDL logic is all in firmware.
+
+> **Crux answered: YES** — the shipped Asahi driver lets us send/probe arbitrary
+> firmware iovars from userspace with no kernel rebuild. A kernel patch is needed
+> only later, to materialize the `awdl0` **netdev** and forward AWDL **events**
+> (see §7.5), not to reach the iovars.
+
+**Important caveat on error reporting:** brcmfmac collapses every firmware error
+to `-EBADE`, so a probe must read back `bcmerror`/`bcmerrorstr` to tell
+UNSUPPORTED (iovar absent) from BADARG/NOTUP. Many `awdl*` iovars are
+**bsscfg-scoped** — they must be prefixed `bsscfg:` / targeted at the AWDL bsscfg
+index once it exists.
+
+### 7.3 Prior art — TWO existing projects already do this (control plane works, data plane does not)
+
+The parallel research turned up two GitHub projects doing exactly the
+firmware-iovar (not monitor-mode) approach on Broadcom-Apple chips. **This is the
+most important input to Route C** — it de-risks the "can we reach AWDL" question
+and sharply defines where the wall is.
+
+- **`andreanicassio/brcmfmac-awdl`** (BCM4364/4377/4378; T2 + Apple Silicon).
+  The most on-point work. Ships `brcmiovar.py` (pure-Python nl80211 vendor-cmd
+  iovar sender — our path #1 above, ready to use), `iovars-awdl.txt` (AWDL iovar
+  names harvested from decompiling Apple's **iOS 26 AppleBCMWLAN DriverKit
+  dext**), an extensive `NOTES.md` lab log (bring-up sequence, struct offsets,
+  host/fw split, the data-plane failure), plus `awdl-up.sh`/`awdl-down.sh` and a
+  small role-7 netdev patch `brcmfmac-awdl.patch`.
+- **`brentkearney/omdrop-awdl`** (BCM4387, **Asahi**, kernel tag
+  `asahi-7.1.13-2`). Eleven brcmfmac patches + DKMS; adds a
+  `BRCMF_INTERFACE_TYPE_AWDL` and a `brcmf_cfg80211_vndr_cmds_awdl_handler` to
+  create/manage `awdl0`; patches 0009–0011 instrument PSF/MIF action frames.
+
+Both reach the same state: **AWDL control plane comes up** (firmware transmits
+PSF/MIF, syncs TSF to a nearby iPhone/iPad/Mac, decodes peers; mDNS/service
+discovery works) but **the AWDL data plane — actual unicast transfer — does not
+work in either direction.** `NOTES.md`'s cross-verified conclusion (driving both
+a Linux box and a macOS 26.5 Mac): firmware `datarx` stays 0; our IPv6/mDNS
+multicast goes *out* on `awdl0`, but the Apple peer **advertises a link-local
+address and never unicasts back** — it does not treat us as a reachable data
+peer, so no unicast/flowring is established. Addressed data needs tight per-peer
+availability-window scheduling + the peer confirming us as an active data peer +
+(to wake a passive Apple receiver) the AirDrop **BLE** trigger — none achievable
+by configuring the FullMAC firmware "blind" through iovars. This is the same
+limitation OWL sidesteps with monitor-mode injection, which brcmfmac does not
+offer. Neither project was submitted upstream (both AI-assisted; Asahi's LLM
+policy forbids such contributions), so do not expect them in AsahiLinux trees.
+
+*(Raw copies of `NOTES.md`, `iovars-awdl.txt`, `brcmiovar.py`, `awdl-up.sh`, and
+the omdrop patch/README were saved to the spike scratchpad for reference.)*
+
+**Other prior art:** seemoo-lab's "One Billion Apples' Secret Sauce" (Stute et
+al., MobiCom '18, arXiv 1808.03156) is the authority on AWDL's *frame/TLV/timing*
+semantics but **does not name the Broadcom `awdl*` iovars** — cite it for
+protocol, not the iovar API. seemoo `owl`/`opendrop` are the monitor-mode
+alternative (contrast, = our Route B lineage). The iovar names/structs are
+reverse-engineered from the iOS 26 AppleBCMWLAN dext plus a leaked Broadcom
+`wlioctl.h` AWDL fragment (FreshTomato GPL drop) — undocumented by Broadcom/Apple
+and firmware-build-specific.
+
+### 7.4 The `awdl` iovar surface and bring-up sequence (from the iOS 26 dext RE)
+
+Names probed from Apple's iOS 26 driver (present on a BCM4364 build; **must be
+re-probed on our 4378** — offsets/existence are build-specific):
+
+```
+awdl (enable u32)   awdl_if   awdl_cap   awdl_config   awdl_sync_params
+awdl_chan_seq   awdl_election_tree   awdl_opmode   awdl_extcounts
+awdl_presencemode   awdl_aftxmode   awdl_af_hdr   awdl_af_rssi   awdl_peer_op
+awdl_advertisers   awdl_stats   awdl_psf_dwell   awdl_maxpeers   awdl_osoc_chan
+awdl_min_rate   awdl_phycal_period   awdl_dfsp_cfg/_ucsa   awdl_payload
+awdl_afs_pload   awdl_oob_af[_auto]   awdl_ranging[_config]/_ftm_ranging_config
+```
+
+Selected RE'd struct layouts (from `NOTES.md`, cross-checked vs. leaked
+`wlioctl.h` and probed live on 4364):
+
+- **`awdl_if`** = 20 B `{int32 cfg_idx; int32 up; ether_addr bssid; ether_addr
+  if_addr;}`; AWDL BSSID fixed `00:25:00:ff:94:73`. SET triggers `WLC_E_IF`
+  (event 54) with role `WLC_E_IF_ROLE_AWDL = 7`.
+- **`awdl_sync_params`** 36 B (`aw_period`=16 TU, `af_period` Apple ≈110 TU, ext
+  counts, `presence_mode`).
+- **`awdl_chan_seq`** header `{u8 count-1, u8 enc, u8 dup, u8 step, u16 fill}` +
+  16 slots. `enc=0` 1-byte channel (0 = infra channel); `enc=2` big-endian D11AC
+  chanspecs (5 GHz ch44 = `0xd02c`, 2.4 GHz ch6 = `0x1006`).
+- **`awdl_election_tree`** 42 B; **`awdl_af_hdr`** 10 B (category `0x7f`, Apple
+  OUI `00:17:f2`); **`awdl_peer_op`** old format `{u8 version=0, u8 opcode(0 add/
+  1 del/2 info/3 upd), ether_addr, u8 mode}`.
+- **Events:** `WLC_E_AWDL_AW`=96, `WLC_E_AWDL_ROLE`=97, `WLC_E_AWDL_EVENT`=98
+  (subtypes RX_ACT_FRAME/PEER_STATE/INTERFACE_STATE), action frames as
+  `WLC_E_ACTION_FRAME_RX`=75, tx status `WLC_E_ACTION_FRAME_COMPLETE`=60.
+
+**Bring-up order** (from the dext): `awdl_if` SET on the primary interface →
+firmware creates a bsscfg + emits `WLC_E_IF` role 7 → on that bsscfg set
+`awdl_config` (must precede enable — `awdl 1` returns `BADOPTION` otherwise),
+then `awdl_af_hdr/_rssi`, `awdl_sync_params`, `awdl_chan_seq`,
+`awdl_election_tree`, `awdl_opmode`, `awdl_extcounts`, `awdl_presencemode`,
+`awdl_aftxmode`, `awdl_psf_dwell`, misc → **`awdl` = 1** to enable → set AF tx
+mode. Peers via `awdl_peer_op`; discovered peers read back via `awdl_advertisers`.
+
+### 7.4b Host vs. firmware — responsibility split (authoritative, from the dext RE)
+
+- **Firmware (autonomous, timing-critical):** AW timing, channel hopping, **TSF
+  sync**, election-tree bookkeeping, transmitting PSF/MIF action frames at the
+  right time, the peer table, power save. (Consistent with our firmware evidence:
+  `awdl_psf_dwell`, `wlc_awdl_aw_set`, `master_slice_mask_*`.)
+- **Host (macOS `IO80211Family`/`AppleBCMWLANProximityInterface`, and what *we*
+  drive over iovars):** parses received action frames (delivered as events), runs
+  the AWDL state machine, *decides* channel sequence / election params and pushes
+  them down via iovars; owns the `awdl0` netdev, IPv6 link-local, and all
+  mDNS/`_companion-link._tcp` traffic. So a Linux port ≈ brcmfmac netdev/event
+  plumbing + an OWL-like userspace daemon that no longer needs raw frames.
+
+### 7.5 First experiment (describe only — do NOT run in this spike)
+
+Goal: cheapest test of "does poking `awdl` do anything observable," with least
+risk to the user's live Wi-Fi.
+
+**Risk framing.** `wlan0` is the user's *only* network and is associated now. An
+`awdl` iovar (esp. `awdl_chan_seq` / enable) can push the radio off the AP
+channel and make the link unusable, or wedge the firmware (`NOTES.md` explicitly
+saw an aggressive channel sequence make Wi-Fi "unusable" until disable). **So the
+enable steps must NOT run while the user depends on this link, and never as part
+of a read-only spike** — only later, deliberately, with the user forewarned and a
+fallback network available.
+
+Staged, safest first:
+
+1. **Read-only probe (near-zero risk).** With `brcmiovar.py` (or equivalent),
+   `WLC_GET_VAR "cap"` and check for `awdl`; then `GET_VAR "awdl"` / `"awdl_cap"`.
+   A non-error return **proves the firmware AWDL handler is reachable from
+   userspace on the 4378** — the single highest-value, lowest-risk signal.
+   Distinguish errors via `bcmerrorstr` (brcmfmac maps all to `-EBADE`).
+   **Re-probe the whole `iovars-awdl.txt` list to map which `awdl*` exist on our
+   4378 build** (they differ from the 4364).
+2. **Enable, observe, disable — quickly, with a fallback net up.** Follow the
+   §7.4 order to `awdl 1`, then immediately watch and run `awdl-down`. Observe: a
+   new `awdl0`/bsscfg netdev (needs the role-7 kernel patch to actually appear —
+   without it the firmware makes the bsscfg but stock brcmfmac ignores role 7);
+   `WLC_E_AWDL_*`/`WLC_E_IF` events; whether `wlan0` association survives (the
+   pass/fail safety gate); `awdl_stats` `datatx/datarx`.
+3. **Only if 1–2 are clean:** program channel sequence + election params, add a
+   peer (`awdl_peer_op`), and look for received peer AFs / `awdl_advertisers`
+   populating, with an Apple device nearby and AWDL triggered.
+
+Success ladder: (a) iovar reachable → (b) `awdl0` appears → (c) frames tx'd →
+(d) peer seen / TSF sync → (e) `_companion-link._tcp` resolves over `awdl0` →
+(f) **unicast TCP actually connects** (the step both prior projects fail at).
+
+### 7.6 What we still have to reverse-engineer / build
+
+- **Re-probe the `awdl*` catalog + struct offsets on the 4378** FW
+  `18.20.383.15.7.8.150` — the RE'd layouts are 4364-specific.
+- **A brcmfmac patch** to attach the `awdl0` netdev on `WLC_E_IF` role 7 and
+  route `WLC_E_AWDL_*` events to userspace (the `andreanicassio` role-7 patch or
+  the `omdrop` `interface_create` approach are starting points — but both are
+  AI-assisted and unmerged, so treat as reference, re-derive cleanly).
+- **The data-plane unblock (the real problem, §7.7).**
+- The exact `brcmf_vndr_dcmd_hdr` field encoding/`magic`/endianness — confirm
+  against brcmfmac source, don't guess.
+
+### 7.7 Risks / unknowns specific to Route C
+
+- **Data plane may never work (TOP risk, now evidenced).** Two independent
+  projects bring up AWDL control + discovery but get **no working unicast data
+  path** on brcmfmac — the FullMAC firmware won't schedule per-peer data windows
+  "blind," and the Apple peer won't unicast to a device it hasn't confirmed as a
+  data peer. **companion-link is a bidirectional unicast TCP session**, so this
+  could dead-end our whole use case at "`awdl0` up, mDNS resolves, TCP never
+  connects." This is the make-or-break unknown. *One angle unique to us:* the
+  wall partly involves the **AirDrop BLE trigger** that wakes a passive receiver
+  — and `ac-dc` **already has the BLE side** (M1). Whether the companion-link
+  path (same-Apple-ID, possibly already-awake device) behaves like AirDrop here
+  is untested and worth probing, but must not be overclaimed.
+- **Destabilizing the user's live Wi-Fi** — a bad `awdl` iovar can drop `wlan0`
+  or wedge firmware. Strictly gated (§7.5); never during a read-only spike.
+- **Iovar surface is compressed / build-specific** — must be re-probed on 4378.
+- **Needs a kernel patch for the netdev/events** — sending iovars is patch-free,
+  but seeing `awdl0` and receiving events is not.
+- **Firmware/version drift** — 4378 FW is 2023; the `awdl` ABI may differ from
+  the 4364 build the RE was done against.
+- **Still needs everything in §4** — RPIdentity export, companion-link TCP
+  driver, mDNS-over-`awdl0`; Route C only changes *how `awdl0` is born*.
+
+### 7.8 Why C first, B as fallback
+
+C's advantages: **zero hardware cost**, uses the **5 GHz-capable built-in radio**
+(AWDL social ch 44/149 that modern Apple devices prefer — Route B's AR9271 is
+2.4 GHz/ch-6 only), **prototypable today** via the userspace iovar path (§7.2),
+and there is **working reference code** (`brcmiovar.py`, `iovars-awdl.txt`, the
+bring-up sequence) to start from. Its gating risk is the **data plane** (§7.7),
+which is *cheaply testable*: step 7.5.1 alone (a read-only probe) validates the
+premise for the price of a couple of vendor commands, and the prior art tells us
+where the wall is before we spend a cent. **If Route C dead-ends at the data
+plane, fall back to Route B** (OWL on an AR9271 dongle, which has a real
+monitor/injection data path) — and every downstream M2 piece (RPIdentity export,
+TCP driver, mDNS) carries over unchanged.
