@@ -17,6 +17,7 @@ mod discover;
 mod gcm;
 mod keystore;
 mod opack;
+mod orchestrate;
 mod scan;
 mod tlv8;
 mod transfer;
@@ -90,6 +91,23 @@ enum Cmd {
         #[arg(long)]
         identity: Option<PathBuf>,
         /// Run against an in-process loopback mock peer (no network, no keys).
+        #[arg(long)]
+        loopback: bool,
+    },
+    /// Milestone 2 end-to-end orchestration: pull a copy onto the Linux
+    /// clipboard, tying the M1 + M2 pieces together.
+    ///
+    /// Walks the state machine: scan detects "clipboard available" -> [AWDL
+    /// bring-up] -> discover companion-link over awdl0 -> pull -> clipboard_out.
+    /// The AWDL bring-up is an unimplemented gate today (awdl0 does not exist
+    /// until the driver work lands), so the real flow stops there with a clear
+    /// error. Use `--loopback` to drive the pull -> clipboard glue against an
+    /// in-process mock peer — it actually lands text on your Wayland clipboard.
+    Auto {
+        /// RPIdentity keys for Pair-Verify (real flow only).
+        #[arg(long, default_value = "keys.json")]
+        identity: PathBuf,
+        /// Drive the wiring against the in-process loopback mock (no AWDL).
         #[arg(long)]
         loopback: bool,
     },
@@ -202,6 +220,9 @@ async fn main() -> Result<()> {
             let board = session.fetch_pasteboard().await?;
             print_pasteboard(&peer, &board);
             land_on_clipboard(&board);
+        }
+        Cmd::Auto { identity, loopback } => {
+            orchestrate::run(orchestrate::AutoConfig { identity_path: identity, loopback }).await?;
         }
     }
     Ok(())
