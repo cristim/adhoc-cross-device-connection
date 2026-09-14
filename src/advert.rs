@@ -94,6 +94,39 @@ impl HandoffPayload {
             flags: HandoffFlags::from_byte(plain[8]),
         })
     }
+
+    /// Best-effort human label for the activity behind a copy.
+    ///
+    /// NOTE: the advert does **not** carry the clipboard contents — only the
+    /// URL flag and a truncated SHA-512 hash of the activity-type string. We map
+    /// that hash against known Apple activities (from seemoo-lab
+    /// handoff-ble-viewer). The actual copied text travels over companion-link
+    /// (AWDL), which we can't reach — so this names the app/activity, not the
+    /// text.
+    pub fn activity_label(&self) -> String {
+        if self.flags.has_url() {
+            return "web page / browsing (Safari)".to_string();
+        }
+        let hex = hex::encode(self.activity_hash);
+        let known = match hex.as_str() {
+            "88085c342dc9ed" => "Notes — editing a note",
+            "9d98584545c05e" => "Mail — viewing a mailbox",
+            "86f6a0732b418e" => "Mail — viewing a message",
+            "a564c399758208" => "Mail — composing a message",
+            "90ec0d1c7a00f7" => "Keynote — editing a presentation",
+            "a2f08c1c87dc98" => "Pages — editing a document",
+            "855912d27f7828" => "Numbers — editing a document",
+            "b64729d1a4296b" => "Calendar — date selection",
+            "88acfe99cad770" => "Calendar — event selection",
+            "a32a9f48308fdc" => "Messages",
+            "a37b6b65fc4f5f" => "Podcasts",
+            "99bee8c360dd13" => "2Do — selected list",
+            "b2a2abdd925ef5" => "2Do — editing a task",
+            "00000000000000" => "clearing last activity",
+            _ => return format!("unknown activity (hash {hex})"),
+        };
+        known.to_string()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

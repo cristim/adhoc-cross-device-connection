@@ -12,15 +12,23 @@ use anyhow::{Context, Result};
 use bluer::{Adapter, AdapterEvent, DeviceEvent, DeviceProperty};
 use futures::{pin_mut, StreamExt};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::advert::{self, HandoffBle, HandoffPayload};
 use crate::gcm;
 use crate::keystore::{HandoffKey, KeyStore};
 
+/// Per-device dedupe state: last (counter, activity_hash) seen for each key id.
+/// Keying on the device *key* (not the BLE address) collapses both Apple's
+/// address rotation and the constant re-broadcasts into one line per real copy.
+type SeenMap = Arc<Mutex<HashMap<String, (u16, [u8; 7])>>>;
+
 pub struct Scanner {
     adapter: Adapter,
     keys: Vec<HandoffKey>,
     capture: bool,
+    seen: SeenMap,
 }
 
 impl Scanner {
@@ -38,7 +46,12 @@ impl Scanner {
         let adapter = session.default_adapter().await.context("no BLE adapter")?;
         adapter.set_powered(true).await.context("powering on adapter")?;
         tracing::info!(adapter = %adapter.name(), "using BLE adapter");
-        Ok(Scanner { adapter, keys, capture })
+        Ok(Scanner {
+            adapter,
+            keys,
+            capture,
+            seen: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -65,7 +78,7 @@ impl Scanner {
                 Err(_) => continue,
             };
             if let Ok(Some(md)) = device.manufacturer_data().await {
-                self.worker().handle(addr, &md);
+                self.worker().handle(addr, &md).await;
             }
             let events = match device.events().await {
                 Ok(e) => e,
@@ -78,7 +91,7 @@ impl Scanner {
                 pin_mut!(events);
                 while let Some(ev) = events.next().await {
                     if let DeviceEvent::PropertyChanged(DeviceProperty::ManufacturerData(md)) = ev {
-                        worker.handle(addr, &md);
+                        worker.handle(addr, &md).await;
                     }
                 }
             });
@@ -90,6 +103,8 @@ impl Scanner {
         Worker {
             keys: self.keys.clone(),
             capture: self.capture,
+            adapter: self.adapter.clone(),
+            seen: self.seen.clone(),
         }
     }
 }
@@ -98,10 +113,12 @@ impl Scanner {
 struct Worker {
     keys: Vec<HandoffKey>,
     capture: bool,
+    adapter: Adapter,
+    seen: SeenMap,
 }
 
 impl Worker {
-    fn handle(&self, addr: bluer::Address, md: &HashMap<u16, Vec<u8>>) {
+    async fn handle(&self, addr: bluer::Address, md: &HashMap<u16, Vec<u8>>) {
         let Some(data) = advert::apple_manufacturer_data(md) else {
             return;
         };
@@ -132,7 +149,8 @@ impl Worker {
                 }
             };
             if let Some(payload) = HandoffPayload::parse(&plain) {
-                self.report(addr, &k.id, &payload);
+                let counter = u16::from_le_bytes(ble.counter_iv);
+                self.report(addr, &k.id, counter, &payload).await;
                 return;
             }
         }
@@ -162,24 +180,50 @@ impl Worker {
         );
     }
 
-    fn report(&self, addr: bluer::Address, key_id: &str, p: &HandoffPayload) {
-        let clip = if p.flags.clipboard_available() {
-            "CLIPBOARD AVAILABLE"
-        } else {
-            "(no clipboard flag)"
-        };
+    async fn report(&self, addr: bluer::Address, key_id: &str, counter: u16, p: &HandoffPayload) {
+        if !p.flags.clipboard_available() {
+            tracing::debug!(%addr, key = key_id, "handoff advert without clipboard flag");
+            return;
+        }
+
+        // Collapse address rotation + re-broadcasts: one line per (device, copy).
+        {
+            let sig = (counter, p.activity_hash);
+            let mut seen = self.seen.lock().await;
+            if seen.get(key_id) == Some(&sig) {
+                return;
+            }
+            seen.insert(key_id.to_string(), sig);
+        }
+
+        let who = self.device_label(addr).await;
+        let activity = p.activity_label();
         tracing::info!(
             %addr,
+            device = %who,
             key = key_id,
-            activity_hash = hex::encode(p.activity_hash),
-            url = p.flags.has_url(),
-            "{clip}"
+            activity = %activity,
+            "CLIPBOARD AVAILABLE"
         );
-        if p.flags.clipboard_available() {
-            println!(
-                "[{}] Universal Clipboard: a copy is available on a nearby Apple device (key {})",
-                addr, key_id
-            );
+        println!("📋  {who} copied — {activity}   [device key {key_id}]");
+    }
+
+    /// A friendly name for the advertiser if BlueZ knows one (e.g. a paired
+    /// iPhone/Mac), else its Bluetooth address. Handoff advertisers usually
+    /// expose no name, so this is often the (rotating) address.
+    async fn device_label(&self, addr: bluer::Address) -> String {
+        if let Ok(dev) = self.adapter.device(addr) {
+            if let Ok(Some(name)) = dev.name().await {
+                if !name.is_empty() {
+                    return name;
+                }
+            }
+            if let Ok(alias) = dev.alias().await {
+                if !alias.is_empty() && alias != addr.to_string() {
+                    return alias;
+                }
+            }
         }
+        addr.to_string()
     }
 }
