@@ -121,7 +121,7 @@ pub enum PacketType {
 }
 
 impl PacketType {
-    fn from_u8(b: u8) -> Option<Self> {
+    pub fn from_u8(b: u8) -> Option<Self> {
         Some(match b {
             0x05 => PacketType::PairVerifyPublicKey,
             0x06 => PacketType::PairVerifyContinue,
@@ -366,6 +366,107 @@ impl PairVerifyClient {
     #[allow(dead_code)]
     pub fn identity_id_type() -> u8 {
         tlv_type::IDENTITY_ID
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pair-Verify server state machine (M1..M4)
+// ---------------------------------------------------------------------------
+
+/// The peer (accessory) side of Pair-Verify. This mirrors [`PairVerifyClient`]
+/// so the same TLV/OPACK/ChaCha wiring can be exercised end-to-end against an
+/// in-process loopback peer (see `companion_client.rs` tests). A real Apple
+/// device is the server in production; this exists so the client is testable
+/// without one, and is NOT how macOS/iOS are driven.
+pub struct PairVerifyServer {
+    ephemeral: Option<EphemeralSecret>,
+    public: PublicKey,
+    identity: PairingIdentity,
+    shared: Option<[u8; 32]>,
+    client_pub: Option<[u8; 32]>,
+}
+
+impl PairVerifyServer {
+    pub fn new(identity: PairingIdentity) -> Self {
+        let ephemeral = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+        let public = PublicKey::from(&ephemeral);
+        PairVerifyServer { ephemeral: Some(ephemeral), public, identity, shared: None, client_pub: None }
+    }
+
+    /// Consume the client's M1 (their public key), run ECDH, and produce M2:
+    /// our public key + our encrypted signature over `server_pub || client_pub`,
+    /// with state=2.
+    pub fn process_m1(&mut self, m1: &ContinuityPacket) -> Result<ContinuityPacket> {
+        let tlv = m1.pairing_tlv()?;
+        let client_pub_bytes: [u8; 32] = tlv
+            .get(tlv_type::PUBLIC_KEY)
+            .context("M1 missing client public key")?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("client public key not 32 bytes"))?;
+        let client_pub = PublicKey::from(client_pub_bytes);
+
+        let eph = self.ephemeral.take().context("server ephemeral already consumed")?;
+        let shared = eph.diffie_hellman(&client_pub).to_bytes();
+        self.shared = Some(shared);
+        self.client_pub = Some(client_pub_bytes);
+
+        let key = pair_verify_key(&shared);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+
+        // We sign server_pub || client_pub; the client verifies exactly this.
+        let mut signed = Vec::with_capacity(64);
+        signed.extend_from_slice(self.public.as_bytes());
+        signed.extend_from_slice(&client_pub_bytes);
+        let our_sig = self.identity.signing.sign(&signed);
+        let mut inner = Tlv8::new();
+        inner.push(tlv_type::SIGNATURE, our_sig.to_bytes().to_vec());
+        let sealed = cipher
+            .encrypt(&pv_nonce(b"PV-Msg02"), inner.encode().as_slice())
+            .map_err(|_| anyhow::anyhow!("PV-Msg02 encrypt failed"))?;
+
+        let mut out = Tlv8::new();
+        out.push(tlv_type::PUBLIC_KEY, self.public.as_bytes().to_vec())
+            .push(tlv_type::ENCRYPTED_DATA, sealed)
+            .push_u8(tlv_type::STATE, 2);
+        Ok(ContinuityPacket::new(PacketType::PairVerifyContinue, wrap_pairing_data(&out)))
+    }
+
+    /// Verify the client's M3 signature over `client_pub || server_pub`, and on
+    /// success produce M4 (state=4) plus the server-role content channel.
+    pub fn process_m3(&mut self, m3: &ContinuityPacket) -> Result<(ContinuityPacket, ContentChannel)> {
+        let tlv = m3.pairing_tlv()?;
+        let shared = self.shared.context("process_m1 not run before M3")?;
+        let client_pub = self.client_pub.context("process_m1 not run before M3")?;
+
+        let key = pair_verify_key(&shared);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let enc = tlv.get(tlv_type::ENCRYPTED_DATA).context("M3 missing encrypted data")?;
+        let dec = cipher
+            .decrypt(&pv_nonce(b"PV-Msg03"), enc)
+            .map_err(|_| anyhow::anyhow!("PV-Msg03 decrypt failed (key or nonce mismatch)"))?;
+        let inner = Tlv8::decode(&dec);
+        let sig_bytes = inner.get(tlv_type::SIGNATURE).context("no signature in M3")?;
+        let signature = Signature::from_slice(sig_bytes).context("bad signature length")?;
+
+        let mut signed = Vec::with_capacity(64);
+        signed.extend_from_slice(&client_pub);
+        signed.extend_from_slice(self.public.as_bytes());
+        let verified = self
+            .identity
+            .peers
+            .iter()
+            .find(|(_, vk)| vk.verify(&signed, &signature).is_ok())
+            .map(|(label, _)| label.clone());
+        if let Some(label) = &verified {
+            tracing::info!(peer = %label, "Pair-Verify(server): client signature verified");
+        } else {
+            tracing::warn!("Pair-Verify(server): no known peer matched the client signature");
+        }
+
+        let mut out = Tlv8::new();
+        out.push_u8(tlv_type::STATE, 4);
+        let m4 = ContinuityPacket::new(PacketType::PairVerifyContinue, wrap_pairing_data(&out));
+        Ok((m4, ContentChannel::from_shared_secret(&shared, Role::Server)))
     }
 }
 

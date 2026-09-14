@@ -56,6 +56,20 @@ impl Value {
             _ => None,
         }
     }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Value::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
 }
 
 pub fn encode(value: &Value) -> Vec<u8> {
