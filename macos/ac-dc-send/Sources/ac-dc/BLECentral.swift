@@ -1,10 +1,9 @@
 // BLECentral.swift — CoreBluetooth central for `ac-dc send-key` (the SENDER).
 //
-// ⚠️ UNVALIDATED AGAINST HARDWARE. This CoreBluetooth plumbing has never been
-// run against a real adapter or the Linux receiver from this checkout. All the
-// security-relevant logic lives in Transfer.swift (mirrored from Rust and unit
-// tested on the Rust side); this file only moves bytes. Treat it as a careful
-// draft and fix whatever the compiler / a real device reveals.
+// Validated against real hardware: a macOS 26.1 send to a Linux `receive-key`
+// completed with matching SAS and a transferred keys.json. All the
+// security-relevant logic lives in Transfer.swift (pinned by tests to vectors
+// from the Rust src/transfer.rs); this file only moves bytes.
 //
 // It mirrors the handshake in Transfer.swift's WIRE FORMAT block: scan for the
 // service, read the receiver's pubkey, write our pubkey, then stream the sealed

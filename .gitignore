@@ -4,3 +4,9 @@
 keys.json
 *.plist
 dump.json
+
+# SwiftPM build output (macos/ac-dc-send)
+.build/
+
+# Agent worktrees
+.claude/worktrees/

@@ -1,8 +1,9 @@
 // Transfer.swift — transport-independent crypto/framing core of `ac-dc send-key`
 // (the macOS SENDER). This mirrors the Rust reference in ../../../src/transfer.rs.
 //
-// ⚠️ UNVALIDATED: not compiled in this repo (no Swift toolchain on the Linux dev
-// box). Build/run on macOS; fix whatever the compiler flags.
+// The session key, SAS and framing here are pinned by Tests/ac-dcTests to
+// vectors generated from the Rust reference, and the whole path has completed a
+// real transfer to a Linux receiver.
 //
 // ===========================================================================
 // WIRE FORMAT  (mirrored verbatim from src/transfer.rs)
@@ -61,14 +62,23 @@ enum Transfer {
     static func sessionKey(shared: SharedSecret,
                            receiverPub: Data,
                            senderPub: Data) -> SymmetricKey {
+        // CryptoKit's SharedSecret is the raw 32-byte X25519 output.
+        sessionKey(sharedBytes: shared.withUnsafeBytes { Data($0) },
+                   receiverPub: receiverPub,
+                   senderPub: senderPub)
+    }
+
+    /// Same derivation over raw shared-secret bytes. Split out from the
+    /// `SharedSecret` overload because `SharedSecret` cannot be constructed from
+    /// known bytes, which would leave this untestable against the Rust vectors.
+    static func sessionKey(sharedBytes: Data,
+                           receiverPub: Data,
+                           senderPub: Data) -> SymmetricKey {
         var info = Data()
         info.append(hkdfInfoPrefix)
         info.append(receiverPub)
         info.append(senderPub)
-        // HKDF over the raw X25519 output. CryptoKit's SharedSecret is the raw
-        // 32-byte value; feed it as the IKM.
-        let ikm = SymmetricKey(data: shared.withUnsafeBytes { Data($0) })
-        return HKDF<SHA512>.deriveKey(inputKeyMaterial: ikm,
+        return HKDF<SHA512>.deriveKey(inputKeyMaterial: SymmetricKey(data: sharedBytes),
                                       salt: hkdfSalt,
                                       info: info,
                                       outputByteCount: 32)

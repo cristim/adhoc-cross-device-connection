@@ -1,10 +1,9 @@
 // swift-tools-version:5.7
 // SwiftPM manifest for the macOS `ac-dc send-key` helper.
 //
-// ⚠️ UNVALIDATED: this package has NOT been compiled or run on a Mac from this
-// repo checkout (there is no Swift toolchain in the Linux dev environment where
-// it was written). Build it on macOS with `swift build -c release`; see
-// README.md. Fix anything the compiler flags — treat it as a careful draft.
+// Build on macOS with `swift build -c release`, then `swift test`. The package
+// has been built and run on macOS 26.1, including a real BLE transfer to a Linux
+// receiver; see README.md.
 
 import PackageDescription
 
@@ -18,6 +17,11 @@ let package = Package(
         .executableTarget(
             name: "ac-dc",
             path: "Sources/ac-dc"
+        ),
+        .testTarget(
+            name: "ac-dcTests",
+            dependencies: ["ac-dc"],
+            path: "Tests/ac-dcTests"
         )
     ]
 )

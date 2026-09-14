@@ -137,7 +137,12 @@ Requires a running `bluetoothd` (BlueZ) and a Bluetooth adapter. Set
 
 ### Exporting keys from macOS
 
-See [`macos/export-keys.sh`](macos/export-keys.sh). Two paths:
+Easiest: build the Swift helper (see
+[`macos/ac-dc-send/README.md`](macos/ac-dc-send/README.md)) and run `ac-dc
+export-keys`. It queries the keychain via `SecItemCopyMatching`, so it gets
+every key with SIP left enabled, and writes `keys.json` at mode 0600.
+
+Otherwise [`macos/export-keys.sh`](macos/export-keys.sh) offers two paths:
 
 - **Path A** — `security` CLI (quick; may be blocked by the item ACL on recent
   macOS).
@@ -180,8 +185,14 @@ device, transfer the exported file over Bluetooth LE instead:
 ac-dc receive-key                 # starts a GATT server, waits for the Mac
 
 # On the Mac (build the helper first — see macos/ac-dc-send/README.md):
-ac-dc send-key                    # scans, connects, sends keys.json
+ac-dc send-key                    # exports from the keychain, scans, connects, sends
 ```
+
+`send-key` does its **own** keychain export, so `export-keys.sh` is not needed
+on this path and the keys never touch the Mac's disk — they go from the keychain
+straight into the encrypted BLE link. The same helper also has `ac-dc
+export-keys` for the dual-boot flow; it uses `SecItemCopyMatching`, so unlike
+`export-keys.sh` Path A it returns **every** key, without SIP disabled or Frida.
 
 The BLE link is treated as **untrusted**. Each side generates an ephemeral
 X25519 keypair and exchanges public keys over GATT; ECDH → HKDF-SHA512 gives a
@@ -200,11 +211,15 @@ mismatch means abort. On a match, Linux decrypts and writes `keys.json` at mode
 
 - Linux receiver: [`ac-dc receive-key`](src/transfer_ble.rs) (bluer GATT
   server). macOS sender: [`ac-dc send-key`](macos/ac-dc-send/) (CoreBluetooth
-  central). The transport-independent crypto/framing core is in
+  central), whose keychain export lives in
+  [`KeychainExport.swift`](macos/ac-dc-send/Sources/ac-dc/KeychainExport.swift). The transport-independent crypto/framing core is in
   [`src/transfer.rs`](src/transfer.rs) and is fully unit-tested.
-- ⚠️ **Unvalidated pending hardware.** The crypto and chunk-framing are covered
-  by unit tests, but the actual BLE plumbing (the bluer GATT server and the
-  Swift CoreBluetooth central) has **not** been run against a real adapter yet.
+- ✅ **Validated end to end on real hardware** (macOS 26.1 sender, Linux
+  receiver): service discovery, the X25519 handshake, matching 6-digit SAS on
+  both screens, and a 902-byte `keys.json` transferred in 2 frames and written
+  on the Linux side. The Swift sender's session-key, SAS and framing are also
+  pinned by unit tests to vectors generated from `src/transfer.rs`, so the two
+  implementations cannot drift apart silently.
   This is an alternative to the read-only APFS mount above, not a replacement
   that's been proven end-to-end.
 
