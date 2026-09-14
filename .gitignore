@@ -1,6 +1,9 @@
 /target
 __pycache__/
 
+# Out-of-tree kernel build: cloned Asahi source + compiled brcmfmac.ko (multi-GB).
+kernel/brcmfmac-awdl-4378/build/
+
 # Never commit exported Apple keys.
 keys.json
 *.plist
