@@ -1,12 +1,12 @@
 #!/bin/bash
 # export-keys.sh — run this ONCE under macOS (booted natively, signed into the
 # same Apple ID as your iPhone) to export the Continuity BLE encryption keys
-# that handoff-clip needs on the Linux side.
+# that ac-dc needs on the Linux side.
 #
 # Key handling / anti-leak design:
 #   * Keys are written ONLY inside your FileVault-encrypted home, never to a
 #     synced or shared folder, so they are encrypted at rest.
-#       - target dir: ~/Library/Application Support/handoff-clip
+#       - target dir: ~/Library/Application Support/ac-dc
 #       - NOT ~/Desktop or ~/Documents (iCloud-synced when Desktop&Documents on)
 #   * The dir is excluded from Time Machine (tmutil) so no backup copy leaks.
 #   * File mode is 600 (owner-only).
@@ -37,14 +37,14 @@ SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 
 # Prefer the Homebrew-installed converter command if it's on PATH, else the
 # sibling script next to us (repo checkout).
-if command -v handoff-clip-dump-to-keys >/dev/null 2>&1; then
-    CONV="handoff-clip-dump-to-keys"
+if command -v ac-dc-dump-to-keys >/dev/null 2>&1; then
+    CONV="ac-dc-dump-to-keys"
 else
     CONV="python3 \"$SCRIPT_DIR/dump-to-keys.py\""
 fi
 
-EXPORT_DIR="$HOME/Library/Application Support/handoff-clip"
-LABEL="app.handoffclip.cleanup"
+EXPORT_DIR="$HOME/Library/Application Support/ac-dc"
+LABEL="app.ac-dc.cleanup"
 AGENT_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 CLEANUP_SH="$EXPORT_DIR/cleanup.sh"
 
@@ -58,7 +58,7 @@ tmutil addexclusion "$EXPORT_DIR" 2>/dev/null || true
 install_autowipe() {
     cat > "$CLEANUP_SH" <<CLEAN
 #!/bin/bash
-# One-shot: erase the handoff-clip key export, then remove self.
+# One-shot: erase the ac-dc key export, then remove self.
 /bin/rm -f "$EXPORT_DIR/keys.json" "$EXPORT_DIR/keys.plist" "$EXPORT_DIR/dump.json" 2>/dev/null
 /bin/launchctl bootout "gui/\$(id -u)/$LABEL" 2>/dev/null || true
 /bin/rm -f "$AGENT_PLIST"
@@ -119,7 +119,7 @@ if security find-generic-password -s "com.apple.continuity.encryption" -w >/tmp/
     echo "Exported one raw keychain item."
     echo "NOTE: security CLI returns only ONE item. If you have multiple devices,"
     echo "      use Path B to capture all keys."
-    echo "handoff-clip parses this plist directly (pass it as --keys)."
+    echo "ac-dc parses this plist directly (pass it as --keys)."
     secure_finish "$EXPORT_DIR/keys.plist"
     exit 0
 fi

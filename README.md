@@ -1,4 +1,4 @@
-# handoff-clip
+# ac-dc
 
 Receive Apple **Universal Clipboard** / **Handoff** announcements on Linux
 (Asahi / any BlueZ box) by reusing the Continuity encryption keys that macOS
@@ -8,7 +8,7 @@ Apple's Continuity services (Handoff, Universal Clipboard, …) only talk to
 devices signed into the *same Apple ID*, authenticated with keys that live in
 the iCloud keychain. Linux can't join that keychain — but if you own a Mac (or
 an Asahi machine that dual-boots macOS) that *is* signed in, the same keys are
-already synced onto it. `handoff-clip` exports those keys once, under macOS,
+already synced onto it. `ac-dc` exports those keys once, under macOS,
 and then uses them under Linux to observe and decrypt the Continuity traffic
 your iPhone and Macs broadcast.
 
@@ -32,7 +32,7 @@ your iPhone and Macs broadcast.
                               │  copy to Linux partition
                               ▼
   Linux / Asahi
-    └─ handoff-clip scan --keys keys.json
+    └─ ac-dc scan --keys keys.json
          ├─ BlueZ: listen for Apple manufacturer-data BLE adverts (company 0x004c)
          ├─ parse the Handoff TLV (type 0x0c)
          ├─ AES-GCM decrypt with each key until the 1-byte tag authenticates
@@ -105,7 +105,7 @@ text on the phone, capture the BLE manufacturer data via `btmon` or a sniffer),
 then run:
 
 ```
-handoff-clip decrypt --keys keys.json --data <manufacturer-data-hex>
+ac-dc decrypt --keys keys.json --data <manufacturer-data-hex>
 ```
 
 If it decrypts to a sane 10-byte payload with the clipboard flag set, the path
@@ -122,18 +122,18 @@ cargo build --release
 cargo test               # runs the gcm + advert unit tests
 
 # On Linux, with keys exported from macOS:
-./target/release/handoff-clip scan --keys keys.json
+./target/release/ac-dc scan --keys keys.json
 
 # Offline decrypt of a single captured advert:
-./target/release/handoff-clip decrypt --keys keys.json --data 0c0e08....
+./target/release/ac-dc decrypt --keys keys.json --data 0c0e08....
 
 # No keys needed:
-./target/release/handoff-clip capture     # grab a raw advert to validate the decrypt
-./target/release/handoff-clip discover     # browse _companion-link._tcp (the M2 AWDL test)
+./target/release/ac-dc capture     # grab a raw advert to validate the decrypt
+./target/release/ac-dc discover     # browse _companion-link._tcp (the M2 AWDL test)
 ```
 
 Requires a running `bluetoothd` (BlueZ) and a Bluetooth adapter. Set
-`RUST_LOG=handoff_clip=debug` for verbose output.
+`RUST_LOG=ac_dc=debug` for verbose output.
 
 ### Exporting keys from macOS
 
@@ -157,7 +157,7 @@ Produce a `keys.json`:
 The exported AES keys are sensitive, so they never touch an unencrypted or
 synced location:
 
-- `export-keys.sh` writes only into `~/Library/Application Support/handoff-clip`
+- `export-keys.sh` writes only into `~/Library/Application Support/ac-dc`
   (inside FileVault, **not** iCloud-synced `~/Desktop`/`~/Documents`), `chmod
   600`, and `tmutil`-excluded so Time Machine won't back it up.
 - It arms a **one-shot LaunchAgent** that deletes the export on your next macOS
@@ -193,7 +193,7 @@ synced location:
     Pair-Verify ChaCha nonce construction is an explicit TODO.
   - **Transport risk (the gating experiment):** Apple normally runs this over
     **AWDL**. The Asahi Wi-Fi driver (`brcmfmac`) has **no monitor mode**, so
-    the open-source AWDL stack (OWL) won't run here. **Run `handoff-clip
+    the open-source AWDL stack (OWL) won't run here. **Run `ac-dc
     discover` first** — if `_companion-link._tcp` resolves over the ordinary
     LAN while your devices are awake and nearby, M2 is tractable; if nothing
     ever resolves, the transport is AWDL-only and M2 becomes a driver-level

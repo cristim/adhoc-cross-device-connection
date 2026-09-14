@@ -1,9 +1,13 @@
 [package]
-name = "handoff-clip"
-version = "0.1.0"
+name = "apple-cross-device-clipboard"
+version = "0.2.0"
 edition = "2021"
 description = "Receive Apple Universal Clipboard / Handoff BLE announcements on Linux by reusing keys exported from macOS"
 license = "MIT"
+
+[[bin]]
+name = "ac-dc"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"

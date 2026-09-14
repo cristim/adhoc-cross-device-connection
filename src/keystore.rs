@@ -84,7 +84,7 @@ impl KeyStore {
         }
 
         anyhow::bail!(
-            "could not parse {} as either handoff-clip JSON or a keychain plist",
+            "could not parse {} as either ac-dc JSON or a keychain plist",
             path.display()
         )
     }

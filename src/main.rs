@@ -1,4 +1,4 @@
-//! handoff-clip: receive Apple Universal Clipboard / Handoff BLE announcements
+//! ac-dc: receive Apple Universal Clipboard / Handoff BLE announcements
 //! on Linux, using encryption keys exported from a macOS install signed into
 //! the same Apple ID.
 //!
@@ -23,7 +23,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "handoff-clip", version, about)]
+#[command(name = "ac-dc", version, about)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "handoff_clip=info".into()),
+                .unwrap_or_else(|_| "ac_dc=info".into()),
         )
         .init();
 

@@ -5,7 +5,7 @@
 //! Two modes share the discovery loop:
 //!   * `run()` – decrypt-and-report (needs keys).
 //!   * `run_capture()` – print each raw Handoff advert as hex, ready to paste
-//!     into `handoff-clip decrypt --data <hex>`. Needs no keys; used to grab a
+//!     into `ac-dc decrypt --data <hex>`. Needs no keys; used to grab a
 //!     validation packet from your own devices.
 
 use anyhow::{Context, Result};
@@ -48,7 +48,7 @@ impl Scanner {
 
     pub async fn run_capture(&self) -> Result<()> {
         tracing::info!("capture mode: printing raw Handoff adverts (Ctrl-C to stop)");
-        println!("# paste a line into: handoff-clip decrypt --keys keys.json --data <hex>");
+        println!("# paste a line into: ac-dc decrypt --keys keys.json --data <hex>");
         self.discover_loop().await
     }
 

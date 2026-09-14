@@ -4,12 +4,12 @@ Our AES-GCM path (2-byte IV, 1-byte tag) is derived from the spec and the
 seemoo-lab code but **unvalidated against real traffic**. To confirm it — and to
 pin down IV byte-order and TLV offsets on your current iOS/macOS — capture one
 real advert while your iPhone copies something, then feed it to
-`handoff-clip decrypt`.
+`ac-dc decrypt`.
 
 There are two ways to grab the bytes. Use method 1; method 2 is a manual
 cross-check.
 
-## Method 1 (recommended): `handoff-clip capture`
+## Method 1 (recommended): `ac-dc capture`
 
 This reuses our own, tested advert parser and prints each Handoff advert as hex
 already normalized to the `0c ..` TLV that `decrypt --data` expects. No keys
@@ -17,7 +17,7 @@ needed, no root beyond what BlueZ already allows.
 
 ```bash
 # Terminal 1: start capturing (no keys required)
-handoff-clip capture
+ac-dc capture
 
 # Then, on the iPhone (unlocked, Handoff ON, near this machine):
 #   copy some text (e.g. in Notes) — this sets the "clipboard available" flag.
@@ -32,7 +32,7 @@ E2:AB:..:..  0c0e08 2a00 99 <10 bytes ct>   # raw_mfg=... status=0x08 iv=2a00 ta
 Copy the second field (the `0c0e…` hex) and validate once you have `keys.json`:
 
 ```bash
-handoff-clip decrypt --keys keys.json --data 0c0e08...
+ac-dc decrypt --keys keys.json --data 0c0e08...
 # success => "decrypted with key <id>: ...  clipboard_available=true"
 ```
 
@@ -71,7 +71,7 @@ Company: Apple, Inc. (76)
 
 If your btmon prints the raw manufacturer data as hex, the Handoff TLV is the
 run starting `0c 0e …` (type 0x0c, length 0x0e = 14 bytes). That's the same hex
-`handoff-clip capture` gives you. Replay a saved capture later with:
+`ac-dc capture` gives you. Replay a saved capture later with:
 
 ```bash
 btmon -r /tmp/hci.snoop

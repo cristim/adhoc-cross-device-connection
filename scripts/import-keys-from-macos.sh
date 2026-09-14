@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# import-keys-from-macos.sh — pull handoff-clip's keys.json from the macOS
+# import-keys-from-macos.sh — pull ac-dc's keys.json from the macOS
 # install on this same machine, WITHOUT copying it onto any unencrypted disk
 # beyond the destination you choose.
 #
@@ -15,8 +15,8 @@
 
 set -euo pipefail
 
-REL="Library/Application Support/handoff-clip/keys.json"
-REL_PLIST="Library/Application Support/handoff-clip/keys.plist"
+REL="Library/Application Support/ac-dc/keys.json"
+REL_PLIST="Library/Application Support/ac-dc/keys.plist"
 DEST="${1:-$(cd "$(dirname "$0")/.." && pwd)/keys.json}"
 MNT="$(mktemp -d /tmp/hc-macos.XXXXXX)"
 
@@ -63,14 +63,14 @@ for home in "$MNT"/Users/*; do
 done
 
 if [ -z "$SRC" ]; then
-    echo "No handoff-clip export found under any /Users home on this volume." >&2
+    echo "No ac-dc export found under any /Users home on this volume." >&2
     echo "Did you run macos/export-keys.sh in macOS? Is this the Data volume?" >&2
     exit 1
 fi
 
 install -m 600 "$SRC" "$DEST"
 echo "Imported: $DEST (mode 600)"
-echo "Run:  handoff-clip scan --keys \"$DEST\""
+echo "Run:  ac-dc scan --keys \"$DEST\""
 echo
 echo "Reminder: the macOS copy auto-wipes on your next macOS login. This local"
 echo "copy persists — it lives on your Linux disk; delete it when done if that"

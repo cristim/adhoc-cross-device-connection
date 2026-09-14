@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a seemoo-lab keychain_access.py dump into handoff-clip's keys.json.
+"""Convert a seemoo-lab keychain_access.py dump into ac-dc's keys.json.
 
 The Frida tool (apple-continuity-tools/keychain_access) hooks
 SecItemCopyMatching in rapportd and writes every accessed keychain item to a
@@ -111,7 +111,7 @@ def extract_from_plist_dict(d):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert a keychain_access dump to handoff-clip keys.json")
+    ap = argparse.ArgumentParser(description="Convert a keychain_access dump to ac-dc keys.json")
     ap.add_argument("dump", help="dump.json from keychain_access.py")
     ap.add_argument("-o", "--output", default="keys.json", help="output keys.json (default: keys.json)")
     ap.add_argument("--include-wrapped", action="store_true",
