@@ -169,6 +169,45 @@ synced location:
   wear-leveling). FileVault-at-rest is the real protection; the auto-wipe is
   hygiene. Re-exporting is cheap, so we wipe aggressively.
 
+### Transfer keys over Bluetooth (from any Mac)
+
+Copying `keys.json` across a read-only APFS mount only works when Linux and
+macOS are the **same** machine (a dual-boot). If your Mac is a **separate**
+device, transfer the exported file over Bluetooth LE instead:
+
+```sh
+# On Linux:
+ac-dc receive-key                 # starts a GATT server, waits for the Mac
+
+# On the Mac (build the helper first — see macos/ac-dc-send/README.md):
+ac-dc send-key                    # scans, connects, sends keys.json
+```
+
+The BLE link is treated as **untrusted**. Each side generates an ephemeral
+X25519 keypair and exchanges public keys over GATT; ECDH → HKDF-SHA512 gives a
+session key that encrypts the payload with ChaCha20-Poly1305. Both ends then
+print a **6-digit security code (SAS)** derived from a hash of the two public
+keys:
+
+```
+  Security code (SAS): 042137     <- must be identical on both screens
+```
+
+**Compare the codes and only answer `y` on Linux if they match.** A
+man-in-the-middle who substitutes public keys forces the two codes apart, so a
+mismatch means abort. On a match, Linux decrypts and writes `keys.json` at mode
+`0600`.
+
+- Linux receiver: [`ac-dc receive-key`](src/transfer_ble.rs) (bluer GATT
+  server). macOS sender: [`ac-dc send-key`](macos/ac-dc-send/) (CoreBluetooth
+  central). The transport-independent crypto/framing core is in
+  [`src/transfer.rs`](src/transfer.rs) and is fully unit-tested.
+- ⚠️ **Unvalidated pending hardware.** The crypto and chunk-framing are covered
+  by unit tests, but the actual BLE plumbing (the bluer GATT server and the
+  Swift CoreBluetooth central) has **not** been run against a real adapter yet.
+  This is an alternative to the read-only APFS mount above, not a replacement
+  that's been proven end-to-end.
+
 ---
 
 ## Roadmap
