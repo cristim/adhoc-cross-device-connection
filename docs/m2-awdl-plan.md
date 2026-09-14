@@ -254,11 +254,28 @@ Today `macos/export-keys.sh` exports **only** the BLE Continuity AES keys
 - each peer device's **Ed25519 public key** (`edpk`).
 
 `companion.rs::PairingIdentity::load` already expects exactly this JSON shape
-(`ed_sk` / `dirk` / `peers[].edpk` hex). The missing work is a **new exporter**
-that locates these in the macOS keychain (RemotePairing / Rapport /
-`com.apple.private.alloy` / AuthKit-adjacent items — exact service name is an RE
-task) and emits that JSON. Risk: these may be SEP-protected or non-exportable —
-see §5.
+(`ed_sk` / `dirk` / `peers[].edpk` hex). This exporter now exists — see
+**`macos/RPIDENTITY.md`** and `macos/export-rpidentity.sh` +
+`macos/inject-rpidentity.swift` + `macos/rpidentity-to-json.py`.
+
+The keychain service is **`RPIdentity-SameAccountDevice`** (confirmed from
+seemoo-lab `handoff-authentication-swift` `MacKeychainController.swift`): a
+synchronizable generic-password whose value is an OPACK blob
+`{ edPK: <32B pubkey>, dIRK: <16B> }`. Crucially the synced item holds only the
+**public** `edPK`; the private `edSK` is **not** there. So the exporter takes
+**approach (b)**: *generate our own* Ed25519 keypair, keep the private seed in
+`rpidentity.json`, and `SecItemAdd` our public key as a new
+`RPIdentity-SameAccountDevice` item so all same-account devices trust us (exactly
+seemoo's `createNewRPIdentityItem`). Peer `edPK`s are read from the same
+keychain (Path A `security` / Path B Frida on `rapportd`).
+
+Approach (a) — exporting a real device's own `edSK` and impersonating it — is
+almost certainly blocked because that private key is **SEP-protected /
+non-exportable**. `macos/RPIDENTITY.md` documents a concrete **probe**
+(`SecKeyCopyExternalRepresentation` returning `NULL` under a Frida hook on
+`rapportd`) to confirm this on real hardware before relying on either path.
+Remaining risk: even with a correctly injected item, a current peer may demand
+more than key-presence to grant same-account trust — see §5.
 
 ### 4.2 The companion-link TCP client
 The socket driver from Step 5 / §3: connect, stream-frame `ContinuityPacket`s,

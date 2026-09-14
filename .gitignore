@@ -1,6 +1,11 @@
 /target
+__pycache__/
 
 # Never commit exported Apple keys.
 keys.json
 *.plist
 dump.json
+# RPIdentity export: our private signing seed + peer public keys.
+rpidentity.json
+identity-self.json
+rp-dump.json
