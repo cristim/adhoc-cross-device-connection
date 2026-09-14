@@ -10,6 +10,7 @@
 
 mod advert;
 mod advertise;
+mod clipboard_out;
 mod companion;
 mod companion_client;
 mod discover;
@@ -174,6 +175,7 @@ async fn main() -> Result<()> {
                 tracing::info!("running companion-link pull against in-process loopback mock");
                 let (peer, board) = companion_client::loopback_demo().await?;
                 print_pasteboard(&peer, &board);
+                land_on_clipboard(&board);
                 return Ok(());
             }
 
@@ -200,9 +202,21 @@ async fn main() -> Result<()> {
                 .await?;
             let board = session.fetch_pasteboard().await?;
             print_pasteboard(&peer, &board);
+            land_on_clipboard(&board);
         }
     }
     Ok(())
+}
+
+/// Put a successfully fetched pasteboard on the Wayland clipboard via
+/// `clipboard_out`, printing what was copied. Best-effort: a clipboard failure
+/// is logged, not fatal, since the fetch itself already succeeded.
+fn land_on_clipboard(board: &companion_client::Pasteboard) {
+    match clipboard_out::copy_pasteboard(board) {
+        Ok(Some(outcome)) => println!("clipboard: copied {}", outcome.describe()),
+        Ok(None) => println!("clipboard: nothing to copy (empty pasteboard)"),
+        Err(e) => tracing::error!(error = %e, "failed to put pasteboard on the clipboard"),
+    }
 }
 
 /// Print a fetched pasteboard and the peer's system info to stdout.
