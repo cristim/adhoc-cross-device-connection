@@ -11,6 +11,7 @@
 mod advert;
 mod advertise;
 mod companion;
+mod companion_client;
 mod discover;
 mod gcm;
 mod keystore;
@@ -64,6 +65,32 @@ enum Cmd {
         /// Manufacturer data hex, e.g. "0c0e082a0099dead...".
         #[arg(short, long)]
         data: String,
+    },
+    /// Milestone 2: pull Universal Clipboard content over companion-link.
+    ///
+    /// Runs the transport-independent client: TCP connect, Pair-Verify M1-M4,
+    /// then the system-info and pasteboard-fetch exchanges. Until AWDL is up
+    /// (see docs/m2-awdl-plan.md) this will fail at `connect` against a real
+    /// device — that is expected. Use `--loopback` to exercise the full flow
+    /// against an in-process mock peer with no network.
+    Pull {
+        /// Peer address. Normally supplied later by `discover` over awdl0.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Peer companion-link TCP port.
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// BLE keystore path (kept for CLI parity; used as the identity source
+        /// if --identity is not given). See macos/export-keys.sh.
+        #[arg(short, long, default_value = "keys.json")]
+        keys: PathBuf,
+        /// RPIdentity keys (Ed25519 signing key + known peers) for Pair-Verify.
+        /// The exporter for these does not exist yet (docs/m2-awdl-plan.md §4.1).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Run against an in-process loopback mock peer (no network, no keys).
+        #[arg(long)]
+        loopback: bool,
     },
 }
 
@@ -142,6 +169,61 @@ async fn main() -> Result<()> {
                 println!("no key authenticated this advertisement");
             }
         }
+        Cmd::Pull { host, port, keys, identity, loopback } => {
+            if loopback {
+                tracing::info!("running companion-link pull against in-process loopback mock");
+                let (peer, board) = companion_client::loopback_demo().await?;
+                print_pasteboard(&peer, &board);
+                return Ok(());
+            }
+
+            // TODO(discover): once awdl0 is up, `discover` will resolve
+            // `_companion-link._tcp` and supply (host, port, IPv6 scope id)
+            // here instead of the CLI flags. See src/discover.rs and
+            // docs/m2-awdl-plan.md §3 step 4.
+            let (host, port) = discover::companion_link_target(&host, port)?;
+
+            // Pair-Verify needs the RPIdentity keys; fall back to --keys for CLI
+            // parity (it will not parse as an identity yet — the exporter is a
+            // follow-up, docs/m2-awdl-plan.md §4.1 — so this fails clearly).
+            let identity_path = identity.unwrap_or(keys);
+            let ident = companion::PairingIdentity::load(&identity_path)?;
+
+            tracing::info!(%host, port, "connecting companion-link (expected to fail without AWDL)");
+            let mut session = companion_client::connect(&host, port, ident).await?;
+            let peer = session
+                .system_info_exchange(&companion_client::SystemInfo {
+                    name: "ac-dc (Linux)".into(),
+                    model: "ac-dc,client".into(),
+                    os_version: env!("CARGO_PKG_VERSION").into(),
+                })
+                .await?;
+            let board = session.fetch_pasteboard().await?;
+            print_pasteboard(&peer, &board);
+        }
     }
     Ok(())
+}
+
+/// Print a fetched pasteboard and the peer's system info to stdout.
+fn print_pasteboard(peer: &companion_client::SystemInfo, board: &companion_client::Pasteboard) {
+    println!("peer: name={:?} model={:?} os={:?}", peer.name, peer.model, peer.os_version);
+    if board.items.is_empty() {
+        println!("pasteboard: (empty)");
+    }
+    for (i, item) in board.items.iter().enumerate() {
+        match std::str::from_utf8(&item.data) {
+            Ok(s) if item.uti.contains("text") => {
+                println!("item[{i}] {} ({} bytes): {s:?}", item.uti, item.data.len());
+            }
+            _ => {
+                println!(
+                    "item[{i}] {} ({} bytes): {}",
+                    item.uti,
+                    item.data.len(),
+                    hex::encode(&item.data)
+                );
+            }
+        }
+    }
 }

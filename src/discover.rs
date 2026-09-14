@@ -18,6 +18,24 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
 
 const SERVICE: &str = "_companion-link._tcp.local.";
 
+/// Resolve the companion-link peer's `(host, port)` for `ac-dc pull`.
+///
+/// STUB: today this only validates and passes through the CLI-supplied
+/// `host`/`port`. Once `awdl0` exists (see `docs/m2-awdl-plan.md`), this is
+/// where a `browse`/resolve of `_companion-link._tcp` over that interface will
+/// supply the peer's IPv6 link-local address, port, and scope id automatically
+/// — triggered by the BLE "clipboard available" wake signal from M1. For now,
+/// discovery is manual: run `ac-dc discover` to find the values, then pass them.
+pub fn companion_link_target(host: &str, port: u16) -> Result<(String, u16)> {
+    if port == 0 {
+        anyhow::bail!(
+            "no companion-link port: pass --port (auto-discovery over awdl0 is not wired yet; \
+             see `ac-dc discover` and docs/m2-awdl-plan.md)"
+        );
+    }
+    Ok((host.to_string(), port))
+}
+
 pub async fn run() -> Result<()> {
     let daemon = ServiceDaemon::new().context("starting mDNS daemon")?;
     let receiver = daemon.browse(SERVICE).context("browsing companion-link")?;
