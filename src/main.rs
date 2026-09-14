@@ -179,11 +179,10 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            // TODO(discover): once awdl0 is up, `discover` will resolve
-            // `_companion-link._tcp` and supply (host, port, IPv6 scope id)
-            // here instead of the CLI flags. See src/discover.rs and
-            // docs/m2-awdl-plan.md §3 step 4.
-            let (host, port) = discover::companion_link_target(&host, port)?;
+            // Once awdl0 is up, `companion_link_target` resolves
+            // `_companion-link._tcp` scoped to it (a non-zero --port is still a
+            // manual override). See src/discover.rs and docs/m2-awdl-plan.md §4.
+            let (host, port) = discover::companion_link_target(&host, port).await?;
 
             // Pair-Verify needs the RPIdentity keys; fall back to --keys for CLI
             // parity (it will not parse as an identity yet — the exporter is a
