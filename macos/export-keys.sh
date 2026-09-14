@@ -25,6 +25,24 @@
 
 set -euo pipefail
 
+# Resolve our real directory even when invoked via a symlink (e.g. a Homebrew
+# bin shim that points into libexec), so we can locate dump-to-keys.py.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+# Prefer the Homebrew-installed converter command if it's on PATH, else the
+# sibling script next to us (repo checkout).
+if command -v handoff-clip-dump-to-keys >/dev/null 2>&1; then
+    CONV="handoff-clip-dump-to-keys"
+else
+    CONV="python3 \"$SCRIPT_DIR/dump-to-keys.py\""
+fi
+
 EXPORT_DIR="$HOME/Library/Application Support/handoff-clip"
 LABEL="app.handoffclip.cleanup"
 AGENT_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -126,11 +144,11 @@ rapportd and prints every Continuity key for all your iCloud devices.
 
 Then convert the dump to keys.json IN THE SECURE DIR (pure Python stdlib):
 
-    python3 "$(dirname "$0")/dump-to-keys.py" \\
+    $CONV \\
         "$EXPORT_DIR/dump.json" -o "$EXPORT_DIR/keys.json"
     chmod 600 "$EXPORT_DIR/keys.json"
     rm -f "$EXPORT_DIR/dump.json"          # the dump holds ALL keys in plaintext
-    bash "$(dirname "$0")/export-keys.sh" --arm-autowipe-only
+    bash "$SCRIPT_DIR/export-keys.sh" --arm-autowipe-only
 
   dump-to-keys.py walks the whole dump, decodes every hex/base64/plist blob it
   finds, and keeps the ones that parse to a keychain item carrying \`keyData\`
