@@ -10,12 +10,14 @@
 
 mod advert;
 mod advertise;
+mod clipboard_out;
 mod companion;
 mod companion_client;
 mod discover;
 mod gcm;
 mod keystore;
 mod opack;
+mod orchestrate;
 mod scan;
 mod tlv8;
 mod transfer;
@@ -89,6 +91,23 @@ enum Cmd {
         #[arg(long)]
         identity: Option<PathBuf>,
         /// Run against an in-process loopback mock peer (no network, no keys).
+        #[arg(long)]
+        loopback: bool,
+    },
+    /// Milestone 2 end-to-end orchestration: pull a copy onto the Linux
+    /// clipboard, tying the M1 + M2 pieces together.
+    ///
+    /// Walks the state machine: scan detects "clipboard available" -> [AWDL
+    /// bring-up] -> discover companion-link over awdl0 -> pull -> clipboard_out.
+    /// The AWDL bring-up is an unimplemented gate today (awdl0 does not exist
+    /// until the driver work lands), so the real flow stops there with a clear
+    /// error. Use `--loopback` to drive the pull -> clipboard glue against an
+    /// in-process mock peer — it actually lands text on your Wayland clipboard.
+    Auto {
+        /// RPIdentity keys for Pair-Verify (real flow only).
+        #[arg(long, default_value = "keys.json")]
+        identity: PathBuf,
+        /// Drive the wiring against the in-process loopback mock (no AWDL).
         #[arg(long)]
         loopback: bool,
     },
@@ -174,14 +193,14 @@ async fn main() -> Result<()> {
                 tracing::info!("running companion-link pull against in-process loopback mock");
                 let (peer, board) = companion_client::loopback_demo().await?;
                 print_pasteboard(&peer, &board);
+                land_on_clipboard(&board);
                 return Ok(());
             }
 
-            // TODO(discover): once awdl0 is up, `discover` will resolve
-            // `_companion-link._tcp` and supply (host, port, IPv6 scope id)
-            // here instead of the CLI flags. See src/discover.rs and
-            // docs/m2-awdl-plan.md §3 step 4.
-            let (host, port) = discover::companion_link_target(&host, port)?;
+            // Once awdl0 is up, `companion_link_target` resolves
+            // `_companion-link._tcp` scoped to it (a non-zero --port is still a
+            // manual override). See src/discover.rs and docs/m2-awdl-plan.md §4.
+            let (host, port) = discover::companion_link_target(&host, port).await?;
 
             // Pair-Verify needs the RPIdentity keys; fall back to --keys for CLI
             // parity (it will not parse as an identity yet — the exporter is a
@@ -200,9 +219,24 @@ async fn main() -> Result<()> {
                 .await?;
             let board = session.fetch_pasteboard().await?;
             print_pasteboard(&peer, &board);
+            land_on_clipboard(&board);
+        }
+        Cmd::Auto { identity, loopback } => {
+            orchestrate::run(orchestrate::AutoConfig { identity_path: identity, loopback }).await?;
         }
     }
     Ok(())
+}
+
+/// Put a successfully fetched pasteboard on the Wayland clipboard via
+/// `clipboard_out`, printing what was copied. Best-effort: a clipboard failure
+/// is logged, not fatal, since the fetch itself already succeeded.
+fn land_on_clipboard(board: &companion_client::Pasteboard) {
+    match clipboard_out::copy_pasteboard(board) {
+        Ok(Some(outcome)) => println!("clipboard: copied {}", outcome.describe()),
+        Ok(None) => println!("clipboard: nothing to copy (empty pasteboard)"),
+        Err(e) => tracing::error!(error = %e, "failed to put pasteboard on the clipboard"),
+    }
 }
 
 /// Print a fetched pasteboard and the peer's system info to stdout.
