@@ -117,17 +117,23 @@ impl Worker {
 
         // Try each key until the 1-byte tag authenticates.
         for k in &self.keys {
-            if let Some(plain) = gcm::open_truncated(
+            let plain = match gcm::open_truncated(
                 &k.key,
                 &ble.counter_iv,
                 &[ble.status],
                 &ble.ciphertext,
                 &ble.tag,
             ) {
-                if let Some(payload) = HandoffPayload::parse(&plain) {
-                    self.report(addr, &k.id, &payload);
-                    return;
+                Ok(Some(plain)) => plain,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::error!(key = %k.id, error = %e, "skipping key");
+                    continue;
                 }
+            };
+            if let Some(payload) = HandoffPayload::parse(&plain) {
+                self.report(addr, &k.id, &payload);
+                return;
             }
         }
     }

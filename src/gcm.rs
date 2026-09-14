@@ -10,24 +10,81 @@
 //! additionalAuthenticatedData:mode:.detached)` as used by seemoo-lab's
 //! handoff-ble-viewer (`BLEDecryptor.swift`).
 //!
+//! The key is `keyData` from the keychain item, used as-is. The reference passes
+//! it straight to CryptoSwift's `AES`, which selects AES-128/192/256 from the
+//! key length, so we accept 16, 24 and 32 bytes the same way. Apple's Platform
+//! Security guide describes the Handoff key as 256-bit AES-GCM, and a real
+//! macOS 26.1 export yielded 32-byte keys.
+//!
 //! IMPORTANT: this path is derived from the spec for a sub-96-bit IV; it still
 //! needs validation against a real captured packet from your own devices (see
-//! README, "Validation"). The unit test below only checks internal consistency.
+//! README, "Validation"). The unit tests below only check internal consistency.
 
+use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockEncrypt, KeyInit};
-use aes::Aes128;
+use aes::{Aes128, Aes192, Aes256};
 use ghash::universal_hash::UniversalHash;
 use ghash::GHash;
+use std::fmt;
 
 const BLOCK: usize = 16;
 
-/// Encrypt one AES-128 block (ECB core), used for GHASH key H and CTR blocks.
-fn aes_block(cipher: &Aes128, input: &[u8; BLOCK]) -> [u8; BLOCK] {
-    let mut b = aes::cipher::generic_array::GenericArray::clone_from_slice(input);
-    cipher.encrypt_block(&mut b);
-    let mut out = [0u8; BLOCK];
-    out.copy_from_slice(&b);
-    out
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcmError {
+    /// The key was not 16, 24 or 32 bytes (AES-128/192/256).
+    InvalidKeyLength(usize),
+    /// A tag of 0 bytes or longer than one block was requested.
+    InvalidTagLength(usize),
+}
+
+impl fmt::Display for GcmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GcmError::InvalidKeyLength(n) => {
+                write!(f, "AES key must be 16, 24 or 32 bytes, got {n}")
+            }
+            GcmError::InvalidTagLength(n) => {
+                write!(f, "GCM tag must be 1..={BLOCK} bytes, got {n}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GcmError {}
+
+/// Check that `key` is a length this module accepts.
+pub fn validate_key(key: &[u8]) -> Result<(), GcmError> {
+    AesCipher::new(key).map(drop)
+}
+
+enum AesCipher {
+    Aes128(Aes128),
+    Aes192(Aes192),
+    Aes256(Aes256),
+}
+
+impl AesCipher {
+    fn new(key: &[u8]) -> Result<Self, GcmError> {
+        let invalid = || GcmError::InvalidKeyLength(key.len());
+        match key.len() {
+            16 => Aes128::new_from_slice(key).map(Self::Aes128),
+            24 => Aes192::new_from_slice(key).map(Self::Aes192),
+            32 => Aes256::new_from_slice(key).map(Self::Aes256),
+            _ => return Err(invalid()),
+        }
+        .map_err(|_| invalid())
+    }
+
+    /// Encrypt one block (ECB core), used for GHASH key H and CTR blocks.
+    fn encrypt_block(&self, input: &[u8; BLOCK]) -> [u8; BLOCK] {
+        let mut b = GenericArray::clone_from_slice(input);
+        match self {
+            Self::Aes128(c) => c.encrypt_block(&mut b),
+            Self::Aes192(c) => c.encrypt_block(&mut b),
+            Self::Aes256(c) => c.encrypt_block(&mut b),
+        }
+        b.into()
+    }
 }
 
 fn xor_into(dst: &mut [u8], src: &[u8]) {
@@ -75,28 +132,30 @@ fn inc32(mut j: [u8; BLOCK]) -> [u8; BLOCK] {
 
 /// Decrypt-and-verify with a truncated tag.
 ///
-/// * `key` – 16-byte AES-128 key (`keyData` from the keychain item).
+/// * `key` – `keyData` from the keychain item: 16, 24 or 32 bytes
+///   (AES-128/192/256).
 /// * `iv` – advertisement counter bytes (little-endian on the wire; we feed
 ///   them here exactly as they appear in the packet).
 /// * `aad` – the plaintext status byte.
 /// * `ciphertext` – the encrypted payload (10 bytes for a Handoff advert).
 /// * `tag` – the truncated authentication tag from the packet (1 byte).
 ///
-/// Returns the plaintext if the truncated tag matches, else `None`.
+/// Returns `Ok(Some(plaintext))` if the truncated tag matches, `Ok(None)` if
+/// it does not, and `Err` for a key or tag length this module cannot use.
 pub fn open_truncated(
     key: &[u8],
     iv: &[u8],
     aad: &[u8],
     ciphertext: &[u8],
     tag: &[u8],
-) -> Option<Vec<u8>> {
-    if key.len() != 16 {
-        return None;
+) -> Result<Option<Vec<u8>>, GcmError> {
+    if tag.is_empty() || tag.len() > BLOCK {
+        return Err(GcmError::InvalidTagLength(tag.len()));
     }
-    let cipher = Aes128::new(aes::cipher::generic_array::GenericArray::from_slice(key));
+    let cipher = AesCipher::new(key)?;
 
     // H = E_K(0^128)
-    let h = aes_block(&cipher, &[0u8; BLOCK]);
+    let h = cipher.encrypt_block(&[0u8; BLOCK]);
 
     // J0 from the short IV.
     let j0 = j0_short_iv(&h, iv);
@@ -112,27 +171,24 @@ pub fn open_truncated(
     let s = ghash(&h, &blocks);
 
     // Full tag = E_K(J0) XOR S, then truncate to the length we were given.
-    let mut full_tag = aes_block(&cipher, &j0);
+    let mut full_tag = cipher.encrypt_block(&j0);
     xor_into(&mut full_tag, &s);
 
-    if tag.is_empty() || tag.len() > BLOCK {
-        return None;
-    }
     if full_tag[..tag.len()] != *tag {
-        return None;
+        return Ok(None);
     }
 
     // CTR decrypt from inc32(J0).
     let mut plaintext = Vec::with_capacity(ciphertext.len());
     let mut counter = inc32(j0);
     for chunk in ciphertext.chunks(BLOCK) {
-        let ks = aes_block(&cipher, &counter);
+        let ks = cipher.encrypt_block(&counter);
         let mut block = chunk.to_vec();
         xor_into(&mut block, &ks[..chunk.len()]);
         plaintext.extend_from_slice(&block);
         counter = inc32(counter);
     }
-    Some(plaintext)
+    Ok(Some(plaintext))
 }
 
 /// Encrypt-and-tag with a truncated tag — the inverse of [`open_truncated`],
@@ -147,19 +203,19 @@ pub fn seal_truncated(
     aad: &[u8],
     plaintext: &[u8],
     tag_len: usize,
-) -> Option<(Vec<u8>, Vec<u8>)> {
-    if key.len() != 16 || tag_len == 0 || tag_len > BLOCK {
-        return None;
+) -> Result<(Vec<u8>, Vec<u8>), GcmError> {
+    if tag_len == 0 || tag_len > BLOCK {
+        return Err(GcmError::InvalidTagLength(tag_len));
     }
-    let cipher = Aes128::new(aes::cipher::generic_array::GenericArray::from_slice(key));
-    let h = aes_block(&cipher, &[0u8; BLOCK]);
+    let cipher = AesCipher::new(key)?;
+    let h = cipher.encrypt_block(&[0u8; BLOCK]);
     let j0 = j0_short_iv(&h, iv);
 
     // CTR encrypt from inc32(J0).
     let mut ciphertext = Vec::with_capacity(plaintext.len());
     let mut counter = inc32(j0);
     for chunk in plaintext.chunks(BLOCK) {
-        let ks = aes_block(&cipher, &counter);
+        let ks = cipher.encrypt_block(&counter);
         let mut block = chunk.to_vec();
         xor_into(&mut block, &ks[..chunk.len()]);
         ciphertext.extend_from_slice(&block);
@@ -176,9 +232,9 @@ pub fn seal_truncated(
     blocks.push(len_block);
     let s = ghash(&h, &blocks);
 
-    let mut full_tag = aes_block(&cipher, &j0);
+    let mut full_tag = cipher.encrypt_block(&j0);
     xor_into(&mut full_tag, &s);
-    Some((ciphertext, full_tag[..tag_len].to_vec()))
+    Ok((ciphertext, full_tag[..tag_len].to_vec()))
 }
 
 #[cfg(test)]
@@ -197,13 +253,13 @@ mod tests {
         let plaintext = b"0123456789"; // 10 bytes, like a Handoff payload
 
         // Encrypt by hand using the same helpers.
-        let cipher = Aes128::new(aes::cipher::generic_array::GenericArray::from_slice(&key));
-        let h = aes_block(&cipher, &[0u8; BLOCK]);
+        let cipher = AesCipher::new(&key).unwrap();
+        let h = cipher.encrypt_block(&[0u8; BLOCK]);
         let j0 = j0_short_iv(&h, &iv);
         let mut ct = Vec::new();
         let mut counter = inc32(j0);
         for chunk in plaintext.chunks(BLOCK) {
-            let ks = aes_block(&cipher, &counter);
+            let ks = cipher.encrypt_block(&counter);
             let mut b = chunk.to_vec();
             xor_into(&mut b, &ks[..chunk.len()]);
             ct.extend_from_slice(&b);
@@ -217,15 +273,20 @@ mod tests {
         len_block[8..].copy_from_slice(&((ct.len() as u64) * 8).to_be_bytes());
         blocks.push(len_block);
         let s = ghash(&h, &blocks);
-        let mut full_tag = aes_block(&cipher, &j0);
+        let mut full_tag = cipher.encrypt_block(&j0);
         xor_into(&mut full_tag, &s);
         let tag = [full_tag[0]]; // 1-byte truncated tag
 
-        let out = open_truncated(&key, &iv, &aad, &ct, &tag).expect("tag should verify");
+        let out = open_truncated(&key, &iv, &aad, &ct, &tag)
+            .expect("valid key")
+            .expect("tag should verify");
         assert_eq!(out, plaintext);
 
         // A wrong tag must be rejected.
-        assert!(open_truncated(&key, &iv, &aad, &ct, &[tag[0] ^ 0xff]).is_none());
+        assert_eq!(
+            open_truncated(&key, &iv, &aad, &ct, &[tag[0] ^ 0xff]),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -236,7 +297,94 @@ mod tests {
         let plaintext = b"clipboard!"; // 10 bytes
         let (ct, tag) = seal_truncated(&key, &iv, &aad, plaintext, 1).expect("seal");
         assert_eq!(tag.len(), 1);
-        let out = open_truncated(&key, &iv, &aad, &ct, &tag).expect("open");
+        let out = open_truncated(&key, &iv, &aad, &ct, &tag)
+            .expect("valid key")
+            .expect("open");
         assert_eq!(out, plaintext);
+    }
+
+    /// FIPS-197 Appendix C known-answer vectors, one per key length, so the
+    /// variant selected for each length is pinned to an external reference.
+    #[test]
+    fn fips197_block_vectors() {
+        let plaintext: [u8; 16] = hex::decode("00112233445566778899aabbccddeeff")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        for (len, expected) in [
+            (16usize, "69c4e0d86a7b0430d8cdb78070b4c55a"),
+            (24, "dda97ca4864cdfe06eaf70a0ec0d7191"),
+            (32, "8ea2b7ca516745bfeafc49904b496089"),
+        ] {
+            let key: Vec<u8> = (0..len as u8).collect();
+            let out = AesCipher::new(&key).unwrap().encrypt_block(&plaintext);
+            assert_eq!(hex::encode(out), expected, "key length {len}");
+        }
+    }
+
+    /// AES-192 and AES-256 keys must round-trip exactly like AES-128.
+    #[test]
+    fn seal_then_open_aes192_and_aes256() {
+        let iv = [0x13u8, 0x37];
+        let aad = [0x08u8];
+        let plaintext = b"clipboard!";
+        for len in [24usize, 32] {
+            let key: Vec<u8> = (0..len as u8).collect();
+            let (ct, tag) = seal_truncated(&key, &iv, &aad, plaintext, 1).expect("seal");
+            assert_eq!(tag.len(), 1);
+            let out = open_truncated(&key, &iv, &aad, &ct, &tag)
+                .expect("valid key")
+                .expect("open");
+            assert_eq!(out, plaintext, "key length {len}");
+            assert_eq!(
+                open_truncated(&key, &iv, &aad, &ct, &[tag[0] ^ 0xff]),
+                Ok(None),
+                "wrong tag must be rejected for key length {len}"
+            );
+        }
+    }
+
+    /// A 32-byte key is AES-256, not a 16-byte key with 16 ignored bytes.
+    #[test]
+    fn aes256_key_is_not_truncated_to_aes128() {
+        let key: Vec<u8> = (0..32u8).collect();
+        let iv = [0x00u8, 0x01];
+        let aad = [0x08u8];
+        let (ct, tag) = seal_truncated(&key, &iv, &aad, b"clipboard!", 16).expect("seal");
+        assert_eq!(open_truncated(&key[..16], &iv, &aad, &ct, &tag), Ok(None));
+    }
+
+    #[test]
+    fn invalid_key_length_is_an_error() {
+        let iv = [0x00u8, 0x01];
+        let aad = [0x08u8];
+        for len in [0usize, 15, 20, 33] {
+            let key = vec![0u8; len];
+            assert_eq!(
+                open_truncated(&key, &iv, &aad, &[0u8; 10], &[0]),
+                Err(GcmError::InvalidKeyLength(len))
+            );
+            assert_eq!(
+                seal_truncated(&key, &iv, &aad, &[0u8; 10], 1),
+                Err(GcmError::InvalidKeyLength(len))
+            );
+            assert_eq!(validate_key(&key), Err(GcmError::InvalidKeyLength(len)));
+        }
+        for len in [16usize, 24, 32] {
+            assert_eq!(validate_key(&vec![0u8; len]), Ok(()));
+        }
+    }
+
+    #[test]
+    fn invalid_tag_length_is_an_error() {
+        let key = [0u8; 16];
+        assert_eq!(
+            open_truncated(&key, &[0, 1], &[8], &[0u8; 10], &[]),
+            Err(GcmError::InvalidTagLength(0))
+        );
+        assert_eq!(
+            seal_truncated(&key, &[0, 1], &[8], &[0u8; 10], 17),
+            Err(GcmError::InvalidTagLength(17))
+        );
     }
 }
