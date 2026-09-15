@@ -91,7 +91,10 @@ fn classify(uti: &str) -> (PlanKind, Option<String>) {
     } else if let Some(mime) = image_mime(uti) {
         (PlanKind::Image, Some(mime.to_string()))
     } else {
-        (PlanKind::Other, Some("application/octet-stream".to_string()))
+        (
+            PlanKind::Other,
+            Some("application/octet-stream".to_string()),
+        )
     }
 }
 
@@ -135,7 +138,12 @@ pub fn plan_copy(pb: &Pasteboard) -> Option<CopyPlan> {
             Some(b) => kind.rank() < b.kind.rank(),
         };
         if better {
-            best = Some(CopyPlan { index: i, uti: item.uti.clone(), mime, kind });
+            best = Some(CopyPlan {
+                index: i,
+                uti: item.uti.clone(),
+                mime,
+                kind,
+            });
         }
     }
     best
@@ -190,6 +198,12 @@ fn run_wl_copy(mime: Option<&str>, data: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    // A wl-copy child in a short-lived systemd service dies with its cgroup.
+    // Give the clipboard owner a separate unit; exec readiness ensures the
+    // service opened the private stdin file before we unlink it.
+    if std::env::var_os("INVOCATION_ID").is_some() {
+        return service_copy(mime, data);
+    }
     let mut cmd = Command::new("wl-copy");
     if let Some(m) = mime {
         cmd.arg("--type").arg(m);
@@ -219,20 +233,69 @@ fn run_wl_copy(mime: Option<&str>, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn service_copy(mime: Option<&str>, data: &[u8]) -> Result<()> {
+    use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, process::Command};
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .context("XDG_RUNTIME_DIR unavailable for clipboard service")?;
+    let path = std::path::PathBuf::from(runtime)
+        .join(format!("ac-dc-clipboard-{:032x}", rand::random::<u128>()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)?;
+    struct Remove(std::path::PathBuf);
+    impl Drop for Remove {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _remove = Remove(path.clone());
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
+    let mut cmd = Command::new("systemd-run");
+    cmd.args(["--user", "--quiet", "--collect", "--service-type=exec"])
+        .arg(format!("--property=StandardInput=file:{}", path.display()))
+        .arg("--property=UMask=0077")
+        .arg("--")
+        .arg("wl-copy")
+        .arg("--foreground");
+    if let Some(m) = mime {
+        cmd.args(["--type", m]);
+    }
+    let out = cmd
+        .output()
+        .context("starting independent clipboard owner")?;
+    if !out.status.success() {
+        bail!(
+            "clipboard service failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::companion_client::PasteboardItem;
 
     fn item(uti: &str, data: &[u8]) -> PasteboardItem {
-        PasteboardItem { uti: uti.into(), data: data.to_vec() }
+        PasteboardItem {
+            uti: uti.into(),
+            data: data.to_vec(),
+        }
     }
 
     #[test]
     fn prefers_text_over_image() {
         // Image listed first, but text must still win.
         let pb = Pasteboard {
-            items: vec![item("public.png", &[0x89, 0x50]), item("public.utf8-plain-text", b"hi")],
+            items: vec![
+                item("public.png", &[0x89, 0x50]),
+                item("public.utf8-plain-text", b"hi"),
+            ],
         };
         let plan = plan_copy(&pb).unwrap();
         assert_eq!(plan.kind, PlanKind::Text);
@@ -249,7 +312,9 @@ mod tests {
             ("com.compuserve.gif", "image/gif"),
             ("public.heic", "image/heic"),
         ] {
-            let pb = Pasteboard { items: vec![item(uti, &[0])] };
+            let pb = Pasteboard {
+                items: vec![item(uti, &[0])],
+            };
             let plan = plan_copy(&pb).unwrap();
             assert_eq!(plan.kind, PlanKind::Image, "{uti}");
             assert_eq!(plan.mime.as_deref(), Some(mime), "{uti}");
@@ -258,7 +323,9 @@ mod tests {
 
     #[test]
     fn unknown_uti_falls_back_to_octet_stream() {
-        let pb = Pasteboard { items: vec![item("com.acme.proprietary", &[1, 2, 3])] };
+        let pb = Pasteboard {
+            items: vec![item("com.acme.proprietary", &[1, 2, 3])],
+        };
         let plan = plan_copy(&pb).unwrap();
         assert_eq!(plan.kind, PlanKind::Other);
         assert_eq!(plan.mime.as_deref(), Some("application/octet-stream"));
@@ -273,7 +340,10 @@ mod tests {
     fn earliest_text_representation_wins_on_tie() {
         // Two text reps: the earliest (best-first, per Apple's ordering) wins.
         let pb = Pasteboard {
-            items: vec![item("public.text", b"a"), item("public.utf8-plain-text", b"b")],
+            items: vec![
+                item("public.text", b"a"),
+                item("public.utf8-plain-text", b"b"),
+            ],
         };
         let plan = plan_copy(&pb).unwrap();
         assert_eq!(plan.index, 0);

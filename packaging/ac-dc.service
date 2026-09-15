@@ -1,0 +1,16 @@
+[Unit]
+Description=Apple Continuity clipboard receiver
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/ac-dc auto --keys %h/.config/ac-dc/keys.json --identity %h/.config/ac-dc/rpidentity.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+# Radio windows are managed separately. This template is not auto-enabled.
+
+[Install]
+WantedBy=graphical-session.target

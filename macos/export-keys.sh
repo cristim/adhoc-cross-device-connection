@@ -18,8 +18,8 @@
 #     protection; the auto-wipe is hygiene, not a secure erase. Re-exporting is
 #     cheap (keys are long-term + iCloud-synced), so we wipe aggressively.
 #
-# On Linux/Asahi, pull the file with scripts/import-keys-from-macos.sh, which
-# mounts this volume READ-ONLY so the key never leaves encrypted storage.
+# Transfer to Linux with the macOS send-key helper and ac-dc receive-key,
+# or read the exported file from an already-mounted, read-only macOS volume.
 #
 # Two extraction paths below. Try A first; if it comes up empty, use B.
 
@@ -96,7 +96,7 @@ secure_finish() {
     install_autowipe
     echo
     echo "Exported to: $1"
-    echo "On Linux:    ./scripts/import-keys-from-macos.sh   (mounts this volume read-only)"
+    echo "Transfer the exported file securely to Linux, or read it from a read-only macOS volume."
 }
 
 # Called as `export-keys.sh --arm-autowipe-only` after a manual Path B
@@ -155,6 +155,6 @@ Then convert the dump to keys.json IN THE SECURE DIR (pure Python stdlib):
   (service "com.apple.continuity.encryption"). It skips wrapped keys (not
   directly usable) and unrelated items automatically.
 
-Then on Linux:  ./scripts/import-keys-from-macos.sh
+# On Linux: use the exported rpidentity.json from a secure transfer or read-only macOS mount.
 EOF
 exit 1

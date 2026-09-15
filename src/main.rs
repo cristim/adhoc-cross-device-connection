@@ -1,20 +1,13 @@
-//! ac-dc: receive Apple Universal Clipboard / Handoff BLE announcements
-//! on Linux, using encryption keys exported from a macOS install signed into
-//! the same Apple ID.
-//!
-//! This first milestone covers DISCOVERY + DECRYPTION of the BLE advertisement:
-//! it tells you, on Linux, the moment your iPhone or Mac copies something. The
-//! subsequent milestones (pulling the actual clipboard content over the
-//! companion-link service, then the reverse direction) are tracked in the
-//! README roadmap.
-
+//! Apple Continuity receiver and diagnostic tools.
 mod advert;
 mod advertise;
+mod airdrop;
 mod clipboard_out;
 mod companion;
 mod companion_client;
 mod discover;
 mod gcm;
+mod health;
 mod keystore;
 mod opack;
 mod orchestrate;
@@ -48,7 +41,60 @@ enum Cmd {
     /// Browse for `_companion-link._tcp` over mDNS (no keys needed). The live
     /// test of whether the M2 content channel is reachable over plain LAN vs.
     /// AWDL-only. See src/discover.rs.
-    Discover,
+    Discover {
+        #[arg(long, default_value = "awdl0")]
+        iface: String,
+        #[arg(long)]
+        lan: bool,
+    },
+    /// Report missing runtime prerequisites without changing the radio.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        keys: Option<PathBuf>,
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+    /// Report observed AWDL state; link readiness is not proof of transport.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register captured/reconstructed Apple TLVs through BlueZ for a bounded experiment.
+    Advertise {
+        #[arg(
+            long,
+            required_unless_present = "airdrop_wake",
+            conflicts_with = "airdrop_wake"
+        )]
+        data: Option<String>,
+        #[arg(long)]
+        airdrop_wake: bool,
+        #[arg(long, default_value_t = 30)]
+        seconds: u64,
+        #[arg(long, default_value_t = 100)]
+        interval_ms: u64,
+    },
+    /// Receive AirDrop links/files for a bounded Everyone-mode window (experimental).
+    Receive {
+        #[arg(long, default_value = "awdl0")]
+        iface: String,
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        tls_identity: PathBuf,
+        #[arg(long, default_value = "ac-dc")]
+        name: String,
+        #[arg(long, default_value_t = 8771)]
+        port: u16,
+        #[arg(long, default_value_t = 600)]
+        seconds: u64,
+        #[arg(long)]
+        once: bool,
+        #[arg(long)]
+        notify: bool,
+    },
     /// Receive an exported `keys.json` from a Mac over Bluetooth LE.
     ///
     /// Runs a GATT server; on the Mac run `ac-dc send-key`. An ephemeral X25519
@@ -72,7 +118,7 @@ enum Cmd {
     ///
     /// Runs the transport-independent client: TCP connect, Pair-Verify M1-M4,
     /// then the system-info and pasteboard-fetch exchanges. Until AWDL is up
-    /// (see docs/m2-awdl-plan.md) this will fail at `connect` against a real
+    /// (see docs/architecture.md) this will fail at `connect` against a real
     /// device — that is expected. Use `--loopback` to exercise the full flow
     /// against an in-process mock peer with no network.
     Pull {
@@ -87,23 +133,27 @@ enum Cmd {
         #[arg(short, long, default_value = "keys.json")]
         keys: PathBuf,
         /// RPIdentity keys (Ed25519 signing key + known peers) for Pair-Verify.
-        /// The exporter for these does not exist yet (docs/m2-awdl-plan.md §4.1).
+        /// See macos/RPIDENTITY.md for the exporter and expected schema.
         #[arg(long)]
         identity: Option<PathBuf>,
         /// Run against an in-process loopback mock peer (no network, no keys).
         #[arg(long)]
         loopback: bool,
+        /// Fresh JSONL from awdlctl events, used if mDNS resolution fails.
+        #[arg(long, requires = "peer_mac")]
+        events: Option<PathBuf>,
+        #[arg(long)]
+        peer_mac: Option<String>,
     },
-    /// Milestone 2 end-to-end orchestration: pull a copy onto the Linux
-    /// clipboard, tying the M1 + M2 pieces together.
-    ///
-    /// Walks the state machine: scan detects "clipboard available" -> [AWDL
-    /// bring-up] -> discover companion-link over awdl0 -> pull -> clipboard_out.
-    /// The AWDL bring-up is an unimplemented gate today (awdl0 does not exist
-    /// until the driver work lands), so the real flow stops there with a clear
-    /// error. Use `--loopback` to drive the pull -> clipboard glue against an
-    /// in-process mock peer — it actually lands text on your Wayland clipboard.
+    /// Watch real BLE copy events and pull from the matching companion-link peer.
     Auto {
+        #[arg(long, default_value = "keys.json")]
+        keys: PathBuf,
+        /// Explicit mDNS instance; otherwise match the triggering BLE address to rpBA.
+        #[arg(long)]
+        instance: Option<String>,
+        #[arg(long)]
+        notify: bool,
         /// RPIdentity keys for Pair-Verify (real flow only).
         #[arg(long, default_value = "keys.json")]
         identity: PathBuf,
@@ -116,6 +166,7 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "ac_dc=info".into()),
@@ -124,6 +175,67 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Receive {
+            iface,
+            directory,
+            tls_identity,
+            name,
+            port,
+            seconds,
+            once,
+            notify,
+        } => {
+            airdrop::run(airdrop::Config {
+                iface,
+                directory,
+                identity: tls_identity,
+                name,
+                port,
+                seconds,
+                once,
+                notify,
+            })
+            .await?;
+        }
+        Cmd::Doctor {
+            json,
+            keys,
+            identity,
+        } => {
+            let report = health::report(keys.as_deref(), identity.as_deref()).await;
+            println!(
+                "{}",
+                if json {
+                    serde_json::to_string(&report)?
+                } else {
+                    serde_json::to_string_pretty(&report)?
+                }
+            );
+        }
+        Cmd::Status { json } => {
+            let report = health::radio().await?;
+            println!(
+                "{}",
+                if json {
+                    serde_json::to_string(&report)?
+                } else {
+                    serde_json::to_string_pretty(&report)?
+                }
+            );
+        }
+        Cmd::Advertise {
+            data,
+            airdrop_wake,
+            seconds,
+            interval_ms,
+        } => {
+            let data = if airdrop_wake {
+                advertise::airdrop_wake()
+            } else {
+                hex::decode(data.unwrap_or_default())?
+            };
+            advertise::broadcast(data, seconds, interval_ms).await?;
+        }
         Cmd::Scan { keys } => {
             let store = keystore::KeyStore::load(&keys)?;
             if store.is_empty() {
@@ -134,26 +246,26 @@ async fn main() -> Result<()> {
             let scanner = scan::Scanner::new(store).await?;
             tokio::select! {
                 r = scanner.run() => r?,
-                _ = tokio::signal::ctrl_c() => tracing::info!("stopping"),
+                _ = shutdown() => tracing::info!("stopping"),
             }
         }
         Cmd::Capture => {
             let scanner = scan::Scanner::new_capture().await?;
             tokio::select! {
                 r = scanner.run_capture() => r?,
-                _ = tokio::signal::ctrl_c() => tracing::info!("stopping"),
+                _ = shutdown() => tracing::info!("stopping"),
             }
         }
-        Cmd::Discover => {
+        Cmd::Discover { iface, lan } => {
             tokio::select! {
-                r = discover::run() => r?,
-                _ = tokio::signal::ctrl_c() => tracing::info!("stopping"),
+                r = discover::run(if lan { None } else { Some(&iface) }) => r?,
+                _ = shutdown() => tracing::info!("stopping"),
             }
         }
         Cmd::ReceiveKey { out } => {
             tokio::select! {
                 r = transfer_ble::receive_key(&out) => r?,
-                _ = tokio::signal::ctrl_c() => tracing::info!("stopping"),
+                _ = shutdown() => tracing::info!("stopping"),
             }
         }
         Cmd::Decrypt { keys, data } => {
@@ -188,7 +300,15 @@ async fn main() -> Result<()> {
                 println!("no key authenticated this advertisement");
             }
         }
-        Cmd::Pull { host, port, keys, identity, loopback } => {
+        Cmd::Pull {
+            host,
+            port,
+            keys,
+            identity,
+            loopback,
+            events,
+            peer_mac,
+        } => {
             if loopback {
                 tracing::info!("running companion-link pull against in-process loopback mock");
                 let (peer, board) = companion_client::loopback_demo().await?;
@@ -199,12 +319,28 @@ async fn main() -> Result<()> {
 
             // Once awdl0 is up, `companion_link_target` resolves
             // `_companion-link._tcp` scoped to it (a non-zero --port is still a
-            // manual override). See src/discover.rs and docs/m2-awdl-plan.md §4.
-            let (host, port) = discover::companion_link_target(&host, port).await?;
+            // manual override). See src/discover.rs and docs/architecture.md §4.
+            let (host, port) = match discover::companion_link_target(&host, port).await {
+                Ok(target) => target,
+                Err(e) => {
+                    if let Some(path) = events {
+                        tracing::warn!(error=%e, "mDNS failed; checking captured management-frame service records");
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_millis() as u64;
+                        discover::from_events(
+                            &path,
+                            peer_mac.as_deref().unwrap_or(""),
+                            "awdl0",
+                            now,
+                        )?
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
 
-            // Pair-Verify needs the RPIdentity keys; fall back to --keys for CLI
-            // parity (it will not parse as an identity yet — the exporter is a
-            // follow-up, docs/m2-awdl-plan.md §4.1 — so this fails clearly).
+            // Pair-Verify uses a separate RPIdentity export, not the BLE key schema.
             let identity_path = identity.unwrap_or(keys);
             let ident = companion::PairingIdentity::load(&identity_path)?;
 
@@ -221,8 +357,21 @@ async fn main() -> Result<()> {
             print_pasteboard(&peer, &board);
             land_on_clipboard(&board);
         }
-        Cmd::Auto { identity, loopback } => {
-            orchestrate::run(orchestrate::AutoConfig { identity_path: identity, loopback }).await?;
+        Cmd::Auto {
+            keys,
+            identity,
+            instance,
+            loopback,
+            notify,
+        } => {
+            orchestrate::run(orchestrate::AutoConfig {
+                keys,
+                identity_path: identity,
+                instance,
+                loopback,
+                notify,
+            })
+            .await?;
         }
     }
     Ok(())
@@ -241,7 +390,10 @@ fn land_on_clipboard(board: &companion_client::Pasteboard) {
 
 /// Print a fetched pasteboard and the peer's system info to stdout.
 fn print_pasteboard(peer: &companion_client::SystemInfo, board: &companion_client::Pasteboard) {
-    println!("peer: name={:?} model={:?} os={:?}", peer.name, peer.model, peer.os_version);
+    println!(
+        "peer: name={:?} model={:?} os={:?}",
+        peer.name, peer.model, peer.os_version
+    );
     if board.items.is_empty() {
         println!("pasteboard: (empty)");
     }
@@ -260,4 +412,11 @@ fn print_pasteboard(peer: &companion_client::SystemInfo, board: &companion_clien
             }
         }
     }
+}
+
+/// Handle service termination as well as interactive cancellation.
+async fn shutdown() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler");
+    tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
 }

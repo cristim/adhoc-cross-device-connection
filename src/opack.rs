@@ -44,7 +44,10 @@ impl Value {
     /// Look up a string key in a dict.
     pub fn get(&self, key: &str) -> Option<&Value> {
         if let Value::Dict(pairs) = self {
-            pairs.iter().find(|(k, _)| matches!(k, Value::Str(s) if s == key)).map(|(_, v)| v)
+            pairs
+                .iter()
+                .find(|(k, _)| matches!(k, Value::Str(s) if s == key))
+                .map(|(_, v)| v)
         } else {
             None
         }
@@ -279,7 +282,12 @@ mod tests {
     fn roundtrip(v: Value) {
         let enc = encode(&v);
         let dec = decode(&enc).expect("decode");
-        assert_eq!(v, dec, "roundtrip mismatch; encoded = {}", hex::encode(&enc));
+        assert_eq!(
+            v,
+            dec,
+            "roundtrip mismatch; encoded = {}",
+            hex::encode(&enc)
+        );
     }
 
     #[test]
@@ -295,7 +303,18 @@ mod tests {
 
     #[test]
     fn ints() {
-        for v in [0u64, 1, 0x26, 0x27, 0xFF, 0x100, 266256, 0x00FF_FFFF, 0x0100_0000, u32::MAX as u64] {
+        for v in [
+            0u64,
+            1,
+            0x26,
+            0x27,
+            0xFF,
+            0x100,
+            266256,
+            0x00FF_FFFF,
+            0x0100_0000,
+            u32::MAX as u64,
+        ] {
             roundtrip(Value::Int(v));
         }
         // small-int encoding boundary
@@ -317,9 +336,13 @@ mod tests {
         roundtrip(Value::Bytes(vec![0u8; 10]));
         roundtrip(Value::Bytes(vec![0xABu8; 300])); // long form
         roundtrip(Value::Array((0..20).map(Value::Int).collect())); // endless form
-        roundtrip(Value::Array(vec![Value::Bool(true), Value::Str("a".into())]));
-        let big: Vec<(Value, Value)> =
-            (0..20).map(|i| (Value::Str(format!("k{i}")), Value::Int(i))).collect();
+        roundtrip(Value::Array(vec![
+            Value::Bool(true),
+            Value::Str("a".into()),
+        ]));
+        let big: Vec<(Value, Value)> = (0..20)
+            .map(|i| (Value::Str(format!("k{i}")), Value::Int(i)))
+            .collect();
         roundtrip(Value::Dict(big)); // endless dict
     }
 
@@ -327,7 +350,13 @@ mod tests {
     fn nested() {
         let v = Value::dict([
             ("_pd", Value::Bytes(vec![1, 2, 3])),
-            ("list", Value::Array(vec![Value::Int(1), Value::dict([("a", Value::Bool(false))])])),
+            (
+                "list",
+                Value::Array(vec![
+                    Value::Int(1),
+                    Value::dict([("a", Value::Bool(false))]),
+                ]),
+            ),
         ]);
         roundtrip(v);
     }

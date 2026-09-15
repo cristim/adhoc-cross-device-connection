@@ -1,181 +1,229 @@
-//! mDNS-SD discovery of `_companion-link._tcp` — the service Handoff /
-//! Universal Clipboard use for the content transfer.
-//!
-//! This is the ONE part of M2 that is live-testable right now, and it's the
-//! critical experiment for the whole content-pull path: normally the service is
-//! announced over Apple's AWDL peer-to-peer Wi-Fi, which this machine's
-//! `brcmfmac` cannot do (no monitor mode). If `discover` finds your iPhone/Mac
-//! over your ordinary Wi-Fi/Ethernet LAN, M2 is viable here; if nothing ever
-//! resolves while the devices are awake and nearby, the transport is AWDL-only
-//! and M2 becomes a kernel-driver problem.
-//!
-//! The TXT record carries `rpBA` (a rotating BLE-address string), `rpAD` (a
-//! SipHash auth tag over rpBA and the device IRK — used to confirm same Apple
-//! ID), and `rpVr` (version).
-
-use anyhow::{Context, Result};
+//! Scoped companion-link discovery. Discovery is a hint; Pair-Verify authenticates peers.
+use anyhow::{ensure, Context, Result};
 use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent};
-use std::time::Duration;
-
+use std::{
+    net::{IpAddr, SocketAddr, SocketAddrV6},
+    time::Duration,
+};
 const SERVICE: &str = "_companion-link._tcp.local.";
-
-/// The AWDL peer-to-peer Wi-Fi interface Universal Clipboard announces over.
-/// It does NOT exist on this host until the OWL/driver bring-up lands
-/// (docs/m2-awdl-plan.md) — `awdl_interface_present()` is honest about that.
-const AWDL_IFACE: &str = "awdl0";
-
-/// How long an automatic resolve waits before giving up.
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Is an `awdl0` interface up on this host right now?
-///
-/// Today this returns `false` on this machine: `awdl0` does not exist until the
-/// AWDL driver work lands (only `lo`/`wlan0` are present). Kernel network
-/// interfaces show up as directories under `/sys/class/net/`.
-pub fn awdl_interface_present() -> bool {
-    std::path::Path::new("/sys/class/net").join(AWDL_IFACE).exists()
+struct Daemon(ServiceDaemon);
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.stop_browse(SERVICE);
+        let _ = self.0.shutdown();
+    }
 }
-
-/// Resolve the companion-link peer's `(host, port)` for `ac-dc pull`.
-///
-/// Two paths:
-///   * **Manual override** — if a non-zero `port` is supplied, trust the
-///     caller's `host`/`port` and skip discovery. This keeps `--host/--port`,
-///     loopback, and the plain-LAN experiment (`ac-dc discover`) working.
-///   * **Automatic** — with `port == 0`, resolve `_companion-link._tcp` scoped
-///     to `awdl0`. This is the eventual wake-driven path (a BLE "clipboard
-///     available" advert triggers the lookup).
-///
-/// AWDL-GATED: automatic resolution requires `awdl0`, which does not exist yet;
-/// [`discover_over_awdl`] returns a clear "AWDL interface not up yet" error in
-/// that case rather than pretending.
+pub fn scope_address(address: IpAddr, iface: &str) -> Result<SocketAddr> {
+    match address {
+        IpAddr::V6(v) if v.is_unicast_link_local() => {
+            let s = std::ffi::CString::new(iface)?;
+            let idx = unsafe { libc::if_nametoindex(s.as_ptr()) };
+            ensure!(idx != 0, "interface {iface} does not exist");
+            Ok(SocketAddr::V6(SocketAddrV6::new(v, 0, 0, idx)))
+        }
+        _ => Ok(SocketAddr::new(address, 0)),
+    }
+}
+pub async fn socket_target(host: &str, port: u16) -> Result<SocketAddr> {
+    if let Some((ip, zone)) = host.rsplit_once('%') {
+        let ip: std::net::Ipv6Addr = ip.trim_start_matches('[').parse()?;
+        let zone = zone.trim_end_matches(']');
+        let index = match zone.parse::<u32>() {
+            Ok(i) => i,
+            Err(_) => {
+                let s = std::ffi::CString::new(zone)?;
+                unsafe { libc::if_nametoindex(s.as_ptr()) }
+            }
+        };
+        ensure!(index > 0, "invalid IPv6 scope {zone}");
+        return Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, index)));
+    }
+    tokio::net::lookup_host((host, port))
+        .await?
+        .next()
+        .context("host resolved to no addresses")
+}
+fn host_string(a: SocketAddr) -> String {
+    match a {
+        SocketAddr::V6(v) if v.scope_id() != 0 => format!("{}%{}", v.ip(), v.scope_id()),
+        _ => a.ip().to_string(),
+    }
+}
 pub async fn companion_link_target(host: &str, port: u16) -> Result<(String, u16)> {
     if port != 0 {
-        return Ok((host.to_string(), port));
+        return Ok((host.into(), port));
     }
-    discover_over_awdl(RESOLVE_TIMEOUT).await
+    resolve("awdl0", None, None, Duration::from_secs(10)).await
 }
-
-/// Browse `_companion-link._tcp` scoped to `awdl0` and return the first
-/// resolved `(host, port)`.
-///
-/// If `awdl0` is absent — the case today — this returns a descriptive error
-/// instead of a stub value. When the interface exists, it constrains `mdns-sd`
-/// to `awdl0` (IPv6 link-local, mDNS group `ff02::fb`) and waits for a resolve.
-///
-/// AWDL-GATED: the browse body below has never run on this host (no `awdl0`).
-/// It is kept compiled and honest so it's ready the moment the interface comes
-/// up — the live experiment described in docs/m2-awdl-plan.md §4.
-async fn discover_over_awdl(timeout: Duration) -> Result<(String, u16)> {
-    if !awdl_interface_present() {
-        anyhow::bail!(
-            "AWDL interface not up yet: no `{AWDL_IFACE}` interface exists on this host. \
-             Universal Clipboard announces `_companion-link._tcp` over Apple's AWDL \
-             peer-to-peer Wi-Fi, which needs the OWL / driver bring-up that has not \
-             landed yet (see docs/m2-awdl-plan.md). Until then, pass --host/--port \
-             manually, or run `ac-dc discover` to check whether it happens to resolve \
-             over the plain LAN."
-        );
-    }
-
-    let daemon = ServiceDaemon::new().context("starting mDNS daemon")?;
-    // Constrain the daemon to awdl0 only: drop every interface, then re-enable
-    // awdl0 by name. Without this, mdns-sd would query over wlan0/lo too.
-    daemon
-        .disable_interface(IfKind::All)
-        .context("scoping mDNS: disabling all interfaces")?;
-    daemon
-        .enable_interface(AWDL_IFACE)
-        .with_context(|| format!("scoping mDNS to {AWDL_IFACE}"))?;
-
-    let receiver = daemon.browse(SERVICE).context("browsing companion-link over awdl0")?;
-    tracing::info!("browsing {SERVICE} scoped to {AWDL_IFACE} (timeout {timeout:?})");
-
-    let deadline = tokio::time::Instant::now() + timeout;
+fn normalized_address(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+pub async fn resolve(
+    iface: &str,
+    instance: Option<&str>,
+    ble: Option<&str>,
+    timeout: Duration,
+) -> Result<(String, u16)> {
+    ensure!(
+        std::path::Path::new("/sys/class/net").join(iface).exists(),
+        "AWDL interface {iface} is absent; run awdlctl doctor"
+    );
+    let daemon = Daemon(ServiceDaemon::new()?);
+    daemon.0.disable_interface(IfKind::All)?;
+    daemon.0.enable_interface(iface)?;
+    let receiver = daemon.0.browse(SERVICE)?;
+    let end = tokio::time::Instant::now() + timeout;
     loop {
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .context("timed out resolving _companion-link._tcp over awdl0")?;
-        let evt = tokio::time::timeout(remaining, receiver.recv_async())
+        let evt = tokio::time::timeout_at(end, receiver.recv_async())
             .await
-            .context("timed out resolving _companion-link._tcp over awdl0")?
-            .context("mDNS receiver closed")?;
-
+            .context("companion-link discovery timed out")??;
         if let ServiceEvent::ServiceResolved(info) = evt {
-            let port = info.get_port();
-            // TODO(awdl-scope): an awdl0 address is IPv6 link-local and needs
-            // the `%awdl0` scope id appended before connect(); mdns-sd hands us
-            // a bare address. Prefer a resolved address, else the hostname.
-            let host = info
-                .get_addresses()
-                .iter()
-                .map(|a| a.to_string())
-                .next()
-                .unwrap_or_else(|| info.get_hostname().to_string());
-            tracing::info!(%host, port, "resolved companion-link over {AWDL_IFACE}");
-            return Ok((host, port));
-        }
-    }
-}
-
-pub async fn run() -> Result<()> {
-    let daemon = ServiceDaemon::new().context("starting mDNS daemon")?;
-    let receiver = daemon.browse(SERVICE).context("browsing companion-link")?;
-
-    tracing::info!("browsing {SERVICE} (Ctrl-C to stop)");
-    println!("# waiting for _companion-link._tcp instances on the local network...");
-
-    loop {
-        match receiver.recv_async().await {
-            Ok(ServiceEvent::ServiceResolved(info)) => {
-                println!("resolved: {}", info.get_fullname());
-                println!("  host:  {}", info.get_hostname());
-                println!("  port:  {}", info.get_port());
-                let addrs: Vec<String> = info.get_addresses().iter().map(|a| a.to_string()).collect();
-                println!("  addrs: {}", if addrs.is_empty() { "(none yet)".into() } else { addrs.join(", ") });
-                for prop in info.get_properties().iter() {
-                    let val = prop.val_str();
-                    println!("  txt:   {}={}", prop.key(), val);
+            if let Some(want) = instance {
+                if info.get_fullname() != want {
+                    continue;
+                }
+            } else if let Some(addr) = ble {
+                let observed = info.get_property_val_str("rpBA").unwrap_or("");
+                if normalized_address(observed) != normalized_address(addr) {
+                    continue;
                 }
             }
-            Ok(ServiceEvent::ServiceFound(_, name)) => {
-                tracing::debug!(%name, "service found (resolving)");
-            }
-            Ok(ServiceEvent::ServiceRemoved(_, name)) => {
-                println!("removed: {name}");
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, "mDNS receiver closed");
-                break;
+            let mut addrs: Vec<_> = info.get_addresses().iter().copied().collect();
+            addrs.sort();
+            if let Some(addr) = addrs.first() {
+                return Ok((host_string(scope_address(*addr, iface)?), info.get_port()));
             }
         }
     }
-    Ok(())
 }
-
+/// Optional management-frame fallback, using a fresh JSONL capture from `awdlctl events`.
+/// Require a selected AWDL MAC: BLE and AWDL MACs are not interchangeable.
+pub fn from_events(
+    path: &std::path::Path,
+    peer: &str,
+    iface: &str,
+    now_ms: u64,
+) -> Result<(String, u16)> {
+    use std::io::Read;
+    let mut data = Vec::new();
+    std::fs::File::open(path)?
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut data)?;
+    ensure!(data.len() <= 4 * 1024 * 1024, "event capture exceeds 4 MiB");
+    let mut target = None;
+    for line in data.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        let event: serde_json::Value = serde_json::from_slice(line)?;
+        let stamp = event["timestamp_ms"].as_u64().unwrap_or(0);
+        if stamp > now_ms
+            || now_ms - stamp > 30_000
+            || event["interface"] != iface
+            || normalized_address(event["source"].as_str().unwrap_or(""))
+                != normalized_address(peer)
+        {
+            continue;
+        }
+        for service in event["frame"]["services"].as_array().into_iter().flatten() {
+            if service["record_type"] != 33
+                || !service["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .ends_with("._companion-link._tcp.local")
+            {
+                continue;
+            }
+            let port = service["port"]
+                .as_u64()
+                .filter(|p| *p > 0 && *p <= 65535)
+                .context("invalid captured port")? as u16;
+            let host = event["host"]
+                .as_str()
+                .context("missing captured IPv6 address")?;
+            let (ip, zone) = host
+                .rsplit_once('%')
+                .context("captured address missing interface scope")?;
+            ensure!(
+                zone == iface && ip.parse::<std::net::Ipv6Addr>()?.is_unicast_link_local(),
+                "invalid captured endpoint"
+            );
+            target = Some((host.to_string(), port));
+        }
+    }
+    target.context("no fresh companion-link SRV record for selected AWDL peer")
+}
+pub async fn run(iface: Option<&str>) -> Result<()> {
+    let daemon = Daemon(ServiceDaemon::new()?);
+    if let Some(i) = iface {
+        daemon.0.disable_interface(IfKind::All)?;
+        daemon.0.enable_interface(i)?;
+    }
+    let rx = daemon.0.browse(SERVICE)?;
+    loop {
+        if let ServiceEvent::ServiceResolved(i) = rx.recv_async().await? {
+            let addresses = i
+                .get_addresses()
+                .iter()
+                .map(|a| {
+                    if let Some(iface) = iface {
+                        scope_address(*a, iface).map(host_string)
+                    } else {
+                        Ok(a.to_string())
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            println!(
+                "{}",
+                serde_json::json!({"instance":i.get_fullname(),"port":i.get_port(),"addresses":addresses,"rpBA":i.get_property_val_str("rpBA")})
+            );
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[tokio::test]
-    async fn manual_override_passes_host_and_port_through() {
-        // A non-zero port means "trust the caller" — no discovery, no awdl0.
-        let (host, port) = companion_link_target("192.168.1.42", 49152).await.unwrap();
-        assert_eq!(host, "192.168.1.42");
-        assert_eq!(port, 49152);
+    async fn scope_and_override() {
+        assert_eq!(
+            companion_link_target("127.0.0.1", 1234).await.unwrap(),
+            ("127.0.0.1".into(), 1234)
+        );
+        let a = socket_target("fe80::1%lo", 1234).await.unwrap();
+        assert!(matches!(a,SocketAddr::V6(v) if v.scope_id()>0));
+        assert!(socket_target("fe80::1%not-a-real-iface", 1).await.is_err());
     }
+    #[test]
+    fn normalization() {
+        assert_eq!(normalized_address("AA:BB:CC:DD:EE:FF"), "aabbccddeeff");
+    }
+}
 
-    #[tokio::test]
-    async fn automatic_resolve_is_honest_without_awdl() {
-        // On this host (and any without the driver work) awdl0 is absent, so an
-        // automatic resolve must fail with a clear AWDL message, not hang or
-        // fake a target. Guarded so it stays valid should a machine ever have
-        // awdl0 up.
-        if !awdl_interface_present() {
-            let err = companion_link_target("", 0).await.unwrap_err();
-            let msg = err.to_string();
-            assert!(msg.contains("AWDL"), "expected an AWDL message, got: {msg}");
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    #[test]
+    fn fresh_selected_service_only() {
+        let path =
+            std::env::temp_dir().join(format!("ac-dc-events-{:032x}", rand::random::<u128>()));
+        struct Remove(std::path::PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
         }
+        let _remove = Remove(path.clone());
+        let event = serde_json::json!({"timestamp_ms":100_000,"interface":"awdl0","source":"02:11:22:33:44:55","host":"fe80::11:22ff:fe33:4455%awdl0","frame":{"services":[{"name":"phone._companion-link._tcp.local","record_type":33,"port":49152}]}});
+        std::fs::write(&path, serde_json::to_vec(&event).unwrap()).unwrap();
+        assert_eq!(
+            from_events(&path, "02:11:22:33:44:55", "awdl0", 100_001)
+                .unwrap()
+                .1,
+            49152
+        );
+        assert!(from_events(&path, "02:11:22:33:44:66", "awdl0", 100_001).is_err());
+        assert!(from_events(&path, "02:11:22:33:44:55", "awdl0", 140_000).is_err());
+        assert!(from_events(&path, "02:11:22:33:44:55", "awdl0", 99_999).is_err());
+        assert!(from_events(&path, "02:11:22:33:44:55", "lo", 100_001).is_err());
     }
 }

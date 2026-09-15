@@ -69,7 +69,10 @@ impl Tlv8 {
 
     /// First value for a given type (after fragment merging).
     pub fn get(&self, type_: u8) -> Option<&[u8]> {
-        self.items.iter().find(|(t, _)| *t == type_).map(|(_, v)| v.as_slice())
+        self.items
+            .iter()
+            .find(|(t, _)| *t == type_)
+            .map(|(_, v)| v.as_slice())
     }
 
     pub fn types(&self) -> Vec<u8> {
@@ -84,7 +87,9 @@ mod tests {
     #[test]
     fn simple_roundtrip() {
         let mut t = Tlv8::new();
-        t.push_u8(0x06, 1).push(0x03, vec![0xAA; 32]).push_u8(0x19, 1);
+        t.push_u8(0x06, 1)
+            .push(0x03, vec![0xAA; 32])
+            .push_u8(0x19, 1);
         let enc = t.encode();
         let dec = Tlv8::decode(&enc);
         assert_eq!(dec.get(0x06), Some([1u8].as_slice()));

@@ -24,11 +24,20 @@ use crate::keystore::{HandoffKey, KeyStore};
 /// address rotation and the constant re-broadcasts into one line per real copy.
 type SeenMap = Arc<Mutex<HashMap<String, (u16, [u8; 7])>>>;
 
+#[derive(Debug, Clone)]
+pub struct CopyEvent {
+    pub device: String,
+    pub address: String,
+    pub key_id: String,
+    pub activity: String,
+}
+
 pub struct Scanner {
     adapter: Adapter,
     keys: Vec<HandoffKey>,
     capture: bool,
     seen: SeenMap,
+    events: Option<tokio::sync::mpsc::Sender<CopyEvent>>,
 }
 
 impl Scanner {
@@ -42,16 +51,27 @@ impl Scanner {
     }
 
     async fn build(keys: Vec<HandoffKey>, capture: bool) -> Result<Self> {
-        let session = bluer::Session::new().await.context("connecting to bluetoothd")?;
+        let session = bluer::Session::new()
+            .await
+            .context("connecting to bluetoothd")?;
         let adapter = session.default_adapter().await.context("no BLE adapter")?;
-        adapter.set_powered(true).await.context("powering on adapter")?;
+        adapter
+            .set_powered(true)
+            .await
+            .context("powering on adapter")?;
         tracing::info!(adapter = %adapter.name(), "using BLE adapter");
         Ok(Scanner {
             adapter,
             keys,
             capture,
             seen: Arc::new(Mutex::new(HashMap::new())),
+            events: None,
         })
+    }
+
+    pub fn with_events(mut self, events: tokio::sync::mpsc::Sender<CopyEvent>) -> Self {
+        self.events = Some(events);
+        self
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -105,6 +125,7 @@ impl Scanner {
             capture: self.capture,
             adapter: self.adapter.clone(),
             seen: self.seen.clone(),
+            events: self.events.clone(),
         }
     }
 }
@@ -115,6 +136,7 @@ struct Worker {
     capture: bool,
     adapter: Adapter,
     seen: SeenMap,
+    events: Option<tokio::sync::mpsc::Sender<CopyEvent>>,
 }
 
 impl Worker {
@@ -205,7 +227,18 @@ impl Worker {
             activity = %activity,
             "CLIPBOARD AVAILABLE"
         );
-        println!("📋  {who} copied — {activity}   [device key {key_id}]");
+        if let Some(events) = &self.events {
+            if let Err(e) = events.try_send(CopyEvent {
+                device: who.clone(),
+                address: addr.to_string(),
+                key_id: key_id.into(),
+                activity: activity.to_string(),
+            }) {
+                tracing::warn!(error = %e, "copy event queue full or closed");
+            }
+        } else {
+            println!("📋  {who} copied — {activity}   [device key {key_id}]");
+        }
     }
 
     /// A friendly name for the advertiser if BlueZ knows one (e.g. a paired

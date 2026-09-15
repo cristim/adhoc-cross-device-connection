@@ -122,7 +122,7 @@ Typical run (approach b):
 # 1. capture peers via Frida (Path B), producing rp-dump.json  (see script output)
 # 2. generate + inject + assemble:
 ./macos/export-rpidentity.sh --from-dump "$HOME/Library/Application Support/ac-dc/rp-dump.json"
-# 3. on Linux: import rpidentity.json (adapt scripts/import-keys-from-macos.sh REL) and:
+# On Linux: use the exported rpidentity.json from a secure transfer or read-only macOS mount.
 ac-dc <companion-link subcommand> --identity rpidentity.json     # once the socket driver lands
 ```
 
@@ -202,7 +202,7 @@ Interceptor.attach(attrs, { onLeave() { /* inspect kSecAttrTokenID == kSecAttrTo
   circle-of-trust membership, or an access-group-scoped item — is **unverified**.
   If peers require more than the public key being present, (b) as written may be
   rejected even with correct crypto. This mirrors the "same-account trust" risk
-  already called out in `docs/m2-awdl-plan.md §5`.
+  already called out in `docs/architecture.md`.
 - **OPACK value exactness.** We encode `{edPK, dIRK}` with the short-form OPACK
   that matches `src/opack.rs` and the seemoo encoder. If a newer macOS expects
   extra fields in the value (e.g. a model/flags sub-dict, as `gena` hints in

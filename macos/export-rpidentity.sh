@@ -96,7 +96,7 @@ secure_finish() {
     install_autowipe
     echo
     echo "Exported to: $1"
-    echo "On Linux:    ./scripts/import-keys-from-macos.sh   (adapt REL to rpidentity.json)"
+    echo "Transfer the exported file securely to Linux, or read it from a read-only macOS volume."
     echo
     echo "IMPORTANT: rpidentity.json carries OUR PRIVATE signing seed. Treat it like keys.json."
 }

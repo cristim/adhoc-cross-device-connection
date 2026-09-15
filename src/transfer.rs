@@ -160,7 +160,13 @@ pub fn seal(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad: b"" })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad: b"",
+            },
+        )
         .map_err(|_| anyhow!("chacha20poly1305 seal failed"))?;
     let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
     out.extend_from_slice(&nonce_bytes);

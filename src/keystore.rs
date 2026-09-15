@@ -56,8 +56,8 @@ pub struct KeyStore {
 
 impl KeyStore {
     pub fn load(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading key file {}", path.display()))?;
+        let bytes =
+            std::fs::read(path).with_context(|| format!("reading key file {}", path.display()))?;
 
         // Try our JSON format first.
         if let Ok(jf) = serde_json::from_slice::<JsonKeyFile>(&bytes) {
@@ -109,10 +109,8 @@ mod tests {
     use super::*;
 
     fn load_json(name: &str, json: &str) -> Result<KeyStore> {
-        let path = std::env::temp_dir().join(format!(
-            "ac-dc-keystore-{}-{name}.json",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ac-dc-keystore-{}-{name}.json", std::process::id()));
         std::fs::write(&path, json).unwrap();
         let result = KeyStore::load(&path);
         std::fs::remove_file(&path).unwrap();
@@ -135,7 +133,9 @@ mod tests {
     #[test]
     fn rejects_key_of_unsupported_length() {
         let json = format!(r#"{{"keys":[{{"id":"bad","key":"{}"}}]}}"#, "33".repeat(20));
-        let err = load_json("bad", &json).err().expect("20-byte key must be rejected");
+        let err = load_json("bad", &json)
+            .err()
+            .expect("20-byte key must be rejected");
         let msg = format!("{err:#}");
         assert!(msg.contains("bad") && msg.contains("got 20"), "{msg}");
     }

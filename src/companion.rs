@@ -40,7 +40,8 @@ use crate::tlv8::Tlv8;
 pub fn hkdf_sha512(secret: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> Vec<u8> {
     let hk = Hkdf::<Sha512>::new(Some(salt), secret);
     let mut okm = vec![0u8; out_len];
-    hk.expand(info, &mut okm).expect("HKDF output length within SHA-512 limit");
+    hk.expand(info, &mut okm)
+        .expect("HKDF output length within SHA-512 limit");
     okm
 }
 
@@ -79,7 +80,12 @@ impl ContentChannel {
         let mut dec_key = [0u8; KEY_LEN];
         enc_key.copy_from_slice(&enc);
         dec_key.copy_from_slice(&dec);
-        ContentChannel { enc_key, dec_key, enc_nonce: 0, dec_nonce: 0 }
+        ContentChannel {
+            enc_key,
+            dec_key,
+            enc_nonce: 0,
+            dec_nonce: 0,
+        }
     }
 
     fn nonce(counter: u64) -> Nonce {
@@ -92,7 +98,13 @@ impl ContentChannel {
     pub fn encrypt(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.enc_key));
         let out = cipher
-            .encrypt(&Self::nonce(self.enc_nonce), Payload { msg: plaintext, aad })
+            .encrypt(
+                &Self::nonce(self.enc_nonce),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|_| anyhow::anyhow!("chacha encrypt failed"))?;
         self.enc_nonce += 1;
         Ok(out)
@@ -101,7 +113,13 @@ impl ContentChannel {
     pub fn decrypt(&mut self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.dec_key));
         let out = cipher
-            .decrypt(&Self::nonce(self.dec_nonce), Payload { msg: ciphertext, aad })
+            .decrypt(
+                &Self::nonce(self.dec_nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
             .map_err(|_| anyhow::anyhow!("chacha decrypt failed / bad tag"))?;
         self.dec_nonce += 1;
         Ok(out)
@@ -163,13 +181,19 @@ impl ContinuityPacket {
         }
         let ptype = PacketType::from_u8(data[0])
             .with_context(|| format!("unknown packet type {:#04x}", data[0]))?;
-        Ok(ContinuityPacket { ptype, body: data[4..].to_vec() })
+        Ok(ContinuityPacket {
+            ptype,
+            body: data[4..].to_vec(),
+        })
     }
 
     /// Body is `OPACK({ "_pd": <TLV8 bytes> })`. Extract and decode the TLV.
     pub fn pairing_tlv(&self) -> Result<Tlv8> {
         let dict = opack::decode(&self.body)?;
-        let pd = dict.get("_pd").and_then(Value::as_bytes).context("no _pd in packet")?;
+        let pd = dict
+            .get("_pd")
+            .and_then(Value::as_bytes)
+            .context("no _pd in packet")?;
         Ok(Tlv8::decode(pd))
     }
 }
@@ -196,9 +220,7 @@ mod tlv_type {
 /// public keys. The Ed25519 secret and the peer public keys are iCloud-synced
 /// keychain material; they arrive from an export like keys.json.
 ///
-/// TODO(keys): wire this to a real exporter (`macos/export-keys.sh` currently
-/// only pulls the BLE key; RPIdentity export is a follow-up). The JSON schema
-/// here is provisional.
+/// Export instructions and the JSON schema live in macos/RPIDENTITY.md.
 pub struct PairingIdentity {
     pub signing: SigningKey,
     pub device_irk: [u8; 16],
@@ -235,7 +257,9 @@ impl PairingIdentity {
         let device_irk: [u8; 16] = if f.dirk.is_empty() {
             [0u8; 16]
         } else {
-            hex::decode(f.dirk.trim())?.try_into().map_err(|_| anyhow::anyhow!("dirk must be 16 bytes"))?
+            hex::decode(f.dirk.trim())?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("dirk must be 16 bytes"))?
         };
         let mut peers = Vec::new();
         for p in f.peers {
@@ -244,7 +268,11 @@ impl PairingIdentity {
                 .map_err(|_| anyhow::anyhow!("peer edpk must be 32 bytes"))?;
             peers.push((p.label, VerifyingKey::from_bytes(&pk)?));
         }
-        Ok(PairingIdentity { signing: SigningKey::from_bytes(&sk_bytes), device_irk, peers })
+        Ok(PairingIdentity {
+            signing: SigningKey::from_bytes(&sk_bytes),
+            device_irk,
+            peers,
+        })
     }
 }
 
@@ -253,7 +281,12 @@ impl PairingIdentity {
 // ---------------------------------------------------------------------------
 
 fn pair_verify_key(shared_secret: &[u8]) -> [u8; KEY_LEN] {
-    let k = hkdf_sha512(shared_secret, b"Pair-Verify-Encrypt-Salt", b"Pair-Verify-Encrypt-Info", KEY_LEN);
+    let k = hkdf_sha512(
+        shared_secret,
+        b"Pair-Verify-Encrypt-Salt",
+        b"Pair-Verify-Encrypt-Info",
+        KEY_LEN,
+    );
     let mut out = [0u8; KEY_LEN];
     out.copy_from_slice(&k);
     out
@@ -280,7 +313,12 @@ impl PairVerifyClient {
     pub fn new(identity: PairingIdentity) -> Self {
         let ephemeral = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
         let public = PublicKey::from(&ephemeral);
-        PairVerifyClient { ephemeral: Some(ephemeral), public, identity, shared: None }
+        PairVerifyClient {
+            ephemeral: Some(ephemeral),
+            public,
+            identity,
+            shared: None,
+        }
     }
 
     /// M1: our public key + state=1 + appFlags=1, wrapped OPACK("_pd": TLV).
@@ -304,19 +342,27 @@ impl PairVerifyClient {
         let peer_pub = PublicKey::from(peer_pub_bytes);
 
         let eph = self.ephemeral.take().context("M1 not sent")?;
-        let shared = eph.diffie_hellman(&peer_pub).to_bytes();
+        let secret = eph.diffie_hellman(&peer_pub);
+        if !secret.was_contributory() {
+            bail!("invalid low-order X25519 peer key");
+        }
+        let shared = secret.to_bytes();
         self.shared = Some(shared);
 
         let key = pair_verify_key(&shared);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
 
         // Decrypt the peer's signature blob (a TLV containing SIGNATURE).
-        let enc = tlv.get(tlv_type::ENCRYPTED_DATA).context("M2 missing encrypted data")?;
-        let dec = cipher
-            .decrypt(&pv_nonce(b"PV-Msg02"), enc)
-            .map_err(|_| anyhow::anyhow!("PV-Msg02 decrypt failed (key or nonce mismatch — see TODO)"))?;
+        let enc = tlv
+            .get(tlv_type::ENCRYPTED_DATA)
+            .context("M2 missing encrypted data")?;
+        let dec = cipher.decrypt(&pv_nonce(b"PV-Msg02"), enc).map_err(|_| {
+            anyhow::anyhow!("PV-Msg02 decrypt failed (key or nonce mismatch — see TODO)")
+        })?;
         let inner = Tlv8::decode(&dec);
-        let sig_bytes = inner.get(tlv_type::SIGNATURE).context("no signature in M2")?;
+        let sig_bytes = inner
+            .get(tlv_type::SIGNATURE)
+            .context("no signature in M2")?;
         let signature = Signature::from_slice(sig_bytes).context("bad signature length")?;
 
         // Peer signs peer_pub || our_pub.
@@ -332,9 +378,7 @@ impl PairVerifyClient {
         if let Some(label) = &verified {
             tracing::info!(peer = %label, "Pair-Verify: peer signature verified");
         } else {
-            // The reference also proceeds on verify failure (logs only); we do
-            // too, but say so loudly.
-            tracing::warn!("Pair-Verify: no known peer matched the signature");
+            bail!("Pair-Verify rejected an unknown peer signature");
         }
 
         // M3: sign our_pub || peer_pub, encrypt, send with state=3.
@@ -349,8 +393,12 @@ impl PairVerifyClient {
             .map_err(|_| anyhow::anyhow!("PV-Msg03 encrypt failed"))?;
 
         let mut out = Tlv8::new();
-        out.push(tlv_type::ENCRYPTED_DATA, sealed).push_u8(tlv_type::STATE, 3);
-        Ok(ContinuityPacket::new(PacketType::PairVerifyContinue, wrap_pairing_data(&out)))
+        out.push(tlv_type::ENCRYPTED_DATA, sealed)
+            .push_u8(tlv_type::STATE, 3);
+        Ok(ContinuityPacket::new(
+            PacketType::PairVerifyContinue,
+            wrap_pairing_data(&out),
+        ))
     }
 
     /// M4: peer confirms with state=4 and nothing else.
@@ -359,7 +407,9 @@ impl PairVerifyClient {
         if tlv.get(tlv_type::STATE) != Some(&[4]) {
             bail!("Pair-Verify M4 did not report state=4");
         }
-        let shared = self.shared.context("no shared secret; process_m2 not run")?;
+        let shared = self
+            .shared
+            .context("no shared secret; process_m2 not run")?;
         Ok(ContentChannel::from_shared_secret(&shared, Role::Client))
     }
 
@@ -390,7 +440,13 @@ impl PairVerifyServer {
     pub fn new(identity: PairingIdentity) -> Self {
         let ephemeral = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
         let public = PublicKey::from(&ephemeral);
-        PairVerifyServer { ephemeral: Some(ephemeral), public, identity, shared: None, client_pub: None }
+        PairVerifyServer {
+            ephemeral: Some(ephemeral),
+            public,
+            identity,
+            shared: None,
+            client_pub: None,
+        }
     }
 
     /// Consume the client's M1 (their public key), run ECDH, and produce M2:
@@ -405,7 +461,10 @@ impl PairVerifyServer {
             .map_err(|_| anyhow::anyhow!("client public key not 32 bytes"))?;
         let client_pub = PublicKey::from(client_pub_bytes);
 
-        let eph = self.ephemeral.take().context("server ephemeral already consumed")?;
+        let eph = self
+            .ephemeral
+            .take()
+            .context("server ephemeral already consumed")?;
         let shared = eph.diffie_hellman(&client_pub).to_bytes();
         self.shared = Some(shared);
         self.client_pub = Some(client_pub_bytes);
@@ -428,24 +487,34 @@ impl PairVerifyServer {
         out.push(tlv_type::PUBLIC_KEY, self.public.as_bytes().to_vec())
             .push(tlv_type::ENCRYPTED_DATA, sealed)
             .push_u8(tlv_type::STATE, 2);
-        Ok(ContinuityPacket::new(PacketType::PairVerifyContinue, wrap_pairing_data(&out)))
+        Ok(ContinuityPacket::new(
+            PacketType::PairVerifyContinue,
+            wrap_pairing_data(&out),
+        ))
     }
 
     /// Verify the client's M3 signature over `client_pub || server_pub`, and on
     /// success produce M4 (state=4) plus the server-role content channel.
-    pub fn process_m3(&mut self, m3: &ContinuityPacket) -> Result<(ContinuityPacket, ContentChannel)> {
+    pub fn process_m3(
+        &mut self,
+        m3: &ContinuityPacket,
+    ) -> Result<(ContinuityPacket, ContentChannel)> {
         let tlv = m3.pairing_tlv()?;
         let shared = self.shared.context("process_m1 not run before M3")?;
         let client_pub = self.client_pub.context("process_m1 not run before M3")?;
 
         let key = pair_verify_key(&shared);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-        let enc = tlv.get(tlv_type::ENCRYPTED_DATA).context("M3 missing encrypted data")?;
+        let enc = tlv
+            .get(tlv_type::ENCRYPTED_DATA)
+            .context("M3 missing encrypted data")?;
         let dec = cipher
             .decrypt(&pv_nonce(b"PV-Msg03"), enc)
             .map_err(|_| anyhow::anyhow!("PV-Msg03 decrypt failed (key or nonce mismatch)"))?;
         let inner = Tlv8::decode(&dec);
-        let sig_bytes = inner.get(tlv_type::SIGNATURE).context("no signature in M3")?;
+        let sig_bytes = inner
+            .get(tlv_type::SIGNATURE)
+            .context("no signature in M3")?;
         let signature = Signature::from_slice(sig_bytes).context("bad signature length")?;
 
         let mut signed = Vec::with_capacity(64);
@@ -460,13 +529,16 @@ impl PairVerifyServer {
         if let Some(label) = &verified {
             tracing::info!(peer = %label, "Pair-Verify(server): client signature verified");
         } else {
-            tracing::warn!("Pair-Verify(server): no known peer matched the client signature");
+            bail!("Pair-Verify rejected an unknown client signature");
         }
 
         let mut out = Tlv8::new();
         out.push_u8(tlv_type::STATE, 4);
         let m4 = ContinuityPacket::new(PacketType::PairVerifyContinue, wrap_pairing_data(&out));
-        Ok((m4, ContentChannel::from_shared_secret(&shared, Role::Server)))
+        Ok((
+            m4,
+            ContentChannel::from_shared_secret(&shared, Role::Server),
+        ))
     }
 }
 
@@ -506,7 +578,10 @@ mod tests {
         let a_pub = PublicKey::from(&a);
         let b = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
         let b_pub = PublicKey::from(&b);
-        assert_eq!(a.diffie_hellman(&b_pub).to_bytes(), b.diffie_hellman(&a_pub).to_bytes());
+        assert_eq!(
+            a.diffie_hellman(&b_pub).to_bytes(),
+            b.diffie_hellman(&a_pub).to_bytes()
+        );
     }
 
     #[test]
@@ -522,7 +597,10 @@ mod tests {
 
     #[test]
     fn continuity_packet_roundtrip() {
-        let body = opack::encode(&Value::dict([("_pd", Value::Bytes(vec![0x06, 0x01, 0x04]))]));
+        let body = opack::encode(&Value::dict([(
+            "_pd",
+            Value::Bytes(vec![0x06, 0x01, 0x04]),
+        )]));
         let pkt = ContinuityPacket::new(PacketType::PairVerifyPublicKey, body.clone());
         let wire = pkt.serialize();
         assert_eq!(wire[0], 0x05);
@@ -563,12 +641,18 @@ mod tests {
         let m1 = client.build_m1();
         // Client's ephemeral public from M1.
         let m1_tlv = m1.pairing_tlv().unwrap();
-        let client_pub: [u8; 32] = m1_tlv.get(tlv_type::PUBLIC_KEY).unwrap().try_into().unwrap();
+        let client_pub: [u8; 32] = m1_tlv
+            .get(tlv_type::PUBLIC_KEY)
+            .unwrap()
+            .try_into()
+            .unwrap();
 
         // Build a peer M2: peer ephemeral, ECDH, sign peer_pub||client_pub.
         let peer_eph = EphemeralSecret::random_from_rng(OsRng);
         let peer_pub = PublicKey::from(&peer_eph);
-        let shared = peer_eph.diffie_hellman(&PublicKey::from(client_pub)).to_bytes();
+        let shared = peer_eph
+            .diffie_hellman(&PublicKey::from(client_pub))
+            .to_bytes();
         let key = pair_verify_key(&shared);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let mut signed = peer_pub.as_bytes().to_vec();
@@ -576,7 +660,9 @@ mod tests {
         let sig = peer_sk.sign(&signed);
         let mut inner = Tlv8::new();
         inner.push(tlv_type::SIGNATURE, sig.to_bytes().to_vec());
-        let sealed = cipher.encrypt(&pv_nonce(b"PV-Msg02"), inner.encode().as_slice()).unwrap();
+        let sealed = cipher
+            .encrypt(&pv_nonce(b"PV-Msg02"), inner.encode().as_slice())
+            .unwrap();
         let mut m2_tlv = Tlv8::new();
         m2_tlv
             .push(tlv_type::PUBLIC_KEY, peer_pub.as_bytes().to_vec())

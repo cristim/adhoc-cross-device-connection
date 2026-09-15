@@ -1,7 +1,7 @@
 //! Milestone 2: the transport-INDEPENDENT companion-link client that pulls
 //! Universal Clipboard content from a same-Apple-ID peer.
 //!
-//! This module is the socket driver the M2 plan (`docs/m2-awdl-plan.md` §4.2)
+//! This module is the socket driver the M2 plan (`docs/architecture.md` §4.2)
 //! calls for. It sits on top of the pieces already in `companion.rs`
 //! (`PairVerifyClient`, `ContinuityPacket` framing, `ContentChannel`,
 //! `PairingIdentity`) and adds:
@@ -56,9 +56,16 @@ pub(crate) async fn write_packet<S: AsyncWrite + Unpin>(
     stream: &mut S,
     pkt: &ContinuityPacket,
 ) -> Result<()> {
-    stream.write_all(&pkt.serialize()).await.context("writing continuity packet")?;
-    stream.flush().await.context("flushing continuity packet")?;
-    Ok(())
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        stream
+            .write_all(&pkt.serialize())
+            .await
+            .context("writing continuity packet")?;
+        stream.flush().await.context("flushing continuity packet")?;
+        anyhow::Ok(())
+    })
+    .await
+    .context("continuity write timed out")?
 }
 
 /// Read one `ContinuityPacket`, framing on the 4-byte header.
@@ -73,13 +80,26 @@ pub(crate) async fn write_packet<S: AsyncWrite + Unpin>(
 /// reference-derived guess (see `companion.rs`); confirmed only for our own
 /// framing, not against a real device.
 pub(crate) async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> Result<ContinuityPacket> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_packet_inner(stream),
+    )
+    .await
+    .context("continuity read timed out")?
+}
+async fn read_packet_inner<S: AsyncRead + Unpin>(stream: &mut S) -> Result<ContinuityPacket> {
     let mut header = [0u8; 4];
-    stream.read_exact(&mut header).await.context("reading continuity packet header")?;
+    stream
+        .read_exact(&mut header)
+        .await
+        .context("reading continuity packet header")?;
     let ptype = PacketType::from_u8(header[0])
         .with_context(|| format!("unknown packet type {:#04x}", header[0]))?;
     let adv_len = u16::from_be_bytes([header[2], header[3]]) as usize;
     let body_len = if ptype == PacketType::EncryptedData {
-        adv_len.saturating_sub(16)
+        adv_len
+            .checked_sub(16)
+            .context("encrypted frame length is shorter than its tag")?
     } else {
         adv_len
     };
@@ -87,7 +107,10 @@ pub(crate) async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> Result<
         bail!("continuity packet body of {body_len} bytes exceeds {MAX_PACKET_BODY} cap");
     }
     let mut body = vec![0u8; body_len];
-    stream.read_exact(&mut body).await.context("reading continuity packet body")?;
+    stream
+        .read_exact(&mut body)
+        .await
+        .context("reading continuity packet body")?;
     Ok(ContinuityPacket { ptype, body })
 }
 
@@ -164,8 +187,17 @@ pub mod uc {
         }
 
         pub(super) fn from_value(v: &Value) -> SystemInfo {
-            let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
-            SystemInfo { name: s(Self::K_NAME), model: s(Self::K_MODEL), os_version: s(Self::K_OS) }
+            let s = |k: &str| {
+                v.get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            SystemInfo {
+                name: s(Self::K_NAME),
+                model: s(Self::K_MODEL),
+                os_version: s(Self::K_OS),
+            }
         }
     }
 
@@ -209,7 +241,9 @@ pub mod uc {
     /// UNVALIDATED: exact UC pasteboard payload unconfirmed until tested against
     /// a device.
     pub(super) fn parse_pasteboard_response(v: &Value) -> Result<Pasteboard> {
-        let items_val = v.get("items").context("pasteboard response missing `items`")?;
+        let items_val = v
+            .get("items")
+            .context("pasteboard response missing `items`")?;
         let arr = match items_val {
             Value::Array(a) => a,
             _ => bail!("pasteboard response `items` is not an array"),
@@ -250,7 +284,11 @@ async fn send_opack<S: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let plain = opack::encode(value);
     let sealed = channel.encrypt(&plain, CONTENT_AAD)?;
-    write_packet(stream, &ContinuityPacket::new(PacketType::EncryptedData, sealed)).await
+    write_packet(
+        stream,
+        &ContinuityPacket::new(PacketType::EncryptedData, sealed),
+    )
+    .await
 }
 
 async fn recv_opack<S: AsyncRead + Unpin>(
@@ -259,7 +297,10 @@ async fn recv_opack<S: AsyncRead + Unpin>(
 ) -> Result<Value> {
     let pkt = read_packet(stream).await?;
     if pkt.ptype != PacketType::EncryptedData {
-        bail!("expected EncryptedData in content phase, got {:?}", pkt.ptype);
+        bail!(
+            "expected EncryptedData in content phase, got {:?}",
+            pkt.ptype
+        );
     }
     let plain = channel.decrypt(&pkt.body, CONTENT_AAD)?;
     opack::decode(&plain)
@@ -284,20 +325,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     /// stream (a TCP socket in production, a loopback socket in tests).
     pub async fn handshake(mut stream: S, identity: PairingIdentity) -> Result<Self> {
         let mut client = PairVerifyClient::new(identity);
-        write_packet(&mut stream, &client.build_m1()).await.context("sending Pair-Verify M1")?;
-        let m2 = read_packet(&mut stream).await.context("reading Pair-Verify M2")?;
-        let m3 = client.process_m2(&m2).context("processing M2 / building M3")?;
-        write_packet(&mut stream, &m3).await.context("sending Pair-Verify M3")?;
-        let m4 = read_packet(&mut stream).await.context("reading Pair-Verify M4")?;
-        let channel = client.check_m4(&m4).context("verifying M4 / deriving content keys")?;
-        Ok(Session { stream, channel, xid: 1 })
+        write_packet(&mut stream, &client.build_m1())
+            .await
+            .context("sending Pair-Verify M1")?;
+        let m2 = read_packet(&mut stream)
+            .await
+            .context("reading Pair-Verify M2")?;
+        let m3 = client
+            .process_m2(&m2)
+            .context("processing M2 / building M3")?;
+        write_packet(&mut stream, &m3)
+            .await
+            .context("sending Pair-Verify M3")?;
+        let m4 = read_packet(&mut stream)
+            .await
+            .context("reading Pair-Verify M4")?;
+        let channel = client
+            .check_m4(&m4)
+            .context("verifying M4 / deriving content keys")?;
+        Ok(Session {
+            stream,
+            channel,
+            xid: 1,
+        })
     }
 
     /// P1/P2 system-info exchange: send our system-info dict, read the peer's.
     pub async fn system_info_exchange(&mut self, ours: &SystemInfo) -> Result<SystemInfo> {
-        send_opack(&mut self.stream, &mut self.channel, &ours.to_value(uc::MSG_REQUEST))
-            .await
-            .context("sending system-info request (P1)")?;
+        send_opack(
+            &mut self.stream,
+            &mut self.channel,
+            &ours.to_value(uc::MSG_REQUEST),
+        )
+        .await
+        .context("sending system-info request (P1)")?;
         let resp = recv_opack(&mut self.stream, &mut self.channel)
             .await
             .context("reading system-info response (P2)")?;
@@ -309,13 +370,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     ///
     /// TODO(long-payload): items larger than ~10 KB are NOT delivered inline in
     /// this response on a real device — Apple uses a separate TLS-wrapped bulk
-    /// channel for those (see `docs/m2-awdl-plan.md` §4.3). That path is
+    /// channel for those (see `docs/architecture.md` §4.3). That path is
     /// deliberately not implemented yet; this handles the inline case only.
     pub async fn fetch_pasteboard(&mut self) -> Result<Pasteboard> {
         let xid = self.next_xid();
-        send_opack(&mut self.stream, &mut self.channel, &uc::build_pasteboard_request(xid))
-            .await
-            .context("sending pasteboard-fetch request (P3)")?;
+        send_opack(
+            &mut self.stream,
+            &mut self.channel,
+            &uc::build_pasteboard_request(xid),
+        )
+        .await
+        .context("sending pasteboard-fetch request (P3)")?;
         let resp = recv_opack(&mut self.stream, &mut self.channel)
             .await
             .context("reading pasteboard-fetch response (P4)")?;
@@ -334,14 +399,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
 ///
 /// Without AWDL up this is expected to fail at `connect` against a real device;
 /// it works against [`run_mock_server`] / [`loopback_demo`].
-pub async fn connect(host: &str, port: u16, identity: PairingIdentity) -> Result<Session<TcpStream>> {
-    let stream = TcpStream::connect((host, port))
-        .await
-        .with_context(|| format!("connecting to companion-link at {host}:{port}"))?;
+pub async fn connect(
+    host: &str,
+    port: u16,
+    identity: PairingIdentity,
+) -> Result<Session<TcpStream>> {
+    let stream = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        Ok::<_, anyhow::Error>(
+            TcpStream::connect(crate::discover::socket_target(host, port).await?).await?,
+        )
+    })
+    .await
+    .context("TCP connection timed out")?
+    .with_context(|| format!("connecting to companion-link at {host}:{port}"))?;
     stream.set_nodelay(true).ok();
-    Session::handshake(stream, identity)
-        .await
-        .context("companion-link Pair-Verify handshake failed")
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        Session::handshake(stream, identity),
+    )
+    .await
+    .context("Pair-Verify timed out")?
+    .context("companion-link Pair-Verify handshake failed")
 }
 
 // ---------------------------------------------------------------------------
@@ -362,23 +440,41 @@ pub async fn run_mock_server<S: AsyncRead + AsyncWrite + Unpin>(
     let mut server = PairVerifyServer::new(identity);
     let m1 = read_packet(&mut stream).await.context("mock: reading M1")?;
     let m2 = server.process_m1(&m1).context("mock: building M2")?;
-    write_packet(&mut stream, &m2).await.context("mock: sending M2")?;
+    write_packet(&mut stream, &m2)
+        .await
+        .context("mock: sending M2")?;
     let m3 = read_packet(&mut stream).await.context("mock: reading M3")?;
-    let (m4, mut channel) = server.process_m3(&m3).context("mock: verifying M3 / building M4")?;
-    write_packet(&mut stream, &m4).await.context("mock: sending M4")?;
+    let (m4, mut channel) = server
+        .process_m3(&m3)
+        .context("mock: verifying M3 / building M4")?;
+    write_packet(&mut stream, &m4)
+        .await
+        .context("mock: sending M4")?;
 
     // P1/P2: read the client's system-info request, reply with ours.
-    let _client_info = recv_opack(&mut stream, &mut channel).await.context("mock: reading P1")?;
-    send_opack(&mut stream, &mut channel, &sysinfo.to_value(uc::MSG_RESPONSE))
+    let _client_info = recv_opack(&mut stream, &mut channel)
         .await
-        .context("mock: sending P2")?;
+        .context("mock: reading P1")?;
+    send_opack(
+        &mut stream,
+        &mut channel,
+        &sysinfo.to_value(uc::MSG_RESPONSE),
+    )
+    .await
+    .context("mock: sending P2")?;
 
     // P3/P4: read the pasteboard-fetch request, reply with the canned board.
-    let req = recv_opack(&mut stream, &mut channel).await.context("mock: reading P3")?;
-    let xid = req.get(uc::K_XID).and_then(Value::as_u64).unwrap_or(0);
-    send_opack(&mut stream, &mut channel, &uc::build_pasteboard_response(xid, &pasteboard))
+    let req = recv_opack(&mut stream, &mut channel)
         .await
-        .context("mock: sending P4")?;
+        .context("mock: reading P3")?;
+    let xid = req.get(uc::K_XID).and_then(Value::as_u64).unwrap_or(0);
+    send_opack(
+        &mut stream,
+        &mut channel,
+        &uc::build_pasteboard_response(xid, &pasteboard),
+    )
+    .await
+    .context("mock: sending P4")?;
     Ok(())
 }
 
@@ -424,7 +520,9 @@ pub async fn loopback_demo() -> Result<(SystemInfo, Pasteboard)> {
         }],
     };
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.context("binding loopback listener")?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("binding loopback listener")?;
     let addr = listener.local_addr().context("loopback listener addr")?;
 
     let srv_info = server_info.clone();
@@ -497,8 +595,14 @@ mod tests {
 
         let board = Pasteboard {
             items: vec![
-                PasteboardItem { uti: "public.utf8-plain-text".into(), data: b"clip!".to_vec() },
-                PasteboardItem { uti: "public.png".into(), data: vec![0x89, 0x50, 0x4E, 0x47] },
+                PasteboardItem {
+                    uti: "public.utf8-plain-text".into(),
+                    data: b"clip!".to_vec(),
+                },
+                PasteboardItem {
+                    uti: "public.png".into(),
+                    data: vec![0x89, 0x50, 0x4E, 0x47],
+                },
             ],
         };
         let resp = uc::build_pasteboard_response(42, &board);
@@ -516,7 +620,10 @@ mod tests {
         // `items` present but an item lacks `data`.
         let bad2 = Value::dict([(
             "items",
-            Value::Array(vec![Value::dict([("type", Value::Str("public.text".into()))])]),
+            Value::Array(vec![Value::dict([(
+                "type",
+                Value::Str("public.text".into()),
+            )])]),
         )]);
         assert!(uc::parse_pasteboard_response(&bad2).is_err());
     }
@@ -566,17 +673,15 @@ mod tests {
     async fn loopback_demo_runs_end_to_end() {
         let (peer, board) = loopback_demo().await.unwrap();
         assert_eq!(peer.name, "Loopback Mock");
-        assert!(board.plain_text().unwrap().contains("loopback mock pasteboard"));
+        assert!(board
+            .plain_text()
+            .unwrap()
+            .contains("loopback mock pasteboard"));
     }
 
     #[tokio::test]
-    async fn untrusted_peer_still_completes_flow() {
-        // Neither side knows the other's signing key. The reference Pair-Verify
-        // proceeds on verify-failure (it only logs a warning; see
-        // companion.rs::process_m2/process_m3), so the handshake and content
-        // flow still complete over the socket. This test documents that trust
-        // is currently advisory (logged), NOT enforced by aborting — a property
-        // that must be revisited before trusting real peers.
+    async fn untrusted_peer_is_rejected() {
+        // Unknown signing keys must never authorize clipboard access.
         use ed25519_dalek::SigningKey;
         let client = PairingIdentity {
             signing: SigningKey::generate(&mut rand::rngs::OsRng),
@@ -595,9 +700,8 @@ mod tests {
             run_mock_server(sock, server, SystemInfo::default(), Pasteboard::default()).await
         });
         let stream = TcpStream::connect(addr).await.unwrap();
-        let mut session = Session::handshake(stream, client).await.unwrap();
-        session.system_info_exchange(&SystemInfo::default()).await.unwrap();
-        assert!(session.fetch_pasteboard().await.is_ok());
-        srv.await.unwrap().unwrap();
+        let result = Session::handshake(stream, client).await;
+        assert!(result.err().unwrap().to_string().contains("M2"));
+        assert!(srv.await.unwrap().is_err());
     }
 }

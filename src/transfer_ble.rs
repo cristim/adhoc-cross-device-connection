@@ -64,7 +64,9 @@ pub async fn receive_key(out: &Path) -> Result<()> {
     let keypair = EphemeralKeyPair::generate();
     let receiver_pub = keypair.public_bytes();
 
-    let session = bluer::Session::new().await.context("opening BlueZ session")?;
+    let session = bluer::Session::new()
+        .await
+        .context("opening BlueZ session")?;
     let adapter = session
         .default_adapter()
         .await
@@ -130,7 +132,11 @@ pub async fn receive_key(out: &Path) -> Result<()> {
         .context("decrypting received payload (bad tag: wrong code or tampering)")?;
 
     write_0600(out, &plaintext).with_context(|| format!("writing {}", out.display()))?;
-    println!("Wrote {} ({} bytes, mode 0600).", out.display(), plaintext.len());
+    println!(
+        "Wrote {} ({} bytes, mode 0600).",
+        out.display(),
+        plaintext.len()
+    );
     Ok(())
 }
 

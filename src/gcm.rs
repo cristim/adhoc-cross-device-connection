@@ -197,6 +197,7 @@ pub fn open_truncated(
 ///
 /// Like the open path, this is spec-derived and UNVALIDATED against real Apple
 /// traffic; a seal/open round-trip is the only guarantee so far.
+#[cfg(test)]
 pub fn seal_truncated(
     key: &[u8],
     iv: &[u8],
