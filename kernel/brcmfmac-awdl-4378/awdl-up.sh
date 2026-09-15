@@ -20,9 +20,14 @@ set -euo pipefail
 readonly IF="${IF:-wlan0}"                  # primary (infra) interface
 readonly AWDL_IF="${AWDL_IF:-awdl0}"
 readonly BROADCOM_OUI="0x001018"
-readonly SUBCMD_AWDL="2"                     # BRCMF_VNDR_CMDS_AWDL
+readonly SUBCMD_AWDL="0x2"                   # BRCMF_VNDR_CMDS_AWDL (iw wants 0x-prefixed)
 readonly MASTER_CHAN="${MASTER_CHAN:-6}"
-readonly BRCMIOVAR="${BRCMIOVAR:-$HOME/Work/awdl-refs/brcmiovar.py}"
+
+# Resolve the invoking user's home even under sudo/pkexec ($HOME would be /root).
+if [[ -n "${SUDO_USER:-}" ]]; then _RH="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+elif [[ -n "${PKEXEC_UID:-}" ]]; then _RH="$(getent passwd "$PKEXEC_UID" | cut -d: -f6)"
+else _RH="$HOME"; fi
+readonly BRCMIOVAR="${BRCMIOVAR:-$_RH/Work/awdl-refs/brcmiovar.py}"
 
 log() { printf '[awdl-up] %s\n' "$*" >&2; }
 die() { printf '[awdl-up] ERROR: %s\n' "$*" >&2; exit 1; }
