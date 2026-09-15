@@ -84,6 +84,7 @@ apply_patch "${HERE}/0001-brcmfmac-awdl-4378-interface-create.patch"     "brcmf_
 apply_patch "${HERE}/0002-brcmfmac-awdl-4378-netdev-ops.patch"           "brcmf_netdev_open_awdl"
 apply_patch "${HERE}/0003-brcmfmac-awdl-4378-usable-create-args.patch"   "awdl_create_flags"
 apply_patch "${HERE}/0004-brcmfmac-awdl-4378-rtnl-safe-teardown.patch"   "interface_remove failed"
+apply_patch "${HERE}/0005-brcmfmac-awdl-4378-event-forwarding.patch"     "brcmf_awdl_notify_fwevent"
 
 # --- build ONLY brcmfmac.ko --------------------------------------------------
 # M= points make at the module subdir; -C at the running kernel's build headers.
