@@ -20,9 +20,11 @@ set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KO="$HERE/build/linux/drivers/net/wireless/broadcom/brcm80211/brcmfmac/brcmfmac.ko"
 
-# Resolve the invoking user's home even under sudo ($HOME would be /root).
+# Resolve the invoking user's home even under sudo/pkexec ($HOME would be /root).
 if [[ -n "${SUDO_USER:-}" ]]; then
     REAL_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+elif [[ -n "${PKEXEC_UID:-}" ]]; then
+    REAL_HOME="$(getent passwd "$PKEXEC_UID" | cut -d: -f6)"
 else
     REAL_HOME="$HOME"
 fi
