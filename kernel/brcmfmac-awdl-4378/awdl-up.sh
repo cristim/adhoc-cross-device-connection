@@ -62,6 +62,16 @@ fi
 
 ip link set "$AWDL_IF" up
 
+# AWDL/mDNS runs on IPv6 link-local, but this system sets addr_gen_mode=none, so
+# awdl0 gets no automatic fe80::. Assign the EUI-64 link-local ourselves.
+_mac="$(cat /sys/class/net/"$AWDL_IF"/address)"
+_ll="$(python3 -c 'import sys;m=sys.argv[1].split(":");print("fe80::%02x%s:%sff:fe%s:%s%s"%(int(m[0],16)^2,m[1],m[2],m[3],m[4],m[5]))' "$_mac")"
+if ip -6 addr add "$_ll/64" dev "$AWDL_IF" 2>/dev/null; then
+    log "assigned link-local $_ll to $AWDL_IF"
+else
+    log "link-local $_ll already present on $AWDL_IF"
+fi
+
 # From here iovars are issued ON the awdl0 netdev, which maps to the AWDL bsscfg
 # the firmware created - so no explicit "bsscfg:" scoping is needed.
 
