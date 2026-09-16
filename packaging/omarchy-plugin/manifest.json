@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "ac-dc",
   "license": "MIT",
-  "description": "Airdrop-compatible-compatible file transfer with nearby Apple devices",
+  "description": "Airdrop-compatible file transfer with nearby Apple devices",
   "kinds": ["bar-widget"],
   "entryPoints": {"barWidget": "BarWidget.qml"},
   "barWidget": {

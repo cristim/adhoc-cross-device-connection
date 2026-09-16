@@ -19,6 +19,8 @@ pub struct Request {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
+    pub directory: Option<PathBuf>,
+    #[serde(default)]
     pub files: Vec<PathBuf>,
     #[serde(default)]
     pub links: Vec<String>,
@@ -93,7 +95,7 @@ async fn handle(stream: UnixStream, state: Arc<Mutex<State>>) -> Result<()> {
                 data: None,
             }
         }
-        "receive" => start_receive(state.clone()).await,
+        "receive" => start_receive(state.clone(), request).await,
         "stop" => stop(state.clone()).await,
         "send" => start_send(state.clone(), request).await,
         "peers" => discover(state.clone()).await,
@@ -111,7 +113,11 @@ async fn handle(stream: UnixStream, state: Arc<Mutex<State>>) -> Result<()> {
     Ok(())
 }
 
-async fn start_receive(state: Arc<Mutex<State>>) -> Reply {
+async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
+    let directory = request
+        .directory
+        .unwrap_or_else(|| PathBuf::from(DIRECTORY));
+    let name = request.name.unwrap_or_else(|| "Omarchy".into());
     let mut s = state.lock().await;
     if s.task.as_ref().is_some_and(|t| !t.is_finished()) {
         return Reply {
@@ -137,9 +143,9 @@ async fn start_receive(state: Arc<Mutex<State>>) -> Reply {
                 ble_wake: true,
                 approval: None,
                 iface: "awdl0".into(),
-                directory: PathBuf::from(DIRECTORY),
+                directory,
                 identity: PathBuf::from(IDENTITY),
-                name: "Linux".into(),
+                name,
                 port: 8771,
                 seconds: 600,
                 once: false,

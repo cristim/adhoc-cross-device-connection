@@ -46,6 +46,8 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
+        directory: Option<PathBuf>,
+        #[arg(long)]
         file: Vec<PathBuf>,
         #[arg(long)]
         link: Vec<String>,
@@ -230,6 +232,7 @@ async fn main() -> Result<()> {
             host,
             port,
             name,
+            directory,
             file,
             link,
         } => {
@@ -240,6 +243,7 @@ async fn main() -> Result<()> {
                     host,
                     port,
                     name,
+                    directory,
                     files: file,
                     links: link,
                 },
