@@ -26,10 +26,7 @@ BarWidget {
 
   function font(size) { return root.bar ? root.bar.fontFamily : Style.font.family }
   function close() { root.popupOpen = false }
-  function togglePopup() {
-    root.popupOpen = !root.popupOpen
-    if (root.popupOpen) root.findRecipients()
-  }
+  function togglePopup() { root.popupOpen = !root.popupOpen }
   function refresh() { if (!statusProc.running) statusProc.running = true }
 
   function persistSettings(values) {
