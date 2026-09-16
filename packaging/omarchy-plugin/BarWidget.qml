@@ -18,14 +18,24 @@ BarWidget {
   property string selectedFiles: ""
   property string linkText: ""
   property string errorText: ""
-  property string transferName: "Omarchy"
-  property string receivePath: "/home/cristi/Downloads/Adhoc"
+  property string transferName: String(setting("name", "Omarchy"))
+  property string receivePath: String(setting("directory", "/home/cristi/Downloads/Adhoc"))
 
   readonly property bool busy: statusProc.running || peersProc.running || actionProc.running || fileProc.running
   readonly property bool canSend: selectedPeer >= 0 && (selectedFiles.trim().length > 0 || linkText.trim().length > 0)
 
   function font(size) { return root.bar ? root.bar.fontFamily : Style.font.family }
   function refresh() { if (!statusProc.running) statusProc.running = true }
+
+  function persistSettings(values) {
+    var entry = { id: root.moduleName }
+    for (var existing in root.settings) if (existing !== "id") entry[existing] = root.settings[existing]
+    for (var key in values) entry[key] = values[key]
+    root.settings = entry
+    if (root.hostWidget && "settings" in root.hostWidget) root.hostWidget.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
 
   function applyStatus(raw) {
     try {
@@ -187,7 +197,7 @@ BarWidget {
         Layout.fillWidth: true
         Text { text: "Send to"; color: Color.foreground; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption; font.bold: true }
         Button { text: root.peers.length ? "Refresh" : "Find recipients"; enabled: !root.busy; Layout.alignment: Qt.AlignRight; onClicked: root.findRecipients() }
-        Button { text: root.configOpen ? "Done" : "Settings"; onClicked: root.configOpen = !root.configOpen }
+        Button { text: root.configOpen ? "Save" : "Settings"; onClicked: { if (root.configOpen) root.persistSettings({ name: root.transferName || "Omarchy", directory: root.receivePath || "/home/cristi/Downloads/Adhoc" }); root.configOpen = !root.configOpen } }
       }
 
       ColumnLayout {
