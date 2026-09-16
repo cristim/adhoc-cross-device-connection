@@ -1,19 +1,31 @@
 # ac-dc
 
-Apple Continuity and clipboard tools for Linux, implemented in Rust.
+Apple Continuity and Airdrop-compatible file-transfer tools for Linux, implemented in Rust.
 
-- Observe and decrypt Universal Clipboard BLE announcements using keys exported
-  from your own macOS account.
-- Pull a pasteboard through companion-link, with mandatory peer signature
-  verification, scoped IPv6 discovery, and Wayland clipboard output.
-- Send and receive Airdrop-compatible files/links through a native Rust GTK UI or the CLI.
+- Explore Universal Clipboard BLE announcements and companion-link traffic using
+  keys exported from your own macOS account.
+- Send and receive Airdrop-compatible files/links through the Omarchy systray
+  widget, native Rust GTK UI, or CLI.
 - Inspect prerequisites and advertise Apple BLE TLVs for controlled experiments.
 
-**Compatibility is experimental.** Companion-link framing and request fields
-still need validation against Apple devices. Rust-to-Rust Airdrop-compatible transfers, including user approval/decline, pass local TLS
-tests. Discovery and HTTPS `/Discover` have succeeded against a real Mac over
-BCM4378 AWDL. File-transfer interoperability is still being tested; do not
-interpret discovery alone as a completed transfer.
+## Project status
+
+The current release focuses on a usable Linux desktop experience. The restricted
+Rust daemon manages the radio session, while the Omarchy widget provides
+recipient discovery, file/link sending, receiving, a ten-minute countdown, and
+configurable name and destination. The transfer/archive protocol passes local
+Rust interoperability tests; real-device compatibility remains dependent on
+Apple firmware and Everyone-mode settings.
+
+Universal Clipboard support is a future goal, not a completed feature. BLE
+announcement parsing, OPACK, companion-link framing, and pasteboard plumbing
+are useful research foundations, but current-device authentication, keyed
+archives, request payloads, and end-to-end pasteboard exchange still need
+reverse engineering and validation against Apple devices.
+
+We welcome reverse-engineering help: packet captures from devices you own,
+wire-format analysis, protocol comparisons, and reproducible tests are especially
+valuable. Please do not share private keys or captures containing personal data.
 
 ## Separate driver repository
 
@@ -58,7 +70,7 @@ guidance.
 Tests use temporary data and loopback TCP/TLS. They never access real Apple keys,
 change the radio, or change the desktop clipboard.
 
-## Universal Clipboard
+## Universal Clipboard research commands
 
 ```sh
 ac-dc doctor --json --keys /path/to/keys.json --identity /path/to/rpidentity.json
@@ -201,13 +213,15 @@ MIT. Not affiliated with Apple. Uses keys for your own devices/account.
 The clipboard audit found concrete wire-format problems. Header/AAD framing and
 OPACK byte order/reference decoding have now been corrected; real UC request
 payloads, keyed-archive parsing and current-device authentication still need work.
+These commands are for protocol research and should not be presented as a
+finished clipboard workflow.
 
 ## 0.1.0-0 release notes
 
 See [installation and operating limits](packaging/INSTALL.md) and
 [OWL, OpenDrop and LocalSend findings](docs/owl-opendrop-localsend-research.md).
-The Rust UI adds outgoing progress/cancellation, folder selection and a renewable
-radio countdown. Archives stream through temporary files; completed top-level
+The Rust UI and Omarchy widget add outgoing progress/cancellation, folder
+selection and a renewable radio countdown. Archives stream through temporary files; completed top-level
 items are published directly in the receive directory, with Finder-style numeric
 collision names. The sender separates discovery from the Ask/Upload connection,
 following OpenDrop's CLI sequence.
