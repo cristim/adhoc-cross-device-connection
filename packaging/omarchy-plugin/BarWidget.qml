@@ -152,7 +152,7 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.phase === "receiving" ? "󰄀" : (root.phase === "sending" ? "󰇚" : "󰍉")
+    text: root.phase === "receiving" ? "󰄀" : (root.phase === "sending" ? "󰇚" : "󰖩")
     slotSize: Style.bar.statusSlot
     fontSize: Style.font.caption
     foreground: root.phase === "error" || root.errorText.length > 0 ? Color.urgent : (root.phase === "offline" ? Qt.rgba(1,1,1,0.45) : (root.bar ? root.bar.barForeground : Color.foreground))
@@ -181,7 +181,7 @@ BarWidget {
           Layout.preferredWidth: Style.space(38); Layout.preferredHeight: Style.space(38)
           radius: Style.spacing.labelGap
           color: Style.normalFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-          Text { anchors.centerIn: parent; text: "󰍉"; color: Color.accent; font.family: root.font(Style.font.subtitle); font.pixelSize: Style.font.subtitle }
+          Text { anchors.centerIn: parent; text: "󰖩"; color: Color.accent; font.family: root.font(Style.font.subtitle); font.pixelSize: Style.font.subtitle }
         }
         ColumnLayout {
           Layout.fillWidth: true; spacing: Style.space(2)
