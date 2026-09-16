@@ -25,6 +25,8 @@ BarWidget {
   readonly property bool canSend: selectedPeer >= 0 && (selectedFiles.trim().length > 0 || linkText.trim().length > 0)
 
   function font(size) { return root.bar ? root.bar.fontFamily : Style.font.family }
+  function close() { root.popupOpen = false }
+  function togglePopup() { root.popupOpen = !root.popupOpen }
   function refresh() { if (!statusProc.running) statusProc.running = true }
 
   function persistSettings(values) {
@@ -157,7 +159,7 @@ BarWidget {
     fontSize: Style.font.caption
     foreground: root.phase === "error" || root.errorText.length > 0 ? Color.urgent : (root.phase === "offline" ? Qt.rgba(1,1,1,0.45) : (root.bar ? root.bar.barForeground : Color.foreground))
     tooltipText: "Adhoc: " + root.message
-    onPressed: root.popupOpen = !root.popupOpen
+    onPressed: root.togglePopup()
   }
 
   PopupCard {
