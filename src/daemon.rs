@@ -56,7 +56,9 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660))?;
         let raw = std::ffi::CString::new(socket.as_os_str().as_encoded_bytes())?;
-        let rc = unsafe { libc::chown(raw.as_ptr(), 0, 65_534) };
+        // The desktop user is granted access through the local administrators
+        // group used by this installation; the daemon itself remains root.
+        let rc = unsafe { libc::chown(raw.as_ptr(), 0, 982) };
         if rc != 0 {
             anyhow::bail!(
                 "set daemon socket group: {}",
