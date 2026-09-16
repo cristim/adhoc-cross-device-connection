@@ -46,12 +46,14 @@ operations. Enable the service once after installation:
 
 ```sh
 sudo systemctl enable --now ac-dc-daemon.service
-ac-dc ui
+ac-dc ctl status
 ```
 
 The widget and the CLI talk to the service through its local Unix socket; no
-network control port is exposed. See [packaging/INSTALL.md](packaging/INSTALL.md)
-for firewall and first-transfer guidance.
+network control port is exposed. The socket is readable by the `users` group;
+log out and back in after installation if your account was just added to that
+group. See [packaging/INSTALL.md](packaging/INSTALL.md) for first-transfer
+guidance.
 
 Tests use temporary data and loopback TCP/TLS. They never access real Apple keys,
 change the radio, or change the desktop clipboard.
@@ -94,22 +96,22 @@ write** the mock pasteboard to your clipboard. The unit tests do not.
 
 ## Airdrop-compatible UI and sending
 
-Launch **Adhoc Cross-Device Connection** from the application launcher, or run `ac-dc ui`.
-The native GTK window provides device name and destination settings, a bounded
-receiving session, incoming Accept/Decline prompts, recipient discovery, a file
-chooser and link sending. It invokes the installed root-owned radio service
-through desktop authentication; all transfer handling runs as your normal user.
+The Omarchy systray widget is the recommended lightweight interface. Opening it
+automatically discovers nearby recipients and refreshes them every second. It
+provides Receive/Stop, a ten-minute receive countdown, recipient selection,
+file selection, link sending, and Settings for the display name and receive
+directory. The full GTK window remains available through `ac-dc ui` when needed.
 
-Set the receiving Apple device to **Everyone for 10 Minutes**. Click **Find
-recipients**, select the intended device, select files or enter an HTTP(S) link,
-and send. Nearby names are discovery hints, not authenticated Apple identities.
+Set the receiving Apple device to **Everyone for 10 Minutes**. Open the widget,
+select the intended recipient, select files or enter an HTTP(S) link, and send.
+Nearby names are discovery hints, not authenticated Apple identities.
 Everyone-mode TLS uses self-signed certificates; Contacts Only is not implemented.
 
 CLI equivalents (prepare the radio service first):
 
 ```sh
 sudo systemctl start ac-dc-daemon.service
-ac-dc air-drop-peers --tls-identity ~/.local/share/ac-dc/airdrop
+ac-dc peers --tls-identity ~/.local/share/ac-dc/airdrop
 ac-dc send --host 'fe80::PEER%awdl0' --port 8770 \
   --tls-identity ~/.local/share/ac-dc/airdrop --name Linux /path/to/file
 # For a link, replace the filename with --url https://example.com/

@@ -6,8 +6,10 @@ the terminal or app launcher:
 
     sudo systemctl enable --now ac-dc-daemon.service
     ac-dc ui
-Choose Receive for 10 minutes, then approve incoming requests in the widget or CLI.
-Choose Find recipients with the Apple device's Airdrop-compatible set to Everyone.
+The Omarchy widget discovers recipients automatically when opened, refreshes
+them every second, and exposes Receive/Stop with a ten-minute countdown. Set the
+Apple device's Airdrop-compatible mode to Everyone for 10 Minutes, then choose
+the recipient and files directly in the widget.
 Select files, a folder, or an HTTP(S) link and send to the selected device.
 Outgoing progress counts bytes sent; delivery is confirmed only after the reply.
 Cancel stops the outgoing request. Closing the UI releases its radio window.
