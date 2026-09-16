@@ -20,6 +20,9 @@ BarWidget {
   property string errorText: ""
   property string transferName: String(setting("name", "Omarchy"))
   property string receivePath: String(setting("directory", "/home/cristi/Downloads/Adhoc"))
+  property bool receiveActive: false
+  property double receiveEndsAt: 0
+  property int remainingSeconds: 0
 
   readonly property bool busy: statusProc.running || peersProc.running || actionProc.running || fileProc.running
   readonly property bool canSend: selectedPeer >= 0 && (selectedFiles.trim().length > 0 || linkText.trim().length > 0)
@@ -28,6 +31,21 @@ BarWidget {
   function close() { root.popupOpen = false }
   function togglePopup() { root.popupOpen = !root.popupOpen }
   function refresh() { if (!statusProc.running) statusProc.running = true }
+  function formatRemaining() {
+    var minutes = Math.floor(root.remainingSeconds / 60)
+    var seconds = root.remainingSeconds % 60
+    return minutes + ":" + (seconds < 10 ? "0" : "") + seconds
+  }
+  function startReceiveCountdown() {
+    root.receiveActive = true
+    root.receiveEndsAt = Date.now() + 600000
+    root.remainingSeconds = 600
+  }
+  function stopReceiveCountdown() {
+    root.receiveActive = false
+    root.receiveEndsAt = 0
+    root.remainingSeconds = 0
+  }
 
   function persistSettings(values) {
     var entry = { id: root.moduleName }
@@ -44,6 +62,9 @@ BarWidget {
       var value = JSON.parse(String(raw).trim())
       root.phase = value.state || "offline"
       root.message = value.message || root.phase
+      if (root.phase === "receiving" && !root.receiveActive) root.startReceiveCountdown()
+      if ((root.phase === "idle" || root.phase === "error" || root.phase === "offline") && root.receiveActive && !actionProc.running)
+        root.stopReceiveCountdown()
       if (root.phase !== "error") root.errorText = ""
     } catch (e) {
       root.phase = "offline"
@@ -67,6 +88,8 @@ BarWidget {
 
   function startAction(op) {
     if (actionProc.running) return
+    if (op === "receive") root.startReceiveCountdown()
+    if (op === "stop") root.stopReceiveCountdown()
     var command = ["/usr/bin/ac-dc", "ctl", op]
     if (op === "receive") {
       command.push("--name"); command.push(root.transferName || "Omarchy")
@@ -147,6 +170,16 @@ BarWidget {
 
   Timer { interval: root.popupOpen ? 1500 : 4000; running: true; repeat: true; triggeredOnStart: true; onTriggered: root.refresh() }
   Timer { interval: 1000; running: root.popupOpen; repeat: true; triggeredOnStart: true; onTriggered: root.findRecipients() }
+  Timer {
+    interval: 1000
+    running: root.receiveActive
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: {
+      root.remainingSeconds = Math.max(0, Math.ceil((root.receiveEndsAt - Date.now()) / 1000))
+      if (root.remainingSeconds === 0) root.stopReceiveCountdown()
+    }
+  }
   Component.onCompleted: root.refresh()
 
   implicitWidth: button.implicitWidth
@@ -191,7 +224,7 @@ BarWidget {
           Text { text: "Adhoc Connection"; color: Color.foreground; font.family: root.font(Style.font.body); font.pixelSize: Style.font.body; font.bold: true }
           Text { text: root.message; color: root.errorText.length > 0 ? Color.urgent : Qt.rgba(1,1,1,0.62); elide: Text.ElideRight; Layout.fillWidth: true; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
         }
-        Button { text: root.phase === "receiving" ? "Stop" : "Receive"; enabled: !root.busy || root.phase === "receiving"; onClicked: root.startAction(root.phase === "receiving" ? "stop" : "receive") }
+        Button { text: root.receiveActive ? ("Stop " + root.formatRemaining()) : "Receive"; enabled: !root.busy || root.receiveActive; onClicked: root.startAction(root.receiveActive ? "stop" : "receive") }
       }
 
       PanelSeparator { Layout.fillWidth: true }
