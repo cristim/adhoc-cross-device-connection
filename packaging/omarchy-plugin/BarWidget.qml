@@ -26,7 +26,10 @@ BarWidget {
 
   function font(size) { return root.bar ? root.bar.fontFamily : Style.font.family }
   function close() { root.popupOpen = false }
-  function togglePopup() { root.popupOpen = !root.popupOpen }
+  function togglePopup() {
+    root.popupOpen = !root.popupOpen
+    if (root.popupOpen) root.findRecipients()
+  }
   function refresh() { if (!statusProc.running) statusProc.running = true }
 
   function persistSettings(values) {
@@ -146,6 +149,7 @@ BarWidget {
   Process { id: legacyProc; command: ["/usr/bin/ac-dc", "ui"] }
 
   Timer { interval: root.popupOpen ? 1500 : 4000; running: true; repeat: true; triggeredOnStart: true; onTriggered: root.refresh() }
+  Timer { interval: 1000; running: root.popupOpen; repeat: true; triggeredOnStart: true; onTriggered: root.findRecipients() }
   Component.onCompleted: root.refresh()
 
   implicitWidth: button.implicitWidth
@@ -198,7 +202,6 @@ BarWidget {
       RowLayout {
         Layout.fillWidth: true
         Text { text: "Send to"; color: Color.foreground; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption; font.bold: true }
-        Button { text: root.peers.length ? "Refresh" : "Find recipients"; enabled: !root.busy; Layout.alignment: Qt.AlignRight; onClicked: root.findRecipients() }
         Button { text: root.configOpen ? "Save" : "Settings"; onClicked: { if (root.configOpen) root.persistSettings({ name: root.transferName || "Omarchy", directory: root.receivePath || "/home/cristi/Downloads/Adhoc" }); root.configOpen = !root.configOpen } }
       }
 
