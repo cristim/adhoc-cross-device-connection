@@ -165,7 +165,7 @@ BarWidget {
 
   PopupCard {
     id: popup
-    anchorItem: button
+    anchorItem: root
     bar: root.bar
     owner: root
     open: root.popupOpen
