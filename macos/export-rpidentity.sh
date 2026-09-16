@@ -133,7 +133,7 @@ Path B: dump every RPIdentity peer via Frida-hooking rapportd (reliable):
   1. Disable SIP once (Recovery -> Terminal -> \`csrutil disable\`, reboot).
   2. pip3 install frida-tools      # or: brew install frida
   3. git clone https://github.com/seemoo-lab/apple-continuity-tools
-  4. In System Settings -> General -> AirDrop & Handoff, turn Handoff OFF.
+  4. In System Settings -> General -> Airdrop-compatible & Handoff, turn Handoff OFF.
   5. sudo python3 apple-continuity-tools/keychain_access/keychain_access.py rapportd \\
          -o "$EXPORT_DIR/rp-dump.json"
   6. Turn Handoff back ON. rapportd re-reads the keychain; RPIdentity items

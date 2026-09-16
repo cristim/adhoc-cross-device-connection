@@ -18,7 +18,7 @@
 
 #![allow(dead_code)] // M2/M3 scaffolding: exercised by unit tests; wired into the runtime once macOS keys exist.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -106,7 +106,10 @@ impl ContentChannel {
                 },
             )
             .map_err(|_| anyhow::anyhow!("chacha encrypt failed"))?;
-        self.enc_nonce += 1;
+        self.enc_nonce = self
+            .enc_nonce
+            .checked_add(1)
+            .context("content encryption nonce exhausted")?;
         Ok(out)
     }
 
@@ -121,7 +124,10 @@ impl ContentChannel {
                 },
             )
             .map_err(|_| anyhow::anyhow!("chacha decrypt failed / bad tag"))?;
-        self.dec_nonce += 1;
+        self.dec_nonce = self
+            .dec_nonce
+            .checked_add(1)
+            .context("content decryption nonce exhausted")?;
         Ok(out)
     }
 }
@@ -150,8 +156,7 @@ impl PacketType {
     }
 }
 
-/// `type(1) | 0x00 | bodylen_be(2) | body`. For EncryptedData the reference
-/// adds 16 to the advertised length to account for the Poly1305 tag.
+/// `type(1) | wire_body_len_be(3) | body`. Encrypted bodies include their tag.
 pub struct ContinuityPacket {
     pub ptype: PacketType,
     pub body: Vec<u8>,
@@ -162,17 +167,19 @@ impl ContinuityPacket {
         ContinuityPacket { ptype, body }
     }
 
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut adv_len = self.body.len();
-        if self.ptype == PacketType::EncryptedData {
-            adv_len += 16;
-        }
-        let mut out = Vec::with_capacity(4 + self.body.len());
-        out.push(self.ptype as u8);
-        out.push(0x00);
-        out.extend_from_slice(&(adv_len as u16).to_be_bytes());
+    pub fn header(ptype: PacketType, wire_body_len: usize) -> Result<[u8; 4]> {
+        ensure!(
+            wire_body_len <= 0xff_ffff,
+            "continuity body exceeds 24-bit wire length"
+        );
+        let n = wire_body_len as u32;
+        Ok([ptype as u8, (n >> 16) as u8, (n >> 8) as u8, n as u8])
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        let mut out = Self::header(self.ptype, self.body.len())?.to_vec();
         out.extend_from_slice(&self.body);
-        out
+        Ok(out)
     }
 
     pub fn parse(data: &[u8]) -> Result<Self> {
@@ -181,6 +188,11 @@ impl ContinuityPacket {
         }
         let ptype = PacketType::from_u8(data[0])
             .with_context(|| format!("unknown packet type {:#04x}", data[0]))?;
+        let length = ((data[1] as usize) << 16) | ((data[2] as usize) << 8) | data[3] as usize;
+        ensure!(
+            data.len() == 4 + length,
+            "continuity header/body length mismatch"
+        );
         Ok(ContinuityPacket {
             ptype,
             body: data[4..].to_vec(),
@@ -602,7 +614,7 @@ mod tests {
             Value::Bytes(vec![0x06, 0x01, 0x04]),
         )]));
         let pkt = ContinuityPacket::new(PacketType::PairVerifyPublicKey, body.clone());
-        let wire = pkt.serialize();
+        let wire = pkt.serialize().unwrap();
         assert_eq!(wire[0], 0x05);
         assert_eq!(u16::from_be_bytes([wire[2], wire[3]]) as usize, body.len());
         let parsed = ContinuityPacket::parse(&wire).unwrap();
@@ -613,9 +625,9 @@ mod tests {
     #[test]
     fn encrypted_packet_len_includes_tag() {
         let pkt = ContinuityPacket::new(PacketType::EncryptedData, vec![0u8; 10]);
-        let wire = pkt.serialize();
-        // Advertised length = body + 16 (Poly1305 tag).
-        assert_eq!(u16::from_be_bytes([wire[2], wire[3]]), 26);
+        let wire = pkt.serialize().unwrap();
+        // The supplied body is already ciphertext plus its tag.
+        assert_eq!(u16::from_be_bytes([wire[2], wire[3]]), 10);
     }
 
     /// Exercise the M1->M3 framing end-to-end with a locally-built peer so the

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Adhoc Cross-Device Connection
+Comment=Send and receive files with nearby Apple devices
+Exec=ac-dc ui
+Icon=folder-publicshare
+Terminal=false
+Categories=Network;FileTransfer;
+StartupNotify=true

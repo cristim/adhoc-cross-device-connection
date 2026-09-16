@@ -1,10 +1,11 @@
-//! Apple Continuity receiver and diagnostic tools.
+//! Adhoc Cross-Device Connection protocol and diagnostic tools.
 mod advert;
 mod advertise;
 mod airdrop;
 mod clipboard_out;
 mod companion;
 mod companion_client;
+mod daemon;
 mod discover;
 mod gcm;
 mod health;
@@ -15,6 +16,7 @@ mod scan;
 mod tlv8;
 mod transfer;
 mod transfer_ble;
+mod ui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -29,6 +31,48 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Run the privileged local Airdrop-compatible protocol service.
+    Daemon {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Send a JSON command to the local Airdrop-compatible service.
+    Ctl {
+        op: String,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        file: Vec<PathBuf>,
+        #[arg(long)]
+        link: Vec<String>,
+    },
+    /// Open the native Airdrop-compatible send/receive window.
+    Ui,
+    /// Discover nearby Everyone-mode Airdrop-compatible recipients.
+    Peers {
+        #[arg(long, default_value = "awdl0")]
+        iface: String,
+        #[arg(long)]
+        tls_identity: PathBuf,
+    },
+    /// Send files or HTTP(S) links to a selected Airdrop-compatible endpoint.
+    Send {
+        #[arg(long)]
+        host: String,
+        #[arg(long, default_value_t = 8770)]
+        port: u16,
+        #[arg(long)]
+        tls_identity: PathBuf,
+        #[arg(long, default_value = "Linux")]
+        name: String,
+        #[arg(long)]
+        url: Vec<String>,
+        files: Vec<PathBuf>,
+    },
     /// Scan for and decrypt Handoff / Universal Clipboard BLE adverts.
     Scan {
         /// Path to the key file exported from macOS (see macos/export-keys.sh).
@@ -76,7 +120,7 @@ enum Cmd {
         #[arg(long, default_value_t = 100)]
         interval_ms: u64,
     },
-    /// Receive AirDrop links/files for a bounded Everyone-mode window (experimental).
+    /// Receive Airdrop-compatible links/files for a bounded Everyone-mode window (experimental).
     Receive {
         #[arg(long, default_value = "awdl0")]
         iface: String,
@@ -94,6 +138,9 @@ enum Cmd {
         once: bool,
         #[arg(long)]
         notify: bool,
+        /// Advertise a Bluetooth wake hint during receiving.
+        #[arg(long)]
+        ble_wake: bool,
     },
     /// Receive an exported `keys.json` from a Mac over Bluetooth LE.
     ///
@@ -175,6 +222,57 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Daemon { socket } => {
+            daemon::run(socket.unwrap_or_else(daemon::default_socket)).await?
+        }
+        Cmd::Ctl {
+            op,
+            host,
+            port,
+            name,
+            file,
+            link,
+        } => {
+            daemon::ctl(
+                daemon::default_socket(),
+                daemon::Request {
+                    op,
+                    host,
+                    port,
+                    name,
+                    files: file,
+                    links: link,
+                },
+            )
+            .await?
+        }
+        Cmd::Ui => ui::run().await?,
+        Cmd::Peers {
+            iface,
+            tls_identity,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &airdrop::peers::browse(&iface, &tls_identity, 8).await?
+                )?
+            );
+        }
+        Cmd::Send {
+            host,
+            port,
+            tls_identity,
+            name,
+            url,
+            files,
+        } => {
+            let address = discover::socket_target(&host, port).await?;
+            let client = airdrop::send::Client::new(address, &tls_identity)?;
+            let receiver = client.discover().await?;
+            tracing::info!(receiver, "Sending Airdrop-compatible transfer");
+            client.transfer(&name, files, url).await?;
+            println!("Transfer accepted by {receiver}");
+        }
         Cmd::Receive {
             iface,
             directory,
@@ -184,8 +282,12 @@ async fn main() -> Result<()> {
             seconds,
             once,
             notify,
+            ble_wake,
         } => {
             airdrop::run(airdrop::Config {
+                radio_managed: false,
+                ble_wake,
+                approval: None,
                 iface,
                 directory,
                 identity: tls_identity,

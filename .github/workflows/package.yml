@@ -1,0 +1,26 @@
+name: Arch package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: pacman -Syu --noconfirm --needed rust pkgconf gtk4 openssl
+      - name: Build package
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -c 'cargo fetch --locked'
+          su builder -c 'makepkg --ignorearch --nodeps --noconfirm'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: adhoc-cross-device-connection-package
+          path: '*.pkg.tar.*'

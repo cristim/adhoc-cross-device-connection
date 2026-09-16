@@ -1,18 +1,23 @@
 //! Bounded DVZip/gzip and CPIO decoding. Extract regular files into one directory only.
-use anyhow::{bail, ensure, Context, Result};
+#[cfg(test)]
+use anyhow::bail;
+use anyhow::{ensure, Context, Result};
+#[cfg(test)]
+use std::io::Read;
 use std::{
-    fs::{self, OpenOptions},
-    io::Read,
-    os::unix::fs::OpenOptionsExt,
+    fs,
     path::{Path, PathBuf},
 };
+#[cfg(test)]
 const MAX: usize = 64 * 1024 * 1024;
+#[cfg(test)]
 fn inflate(reader: impl Read, remaining: usize) -> Result<Vec<u8>> {
     let mut b = Vec::new();
     reader.take(remaining as u64 + 1).read_to_end(&mut b)?;
     ensure!(b.len() <= remaining, "decompressed upload exceeds limit");
     Ok(b)
 }
+#[cfg(test)]
 pub fn dvzip(b: &[u8]) -> Result<Vec<u8>> {
     if b.starts_with(&[31, 139]) {
         return inflate(flate2::read::GzDecoder::new(b), MAX);
@@ -45,6 +50,7 @@ pub fn dvzip(b: &[u8]) -> Result<Vec<u8>> {
     }
     Ok(out)
 }
+#[cfg(test)]
 fn number(b: &[u8], radix: u32) -> Result<usize> {
     Ok(usize::from_str_radix(std::str::from_utf8(b)?, radix)?)
 }
@@ -53,6 +59,7 @@ pub struct Entry {
     pub name: String,
     pub bytes: Vec<u8>,
 }
+#[cfg(test)]
 pub fn cpio(b: &[u8]) -> Result<Vec<Entry>> {
     ensure!(b.len() <= MAX, "archive exceeds decoded limit");
     let mut off = 0;
@@ -128,6 +135,9 @@ pub fn store(dest: &Path, entries: &[Entry]) -> Result<Vec<PathBuf>> {
     let result = (|| -> Result<()> {
         for e in entries {
             let base = safe_name(&e.name)?;
+            let mut temporary = tempfile::NamedTempFile::new_in(dest)?;
+            temporary.write_all(&e.bytes)?;
+            temporary.as_file().sync_all()?;
             let mut saved = false;
             for i in 0..1000 {
                 let name = if i == 0 {
@@ -141,21 +151,16 @@ pub fn store(dest: &Path, entries: &[Entry]) -> Result<Vec<PathBuf>> {
                     }
                 };
                 let path = dest.join(name);
-                match OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&path)
-                {
-                    Ok(mut f) => {
+                match temporary.persist_noclobber(&path) {
+                    Ok(_) => {
                         written.push(path);
-                        f.write_all(&e.bytes)?;
-                        f.sync_all()?;
                         saved = true;
                         break;
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(err) => return Err(err.into()),
+                    Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        temporary = err.file;
+                    }
+                    Err(err) => return Err(err.error.into()),
                 }
             }
             ensure!(saved, "too many filename collisions");

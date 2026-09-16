@@ -1,6 +1,12 @@
-//! Explicit, bounded AirDrop receive sessions. Independent of same-account Universal Clipboard.
+//! Explicit, bounded Airdrop-compatible receive sessions. Independent of same-account Universal Clipboard.
 mod archive;
+mod cancel;
+mod client_http;
 mod http;
+mod outgoing;
+pub mod peers;
+pub mod send;
+mod storage;
 use crate::companion_client::{Pasteboard, PasteboardItem};
 use anyhow::{ensure, Context, Result};
 use std::{
@@ -18,7 +24,7 @@ use tokio_rustls::{
     TlsAcceptor,
 };
 
-fn tls(dir: &Path) -> Result<TlsAcceptor> {
+fn identity(dir: &Path) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
     use openssl::{
         asn1::Asn1Time,
         bn::{BigNum, MsbOption},
@@ -39,7 +45,7 @@ fn tls(dir: &Path) -> Result<TlsAcceptor> {
     if !cert_path.exists() && !key_path.exists() {
         let key = PKey::from_rsa(Rsa::generate(2048)?)?;
         let mut name = X509NameBuilder::new()?;
-        name.append_entry_by_text("CN", "ac-dc AirDrop")?;
+        name.append_entry_by_text("CN", "Adhoc Cross-Device Connection")?;
         let name = name.build();
         let mut x = X509::builder()?;
         x.set_version(2)?;
@@ -78,16 +84,46 @@ fn tls(dir: &Path) -> Result<TlsAcceptor> {
     let key = PKey::private_key_from_pem(&fs::read(key_path)?)?;
     ensure!(
         cert.public_key()?.public_eq(&key),
-        "AirDrop certificate/key do not match"
+        "Airdrop-compatible certificate/key do not match"
     );
+    Ok((
+        CertificateDer::from(cert.to_der()?),
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.private_key_to_pkcs8()?)),
+    ))
+}
+pub fn service_id(identity_dir: &Path) -> Result<String> {
+    if let Ok(mac) = std::fs::read_to_string("/sys/class/net/awdl0/address") {
+        let id = mac.trim().replace(':', "");
+        if id.len() == 12 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(id.to_ascii_lowercase());
+        }
+    }
+    let (cert, _) = identity(identity_dir)?;
+    use sha2::{Digest, Sha256};
+    Ok(hex::encode(&Sha256::digest(cert.as_ref())[..6]))
+}
+pub fn radio_state() -> Option<serde_json::Value> {
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read("/run/brcmfmac-awdl/discovery.json").ok()?).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    (v["active"] == true
+        && v["expires_at"].as_u64().is_some_and(|t| t > now)
+        && v["updated_at"]
+            .as_u64()
+            .is_some_and(|t| t <= now && now - t < 15))
+    .then_some(v)
+}
+fn tls(dir: &Path) -> Result<TlsAcceptor> {
+    let (cert, key) = identity(dir)?;
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from(cert.to_der()?)],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.private_key_to_pkcs8()?)),
-        )?;
+        .with_single_cert(vec![cert], key)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
+
 fn response(name: &str) -> Result<Vec<u8>> {
     let mut d = plist::Dictionary::new();
     d.insert("ReceiverComputerName".into(), name.into());
@@ -139,7 +175,11 @@ async fn deliver(entries: Vec<archive::Entry>, dest: PathBuf, notify: bool) -> R
             false
         }
     };
-    tracing::info!(files = paths.len(), copied, "AirDrop transfer received");
+    tracing::info!(
+        files = paths.len(),
+        copied,
+        "Airdrop-compatible transfer received"
+    );
     for p in paths {
         println!("{}", serde_json::json!({"received":p,"copied":copied}));
     }
@@ -148,7 +188,7 @@ async fn deliver(entries: Vec<archive::Entry>, dest: PathBuf, notify: bool) -> R
             Duration::from_secs(3),
             tokio::process::Command::new("notify-send")
                 .args([
-                    "AirDrop received",
+                    "Airdrop-compatible received",
                     if copied {
                         "Saved and copied to clipboard"
                     } else {
@@ -169,6 +209,17 @@ fn is_link_transfer(value: Option<&plist::Value>) -> bool {
         _ => false,
     }
 }
+pub struct Incoming {
+    pub sender: String,
+    pub items: Vec<String>,
+    pub decision: tokio::sync::oneshot::Sender<bool>,
+}
+#[derive(Clone, Default)]
+struct Sessions {
+    approved:
+        Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, std::time::Instant>>>,
+    approval: Option<tokio::sync::mpsc::Sender<Incoming>>,
+}
 async fn connection(
     stream: tokio::net::TcpStream,
     acceptor: TlsAcceptor,
@@ -176,16 +227,31 @@ async fn connection(
     dest: PathBuf,
     notify: bool,
     completed: tokio::sync::mpsc::Sender<()>,
+    sessions: Sessions,
 ) -> Result<()> {
+    let peer = stream.peer_addr()?.ip();
+    let started = std::time::Instant::now();
+    tracing::info!(%peer,"Airdrop-compatible TCP accepted");
     let tls = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream))
         .await
-        .context("AirDrop TLS timed out")??;
+        .context("Airdrop-compatible TLS timed out")??;
+    tracing::info!(%peer,elapsed_ms=started.elapsed().as_millis() as u64,"Airdrop-compatible TLS established");
     let mut io = tokio::io::BufReader::new(tls);
-    let mut asked = false;
     for _ in 0..32 {
-        let req = tokio::time::timeout(Duration::from_secs(30), http::read(&mut io))
-            .await
-            .context("AirDrop request timed out")??;
+        let req = tokio::time::timeout(
+            Duration::from_secs(3600),
+            http::read_spooled(&mut io, || {
+                sessions
+                    .approved
+                    .lock()
+                    .unwrap()
+                    .remove(&peer)
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(120))
+            }),
+        )
+        .await
+        .context("Airdrop-compatible request timed out")??;
+        tracing::info!(%peer,endpoint=%req.path,"Airdrop-compatible incoming request");
         let result = match req.path.as_str() {
             "/Discover" => {
                 plist::Value::from_reader(Cursor::new(&req.body))
@@ -195,7 +261,59 @@ async fn connection(
             "/Ask" => {
                 let value = plist::Value::from_reader(Cursor::new(&req.body))?;
                 let dict = value.as_dictionary().context("Ask must be a dictionary")?;
-                let links = is_link_transfer(dict.get("TransferType"));
+                let links = is_link_transfer(dict.get("TransferType"))
+                    || (dict.contains_key("Items") && !dict.contains_key("Files"));
+                if let Some(approval) = &sessions.approval {
+                    let sender = dict
+                        .get("SenderComputerName")
+                        .and_then(plist::Value::as_string)
+                        .unwrap_or("Nearby device")
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(128)
+                        .collect();
+                    let items = if links {
+                        dict.get("Items")
+                    } else {
+                        dict.get("Files")
+                    }
+                    .and_then(plist::Value::as_array)
+                    .context("Ask has no items")?
+                    .iter()
+                    .take(512)
+                    .map(|v| {
+                        if links {
+                            v.as_string()
+                        } else {
+                            v.as_dictionary()
+                                .and_then(|d| d.get("FileName"))
+                                .and_then(plist::Value::as_string)
+                        }
+                        .unwrap_or("File")
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(256)
+                        .collect()
+                    })
+                    .collect();
+                    let (decision, result) = tokio::sync::oneshot::channel();
+                    let accepted = match approval.try_send(Incoming {
+                        sender,
+                        items,
+                        decision,
+                    }) {
+                        Ok(()) => tokio::time::timeout(Duration::from_secs(90), result)
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .unwrap_or(false),
+                        Err(_) => false,
+                    };
+                    if !accepted {
+                        http::respond(io.get_mut(), 403, b"").await?;
+                        continue;
+                    }
+                }
                 if links {
                     let mut entries = Vec::new();
                     for url in dict
@@ -216,26 +334,62 @@ async fn connection(
                     }
                     deliver(entries, dest.clone(), notify).await?;
                 }
-                asked = true;
+                if !links {
+                    let mut grants = sessions.approved.lock().unwrap();
+                    grants.retain(|_, t| t.elapsed() < Duration::from_secs(120));
+                    ensure!(grants.len() < 128, "too many pending transfers");
+                    grants.insert(peer, std::time::Instant::now());
+                }
                 Ok((response(&name)?, links))
             }
-            "/Upload" if asked => {
+            "/Upload" => {
                 let ty = req
                     .headers
                     .get("content-type")
                     .map(|s| s.split(';').next().unwrap_or(""))
                     .unwrap_or("");
-                let archive = match ty {
-                    "application/x-dvzip" => archive::dvzip(&req.body)?,
-                    "application/x-cpio" => req.body,
-                    _ => {
-                        http::respond(io.get_mut(), 415, b"").await?;
-                        continue;
-                    }
-                };
-                let entries = archive::cpio(&archive)?;
-                deliver(entries, dest.clone(), notify).await?;
-                asked = false;
+                if !matches!(ty, "application/x-cpio" | "application/x-dvzip") {
+                    http::respond(io.get_mut(), 415, b"").await?;
+                    continue;
+                }
+                let upload = req.upload.context("upload spool missing")?;
+                let ty = ty.to_owned();
+                let directory = dest.clone();
+                let cancellation = cancel::Guard(cancel::Token::default());
+                let token = cancellation.0.clone();
+                let saved = tokio::task::spawn_blocking(move || {
+                    use std::io::Seek;
+                    let mut file = upload.reopen()?;
+                    file.rewind()?;
+                    storage::receive_cancel(file, &ty, &directory, token)
+                })
+                .await??;
+                let copied = crate::clipboard_out::copy_pasteboard(&board(&saved.clipboard))
+                    .ok()
+                    .is_some_and(|v| v.is_some_and(|v| v.spawned));
+                tracing::info!(
+                    files = saved.files,
+                    bytes = saved.bytes,
+                    copied,
+                    "Airdrop-compatible transfer received"
+                );
+                println!(
+                    "{}",
+                    serde_json::json!({"received":saved.directory,"files":saved.files,"bytes":saved.bytes,"copied":copied})
+                );
+                if notify {
+                    let _ = tokio::process::Command::new("notify-send")
+                        .args([
+                            "Airdrop-compatible received",
+                            &format!(
+                                "Saved {} file(s) in {}",
+                                saved.files,
+                                saved.directory.display()
+                            ),
+                        ])
+                        .kill_on_drop(true)
+                        .spawn();
+                }
                 Ok((Vec::new(), true))
             }
             _ => Err(anyhow::anyhow!(
@@ -266,6 +420,9 @@ pub struct Config {
     pub seconds: u64,
     pub once: bool,
     pub notify: bool,
+    pub radio_managed: bool,
+    pub ble_wake: bool,
+    pub approval: Option<tokio::sync::mpsc::Sender<Incoming>>,
 }
 pub async fn run(c: Config) -> Result<()> {
     ensure!(
@@ -318,19 +475,29 @@ pub async fn run(c: Config) -> Result<()> {
     let fullname = info.get_fullname().to_string();
     daemon.register(info)?;
     let _announce = Announce(daemon, fullname);
-    tracing::info!(address=%addr,seconds=c.seconds,"AirDrop receive window open (Everyone; experimental)");
+    tracing::info!(address=%addr,seconds=c.seconds,"Airdrop-compatible receive window open (Everyone; experimental)");
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let end = tokio::time::sleep(Duration::from_secs(c.seconds));
     tokio::pin!(end);
     let shutdown = crate::shutdown();
     tokio::pin!(shutdown);
+    let sessions = Sessions {
+        approval: c.approval.clone(),
+        ..Default::default()
+    };
     let mut tasks = tokio::task::JoinSet::new();
+    let wake = crate::advertise::broadcast(crate::advertise::airdrop_wake(), c.seconds, 100);
+    tokio::pin!(wake);
+    let mut wake_done = !c.ble_wake;
+    let mut monitor = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
-            _=&mut end=>break,_=&mut shutdown=>break,
+            result=&mut wake, if !wake_done=>{wake_done=true;if let Err(e)=result{tracing::warn!(error=%e,"Airdrop-compatible Bluetooth wake unavailable");}},
+            _=monitor.tick(), if c.radio_managed=>{if radio_state().is_none(){tracing::info!("Airdrop-compatible radio window ended");break;}},
+            _=&mut end, if !c.radio_managed=>break,_=&mut shutdown=>break,
             Some(())=rx.recv()=>{if c.once{break;}},
-            Some(result)=tasks.join_next(),if !tasks.is_empty()=>{if let Ok(Err(e))=result{tracing::debug!(error=%format!("{e:#}"),"AirDrop connection ended");}},
-            result=listener.accept()=>{let (s,_)=result?;if tasks.len()>=4{drop(s);continue;}tasks.spawn(connection(s,acceptor.clone(),c.name.clone(),dest.clone(),c.notify,tx.clone()));}
+            Some(result)=tasks.join_next(),if !tasks.is_empty()=>{if let Ok(Err(e))=result{tracing::info!(error=%format!("{e:#}"),"Airdrop-compatible connection ended");}},
+            result=listener.accept()=>{let (s,_)=result?;if tasks.len()>=4{drop(s);continue;}tasks.spawn(connection(s,acceptor.clone(),c.name.clone(),dest.clone(),c.notify,tx.clone(),sessions.clone()));}
         }
     }
     tasks.abort_all();
@@ -365,7 +532,16 @@ mod tests {
         let server_dest = dest.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            connection(stream, acceptor, "Test".into(), server_dest, false, tx).await
+            connection(
+                stream,
+                acceptor,
+                "Test".into(),
+                server_dest,
+                false,
+                tx,
+                Sessions::default(),
+            )
+            .await
         });
         let cert =
             openssl::x509::X509::from_pem(&std::fs::read(id.join("certificate.pem")).unwrap())
@@ -417,7 +593,7 @@ mod tests {
         }
         let mut response = vec![0; size];
         io.read_exact(&mut response).await.unwrap();
-        let mut archive = archive_fixture("../../blob.bin", b"test bytes");
+        let mut archive = archive_fixture("./blob.bin", b"test bytes");
         archive.extend(archive_fixture("TRAILER!!!", b""));
         let mut dvzip = ((archive.len() as u32) | 0x8000_0000)
             .to_be_bytes()
@@ -499,5 +675,186 @@ mod link_tests {
         assert!(!is_link_transfer(Some(&plist::Value::Array(vec![
             "files".into()
         ]))));
+    }
+}
+
+#[cfg(test)]
+mod sender_tests {
+    use super::*;
+    #[tokio::test]
+    async fn rust_sender_receiver_with_approval_and_decline() {
+        let root = std::env::temp_dir().join(format!("acdc-send-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(root.join("receive")).unwrap();
+        let file = root.join("example.bin");
+        std::fs::write(&file, b"end-to-end Rust transfer").unwrap();
+        let acceptor = tls(&root.join("server-id")).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (approval, mut prompts) = tokio::sync::mpsc::channel(4);
+        let sessions = Sessions {
+            approval: Some(approval),
+            ..Default::default()
+        };
+        let (done, mut completed) = tokio::sync::mpsc::channel(4);
+        let dest = root.join("receive");
+        let server = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                let (s, _) = listener.accept().await.unwrap();
+                tasks.spawn(connection(
+                    s,
+                    acceptor.clone(),
+                    "Test Mac".into(),
+                    dest.clone(),
+                    false,
+                    done.clone(),
+                    sessions.clone(),
+                ));
+            }
+        });
+        let client = send::Client::new(address, &root.join("client-id")).unwrap();
+        assert_eq!(client.discover().await.unwrap(), "Test Mac");
+        let transfer =
+            tokio::spawn(async move { client.transfer("Test Linux", vec![file], vec![]).await });
+        let prompt = tokio::time::timeout(Duration::from_secs(5), prompts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt.sender, "Test Linux");
+        assert_eq!(prompt.items, vec!["example.bin"]);
+        prompt.decision.send(true).unwrap();
+        transfer.await.unwrap().unwrap();
+        completed.recv().await.unwrap();
+        assert_eq!(
+            std::fs::read(root.join("receive/example.bin")).unwrap(),
+            b"end-to-end Rust transfer"
+        );
+        let client = send::Client::new(address, &root.join("client-id")).unwrap();
+        let file = root.join("example.bin");
+        let transfer =
+            tokio::spawn(
+                async move { client.transfer("Declined sender", vec![file], vec![]).await },
+            );
+        prompts.recv().await.unwrap().decision.send(false).unwrap();
+        let error = transfer.await.unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("403"));
+        assert_eq!(std::fs::read_dir(root.join("receive")).unwrap().count(), 1);
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod upload_wire_tests {
+    use super::*;
+    async fn sender_fixture(close_ask: bool) {
+        let root = std::env::temp_dir().join(format!("acdc-wire-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("test.bin");
+        std::fs::write(&path, b"wire fixture").unwrap();
+        let (client_cert, _) = identity(&root.join("client")).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(client_cert).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let (cert, key) = identity(&root.join("server")).unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Match OpenDrop CLI: discovery has its own TLS connection.
+            let (stream, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(stream).await.unwrap();
+            assert!(tls
+                .get_ref()
+                .1
+                .peer_certificates()
+                .is_some_and(|c| !c.is_empty()));
+            let mut discovery = tokio::io::BufReader::new(tls);
+            let req = http::read(&mut discovery).await.unwrap();
+            assert_eq!(req.path, "/Discover");
+            assert_eq!(req.headers["connection"], "keep-alive");
+            http::respond(discovery.get_mut(), 200, &response("Wire Mac").unwrap())
+                .await
+                .unwrap();
+            drop(discovery);
+            let (stream, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(stream).await.unwrap();
+            let mut io = tokio::io::BufReader::new(tls);
+            let mut transfer_id = None;
+            for endpoint in ["/Ask", "/Upload"] {
+                let req = http::read(&mut io).await.unwrap();
+                assert_eq!(req.headers["connection"], "keep-alive");
+                assert_eq!(req.path, endpoint);
+                if endpoint == "/Ask" {
+                    let ask = plist::Value::from_reader(std::io::Cursor::new(&req.body)).unwrap();
+                    let dict = ask.as_dictionary().unwrap();
+                    let id = dict["TransferID"].as_dictionary().unwrap()["id"]
+                        .as_string()
+                        .unwrap()
+                        .to_owned();
+                    assert_eq!(
+                        dict["TransferType"].as_dictionary().unwrap()["files"],
+                        plist::Value::Dictionary(plist::Dictionary::new())
+                    );
+                    transfer_id = Some(id);
+                } else {
+                    assert_eq!(
+                        req.headers.get("transfer-encoding").map(String::as_str),
+                        Some("chunked")
+                    );
+                    assert!(!req.headers.contains_key("content-length"));
+                    assert_eq!(req.headers["content-type"], "application/x-dvzip");
+                    assert_eq!(req.headers["transferid"], transfer_id.as_deref().unwrap());
+                    assert_eq!(req.headers["totalbytes"], req.body.len().to_string());
+                    assert!(req.headers["senderpseudonym"].starts_with("pseud:"));
+                    assert_eq!(req.headers["senderpushtoken"].len(), 64);
+                    assert_eq!(req.headers["expect"], "100-continue");
+                    let plain = archive::dvzip(&req.body).unwrap();
+                    let entries = archive::cpio(&plain).unwrap();
+                    assert_eq!(entries[0].bytes, b"wire fixture");
+                }
+                if endpoint == "/Ask" && close_ask {
+                    use tokio::io::AsyncWriteExt;
+                    io.get_mut()
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    io.get_mut().shutdown().await.unwrap();
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let tls = acceptor.accept(stream).await.unwrap();
+                    io = tokio::io::BufReader::new(tls);
+                } else {
+                    http::respond(io.get_mut(), 200, &response("Wire Mac").unwrap())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let client = send::Client::new(addr, &root.join("client")).unwrap();
+        assert_eq!(client.discover().await.unwrap(), "Wire Mac");
+        client.transfer("Sender", vec![path], vec![]).await.unwrap();
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn sender_upload_matches_current_apple_wire_shape() {
+        tokio::time::timeout(Duration::from_secs(10), sender_fixture(false))
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn sender_reconnects_when_ask_response_closes_connection() {
+        tokio::time::timeout(Duration::from_secs(10), sender_fixture(true))
+            .await
+            .unwrap();
     }
 }

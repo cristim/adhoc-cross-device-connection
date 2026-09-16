@@ -6,13 +6,14 @@ Apple Continuity and clipboard tools for Linux, implemented in Rust.
   from your own macOS account.
 - Pull a pasteboard through companion-link, with mandatory peer signature
   verification, scoped IPv6 discovery, and Wayland clipboard output.
-- Run an explicit, bounded **AirDrop receive** session for shared links and files.
+- Send and receive Airdrop-compatible files/links through a native Rust GTK UI or the CLI.
 - Inspect prerequisites and advertise Apple BLE TLVs for controlled experiments.
 
 **Compatibility is experimental.** Companion-link framing and request fields
-still need validation against Apple devices. The AirDrop receiver is tested
-against a local TLS client, not an iPhone/Mac. A mock round-trip does not prove
-Apple interoperability. The BCM4378 AWDL transport also remains unvalidated.
+still need validation against Apple devices. Rust-to-Rust Airdrop-compatible transfers, including user approval/decline, pass local TLS
+tests. Discovery and HTTPS `/Discover` have succeeded against a real Mac over
+BCM4378 AWDL. File-transfer interoperability is still being tested; do not
+interpret discovery alone as a completed transfer.
 
 ## Separate driver repository
 
@@ -35,6 +36,22 @@ cargo build --release --locked
 cargo test --locked
 ./target/release/ac-dc --help
 ```
+
+## Install and quick start
+
+On Arch Linux, build the package from this repository with `makepkg -si`.
+The package installs the `ac-dc` command, the GTK launcher, the Omarchy
+systray widget, and the restricted root service used for radio and transfer
+operations. Enable the service once after installation:
+
+```sh
+sudo systemctl enable --now ac-dc-daemon.service
+ac-dc ui
+```
+
+The widget and the CLI talk to the service through its local Unix socket; no
+network control port is exposed. See [packaging/INSTALL.md](packaging/INSTALL.md)
+for firewall and first-transfer guidance.
 
 Tests use temporary data and loopback TCP/TLS. They never access real Apple keys,
 change the radio, or change the desktop clipboard.
@@ -75,13 +92,43 @@ BLE MACs and AWDL MACs are different identifiers.
 `ac-dc pull --loopback` and `ac-dc auto --loopback` are developer demos and **do
 write** the mock pasteboard to your clipboard. The unit tests do not.
 
-## AirDrop receive
+## Airdrop-compatible UI and sending
+
+Launch **Adhoc Cross-Device Connection** from the application launcher, or run `ac-dc ui`.
+The native GTK window provides device name and destination settings, a bounded
+receiving session, incoming Accept/Decline prompts, recipient discovery, a file
+chooser and link sending. It invokes the installed root-owned radio service
+through desktop authentication; all transfer handling runs as your normal user.
+
+Set the receiving Apple device to **Everyone for 10 Minutes**. Click **Find
+recipients**, select the intended device, select files or enter an HTTP(S) link,
+and send. Nearby names are discovery hints, not authenticated Apple identities.
+Everyone-mode TLS uses self-signed certificates; Contacts Only is not implemented.
+
+CLI equivalents (prepare the radio service first):
+
+```sh
+sudo systemctl start ac-dc-daemon.service
+ac-dc air-drop-peers --tls-identity ~/.local/share/ac-dc/airdrop
+ac-dc send --host 'fe80::PEER%awdl0' --port 8770 \
+  --tls-identity ~/.local/share/ac-dc/airdrop --name Linux /path/to/file
+# For a link, replace the filename with --url https://example.com/
+```
+
+Sending uses scoped HTTPS Discover/Ask/Upload, with DVZip-wrapped CPIO over
+chunked HTTP and one transfer UUID shared by Ask and Upload.
+Select regular files: folders and symlinks are currently rejected, duplicate
+basenames must be renamed, and a transfer is bounded to 64 MiB. Receiving
+flattens archive paths and never overwrites existing files. Larger/streaming
+transfers and directory-preserving transfers remain follow-up work.
+
+## Airdrop-compatible receive (CLI)
 
 Prepare an AWDL window and peer registration using `awdlctl`, then run as your
 normal user:
 
 ```sh
-ac-dc receive --directory ~/Downloads/AirDrop \
+ac-dc receive --directory ~/Downloads/Adhoc \
   --tls-identity ~/.local/share/ac-dc/airdrop \
   --name "Linux Mac" --seconds 600 --once --notify
 ```
@@ -98,10 +145,15 @@ compressed/decompressed sizes and connection counts are limited. URLs are saved
 as text and never opened automatically. Text and recognized images are copied
 to the clipboard; other files are saved. Notifications are optional.
 
-AirDrop's AWDL management-frame publication/wake requirements can differ from
-mDNS publication. This receiver does not yet generate the firmware PSF/service
-templates used by Omdrop. A missing AirDrop tile is therefore not sufficient to
-conclude that its HTTP receiver or the radio is broken.
+The separate Rust driver helper now publishes firmware service/PSF templates,
+tracks election changes, registers nearby peers, and sends scoped mDNS
+announcements. `ac-dc-daemon.service` owns this bounded session. Stopping
+it withdraws host discovery and brings the AWDL host link down; firmware template
+state remains until driver reload because disabling a populated template can
+hang this firmware. The service reuses that state on its next start.
+
+The older `awdl-window.service` is useful for plain clipboard/radio experiments;
+it cannot replace the protocol service. Do not run both at once.
 
 ## BLE advertising experiments
 
@@ -111,7 +163,7 @@ ac-dc advertise --data HEX_APPLE_TLVS --seconds 10 --interval-ms 100
 ```
 
 Registration and cancellation use BlueZ; no raw HCI commands compete with
-bluetoothd. `--airdrop-wake` emits an AirDrop type-5 advert, not a Universal
+bluetoothd. `--airdrop-wake` emits an Airdrop-compatible type-5 advert, not a Universal
 Clipboard announcement. The raw mode sends supplied bytes without allocating
 AES nonces or inventing a usable same-account identity. Full Linux → Apple
 Universal Clipboard still requires a validated server and nonce ownership.
@@ -138,3 +190,36 @@ See [architecture and remaining work](docs/architecture.md) and
 ## License
 
 MIT. Not affiliated with Apple. Uses keys for your own devices/account.
+
+## Research and validation
+
+- [Clipboard protocol audit](docs/clipboard-research.md)
+- [Sapporo issue review](docs/sapporo-research.md)
+
+The clipboard audit found concrete wire-format problems. Header/AAD framing and
+OPACK byte order/reference decoding have now been corrected; real UC request
+payloads, keyed-archive parsing and current-device authentication still need work.
+
+## 0.1.0-0 release notes
+
+See [installation and operating limits](packaging/INSTALL.md) and
+[OWL, OpenDrop and LocalSend findings](docs/owl-opendrop-localsend-research.md).
+The Rust UI adds outgoing progress/cancellation, folder selection and a renewable
+radio countdown. Archives stream through temporary files; completed top-level
+items are published directly in the receive directory, with Finder-style numeric
+collision names. The sender separates discovery from the Ask/Upload connection,
+following OpenDrop's CLI sequence.
+
+Receiving was confirmed during development after the scoped UFW rule was
+added. Outgoing Apple-device delivery and Universal Clipboard remain unconfirmed;
+local TLS tests are not a substitute for those interoperability checks.
+
+
+## Dedicated sender
+
+The sender now follows OpenDrop's dedicated connection flow: discovery is
+separate, then Ask and Upload share an OpenSSL/HTTP1 connection. It uses Rust
+bindings, chunked disk-backed DVZip/CPIO and explicit response limits, without
+reqwest's pool or implicit TCP keepalive timeout. See the
+[implementation and validation notes](docs/opendrop-sender-2026-09-17.md).
+Real Mac/iPhone outgoing delivery still needs validation with this version.

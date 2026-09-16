@@ -1,27 +1,19 @@
-//! OPACK — Apple's proprietary serialization format used by Handoff, Universal
-//! Clipboard and Wi-Fi Password Sharing to carry structured payloads.
-//!
-//! Ported from seemoo-lab openwifipass `OPACK.py`. Supported types: bool, int
-//! (unsigned, up to 4 bytes as the reference encoder does), string, bytes,
-//! array, dict. Float/date/UUID are intentionally omitted (the reference does
-//! not implement them either).
-//!
-//! Reference for the wire format:
-//!   * false=0x02 / true=0x01
-//!   * small int 0..=0x26 => 0x08+value; else 0x30+(len-1) then big-endian bytes
-//!   * string len<=0x20 => 0x40+len + utf8; else 0x61+(lenbytes-1) + len + utf8
-//!   * bytes  len<=0x20 => 0x70+len + data; else 0x91+(lenbytes-1) + len + data
-//!   * array  n<0x0F    => 0xD0+n + items; else 0xDF + items + 0x03
-//!   * dict   n<0x0F    => 0xE0+n + pairs; else 0xEF + pairs + 0x03
+//! OPACK encoding for Companion messages. Integer and data lengths are little endian.
+//! Protocol cross-check: pyatv/support/opack.py (2026-09-16); no runtime dependency.
+//! The decoder bounds nesting, object count, references, and total input.
 
 #![allow(dead_code)] // M2/M3 scaffolding: exercised by unit tests; wired into the runtime once macOS keys exist.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Context, Result};
 
 /// An OPACK value. Dicts keep insertion order and allow non-string keys, so we
 /// model them as an ordered list of pairs rather than a map.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    Null,
+    Float(f64),
+    Uuid([u8; 16]),
+    Time(u64),
     Bool(bool),
     Int(u64),
     Str(String),
@@ -83,6 +75,19 @@ pub fn encode(value: &Value) -> Vec<u8> {
 
 fn encode_into(value: &Value, out: &mut Vec<u8>) {
     match value {
+        Value::Null => out.push(4),
+        Value::Float(v) => {
+            out.push(0x36);
+            out.extend(v.to_le_bytes());
+        }
+        Value::Uuid(v) => {
+            out.push(5);
+            out.extend(v);
+        }
+        Value::Time(v) => {
+            out.push(6);
+            out.extend(v.to_le_bytes());
+        }
         Value::Bool(true) => out.push(0x01),
         Value::Bool(false) => out.push(0x02),
         Value::Int(v) => encode_int(*v, out),
@@ -121,157 +126,209 @@ fn encode_into(value: &Value, out: &mut Vec<u8>) {
     }
 }
 
-fn min_be_bytes(value: u64) -> Vec<u8> {
-    if value == 0 {
-        return vec![0];
-    }
-    let full = value.to_be_bytes();
-    let first = full.iter().position(|&b| b != 0).unwrap();
-    full[first..].to_vec()
-}
-
 fn encode_int(value: u64, out: &mut Vec<u8>) {
-    if value < 0x27 {
-        out.push(value as u8 + 0x08);
+    if value < 0x28 {
+        out.push(value as u8 + 8);
         return;
     }
-    let be = min_be_bytes(value);
-    // Reference encoder supports up to 4 bytes.
-    debug_assert!(be.len() <= 4, "OPACK int wider than 4 bytes");
-    out.push(0x30 + (be.len() as u8 - 1));
-    out.extend_from_slice(&be);
+    let (tag, size) = if value <= 0xff {
+        (0x30, 1)
+    } else if value <= 0xffff {
+        (0x31, 2)
+    } else if value <= 0xffff_ffff {
+        (0x32, 4)
+    } else {
+        (0x33, 8)
+    };
+    out.push(tag);
+    out.extend(&value.to_le_bytes()[..size]);
 }
-
-fn encode_len_prefixed(base_short: u8, base_long: u8, payload: &[u8], out: &mut Vec<u8>) {
-    let len = payload.len();
-    if len <= 0x20 {
-        out.push(base_short + len as u8);
-        out.extend_from_slice(payload);
-        return;
-    }
-    let be = min_be_bytes(len as u64);
-    out.push(base_long + (be.len() as u8 - 1));
-    out.extend_from_slice(&be);
-    out.extend_from_slice(payload);
-}
-
 fn encode_str(s: &str, out: &mut Vec<u8>) {
-    encode_len_prefixed(0x40, 0x61, s.as_bytes(), out);
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    if n <= 32 {
+        out.push(0x40 + n as u8);
+    } else {
+        let width = if n <= 255 {
+            1
+        } else if n <= 65535 {
+            2
+        } else if n <= 0xffffff {
+            3
+        } else {
+            4
+        };
+        out.push(0x60 + width as u8);
+        out.extend(&(n as u64).to_le_bytes()[..width]);
+    }
+    out.extend(bytes);
 }
-
 fn encode_bytes(b: &[u8], out: &mut Vec<u8>) {
-    encode_len_prefixed(0x70, 0x91, b, out);
+    let n = b.len();
+    if n <= 32 {
+        out.push(0x70 + n as u8);
+    } else {
+        let (tag, width) = if n <= 255 {
+            (0x91, 1)
+        } else if n <= 65535 {
+            (0x92, 2)
+        } else if n <= 0xffff_ffff {
+            (0x93, 4)
+        } else {
+            (0x94, 8)
+        };
+        out.push(tag);
+        out.extend(&(n as u64).to_le_bytes()[..width]);
+    }
+    out.extend(b);
 }
 
 pub fn decode(data: &[u8]) -> Result<Value> {
-    let mut d = Decoder { data, pos: 0 };
-    d.parse()
+    ensure!(data.len() <= 4 * 1024 * 1024, "OPACK input exceeds 4 MiB");
+    let mut d = Decoder {
+        data,
+        pos: 0,
+        objects: Vec::new(),
+        count: 0,
+        budget: 16 * 1024 * 1024,
+    };
+    let value = d.parse(0)?;
+    ensure!(d.pos == data.len(), "OPACK trailing bytes");
+    Ok(value)
 }
-
 struct Decoder<'a> {
     data: &'a [u8],
     pos: usize,
+    objects: Vec<Value>,
+    count: usize,
+    budget: usize,
 }
-
 impl Decoder<'_> {
     fn take(&mut self, n: usize) -> Result<&[u8]> {
-        if self.pos + n > self.data.len() {
-            bail!("OPACK: unexpected end of data");
-        }
-        let s = &self.data[self.pos..self.pos + n];
+        ensure!(n <= self.data.len() - self.pos, "OPACK unexpected end");
+        let start = self.pos;
         self.pos += n;
-        Ok(s)
+        Ok(&self.data[start..self.pos])
     }
-
-    fn peek(&self) -> Option<u8> {
-        self.data.get(self.pos).copied()
+    fn number(&mut self, n: usize) -> Result<u64> {
+        let mut b = [0; 8];
+        b[..n].copy_from_slice(self.take(n)?);
+        Ok(u64::from_le_bytes(b))
     }
-
-    fn read_be(&mut self, n: usize) -> Result<u64> {
-        let mut v = 0u64;
-        for &b in self.take(n)? {
-            v = (v << 8) | b as u64;
-        }
-        Ok(v)
+    fn charge(&mut self, n: usize) -> Result<()> {
+        self.budget = self
+            .budget
+            .checked_sub(n)
+            .context("OPACK allocation limit")?;
+        Ok(())
     }
-
-    fn parse(&mut self) -> Result<Value> {
+    fn parse(&mut self, depth: usize) -> Result<Value> {
+        self.count += 1;
+        ensure!(
+            depth <= 64 && self.count <= 65536,
+            "OPACK nesting/object limit"
+        );
+        self.charge(32)?;
         let t = self.take(1)?[0];
-        match t {
-            0x01 => Ok(Value::Bool(true)),
-            0x02 => Ok(Value::Bool(false)),
-            0x08..=0x2F => Ok(Value::Int((t - 0x08) as u64)),
-            0x30..=0x33 => {
-                let n = (t - 0x30) as usize + 1;
-                Ok(Value::Int(self.read_be(n)?))
+        let mut remember = true;
+        let value = match t {
+            1 => {
+                remember = false;
+                Value::Bool(true)
             }
-            0x40..=0x60 => {
-                let len = (t - 0x40) as usize;
-                self.parse_str(len)
+            2 => {
+                remember = false;
+                Value::Bool(false)
             }
-            0x61..=0x64 => {
-                let lenbytes = (t - 0x60) as usize;
-                let len = self.read_be(lenbytes)? as usize;
-                self.parse_str(len)
+            4 => {
+                remember = false;
+                Value::Null
             }
-            0x70..=0x90 => {
-                let len = (t - 0x70) as usize;
-                Ok(Value::Bytes(self.take(len)?.to_vec()))
+            5 => Value::Uuid(self.take(16)?.try_into()?),
+            6 => Value::Time(self.number(8)?),
+            8..=0x2f => {
+                remember = false;
+                Value::Int((t - 8) as u64)
             }
-            0x91..=0x94 => {
-                let lenbytes = (t - 0x90) as usize;
-                let len = self.read_be(lenbytes)? as usize;
-                Ok(Value::Bytes(self.take(len)?.to_vec()))
+            0x30..=0x33 => Value::Int(self.number(1 << (t - 0x30))?),
+            0x35 => Value::Float(f32::from_bits(self.number(4)? as u32) as f64),
+            0x36 => Value::Float(f64::from_bits(self.number(8)?)),
+            0x40..=0x64 => {
+                let n = if t <= 0x60 {
+                    (t - 0x40) as usize
+                } else {
+                    usize::try_from(self.number((t - 0x60) as usize)?)?
+                };
+                self.charge(n * 2)?;
+                Value::Str(std::str::from_utf8(self.take(n)?)?.to_string())
             }
-            0xD0..=0xDE => {
-                let n = (t - 0xD0) as usize;
-                let mut items = Vec::with_capacity(n);
-                for _ in 0..n {
-                    items.push(self.parse()?);
-                }
-                Ok(Value::Array(items))
+            0x70..=0x94 => {
+                let n = if t <= 0x90 {
+                    (t - 0x70) as usize
+                } else {
+                    usize::try_from(self.number(1 << (t - 0x91))?)?
+                };
+                ensure!(n <= 4 * 1024 * 1024, "OPACK data limit");
+                self.charge(n * 2)?;
+                Value::Bytes(self.take(n)?.to_vec())
             }
-            0xDF => {
+            0xa0..=0xc4 => {
+                remember = false;
+                let index = if t <= 0xc0 {
+                    (t - 0xa0) as usize
+                } else {
+                    usize::try_from(self.number((t - 0xc0) as usize)?)?
+                };
+                let object = self
+                    .objects
+                    .get(index)
+                    .context("OPACK invalid object reference")?;
+                let size = match object {
+                    Value::Str(s) => s.len(),
+                    Value::Bytes(b) => b.len(),
+                    _ => 16,
+                };
+                self.charge(size)?;
+                self.objects[index].clone()
+            }
+            0xd0..=0xdf => {
+                remember = false;
                 let mut items = Vec::new();
+                let n = (t & 15) as usize;
                 loop {
-                    if self.peek() == Some(0x03) {
+                    if n < 15 && items.len() == n {
+                        break;
+                    }
+                    if n == 15 && self.data.get(self.pos) == Some(&3) {
                         self.pos += 1;
                         break;
                     }
-                    items.push(self.parse()?);
+                    items.push(self.parse(depth + 1)?);
                 }
-                Ok(Value::Array(items))
+                Value::Array(items)
             }
-            0xE0..=0xEE => {
-                let n = (t - 0xE0) as usize;
-                let mut pairs = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let k = self.parse()?;
-                    let v = self.parse()?;
-                    pairs.push((k, v));
-                }
-                Ok(Value::Dict(pairs))
-            }
-            0xEF => {
-                let mut pairs = Vec::new();
+            0xe0..=0xef => {
+                remember = false;
+                let mut items = Vec::new();
+                let n = (t & 15) as usize;
                 loop {
-                    if self.peek() == Some(0x03) {
+                    if n < 15 && items.len() == n {
+                        break;
+                    }
+                    if n == 15 && self.data.get(self.pos) == Some(&3) {
                         self.pos += 1;
                         break;
                     }
-                    let k = self.parse()?;
-                    let v = self.parse()?;
-                    pairs.push((k, v));
+                    items.push((self.parse(depth + 1)?, self.parse(depth + 1)?));
                 }
-                Ok(Value::Dict(pairs))
+                Value::Dict(items)
             }
-            other => bail!("OPACK: unknown type byte {other:#04x}"),
+            _ => bail!("OPACK unsupported tag {t:#x}"),
+        };
+        if remember && !self.objects.contains(&value) {
+            self.objects.push(value.clone());
         }
-    }
-
-    fn parse_str(&mut self, len: usize) -> Result<Value> {
-        let bytes = self.take(len)?.to_vec();
-        Ok(Value::Str(String::from_utf8(bytes)?))
+        Ok(value)
     }
 }
 
@@ -291,13 +348,13 @@ mod tests {
     }
 
     #[test]
-    fn openwifipass_vector() {
-        // From openwifipass tests/test_opack.py: {"pf": 266256}
+    fn companion_integer_wire_vector() {
+        // Independent protocol fixture: 32-bit little-endian integer.
         let v = Value::dict([("pf", Value::Int(266256))]);
         let enc = encode(&v);
         // E1 (dict,1) | 42 'p'(70) 'f'(66) (str len2) | 32 (int,3 bytes) 04 10 10
         // (266256 == 0x041010)
-        assert_eq!(hex::encode(&enc), "e142706632041010");
+        assert_eq!(hex::encode(&enc), "e14270663210100400");
         assert_eq!(decode(&enc).unwrap(), v);
     }
 
@@ -320,7 +377,7 @@ mod tests {
         // small-int encoding boundary
         assert_eq!(encode(&Value::Int(0)), vec![0x08]);
         assert_eq!(encode(&Value::Int(0x26)), vec![0x2E]);
-        assert_eq!(encode(&Value::Int(0x27)), vec![0x30, 0x27]);
+        assert_eq!(encode(&Value::Int(0x27)), vec![0x2f]);
     }
 
     #[test]
@@ -359,5 +416,29 @@ mod tests {
             ),
         ]);
         roundtrip(v);
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    #[test]
+    fn scalar_references_and_bounds() {
+        assert_eq!(
+            decode(&hex::decode("d24568656c6c6fa0").unwrap()).unwrap(),
+            Value::Array(vec![Value::Str("hello".into()); 2])
+        );
+        assert_eq!(
+            encode(&Value::Int(0x12345678)),
+            hex::decode("3278563412").unwrap()
+        );
+        assert_eq!(
+            encode(&Value::Int(u64::MAX)),
+            [vec![0x33], vec![0xff; 8]].concat()
+        );
+        assert!(decode(&[0xa0]).is_err());
+        assert!(decode(&[1, 2]).is_err());
+        assert!(decode(&[vec![0xd1; 66], vec![1]].concat()).is_err());
+        assert!(decode(&[0x94, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]).is_err());
     }
 }

@@ -15,3 +15,7 @@ rp-dump.json
 *.pcap
 *.pcapng
 *.jsonl
+
+/pkg/
+/*.pkg.tar.*
+/build/

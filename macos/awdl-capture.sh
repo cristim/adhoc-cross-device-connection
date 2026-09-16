@@ -43,19 +43,19 @@ echo " AWDL / Universal Clipboard capture"
 echo "=============================================================================="
 echo
 echo " BEFORE you continue, set up an ACTIVE AWDL session:"
-echo "   1. On the Mac AND the iPhone: open AirDrop (Finder->AirDrop / Control"
+echo "   1. On the Mac AND the iPhone: open Airdrop-compatible (Finder->Airdrop-compatible / Control"
 echo "      Center) set to 'Everyone', keep both awake and close together."
 echo "   2. Confirm awdl0 is up:  ifconfig awdl0 | grep -q 'status: active' && echo up"
 echo
 echo " DURING the ${DUR}s capture, generate real traffic:"
 echo "   - COPY some text on the iPhone, then PASTE (Cmd-V) on the Mac  (Universal"
 echo "     Clipboard -> a companion-link pull happens on awdl0)."
-echo "   - Also AirDrop a small file Mac->iPhone to force an active session."
+echo "   - Also Airdrop-compatible a small file Mac->iPhone to force an active session."
 echo
 read -r -p "Press Enter to start the ${DUR}s capture..." _
 
 if ! ifconfig awdl0 >/dev/null 2>&1; then
-    echo "WARNING: awdl0 not present - open AirDrop to bring it up, then re-run." >&2
+    echo "WARNING: awdl0 not present - open Airdrop-compatible to bring it up, then re-run." >&2
 fi
 
 echo "capturing awdl0 for ${DUR}s -> $PCAP"

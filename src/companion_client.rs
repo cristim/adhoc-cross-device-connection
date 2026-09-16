@@ -51,14 +51,14 @@ const MAX_PACKET_BODY: usize = 4 * 1024 * 1024;
 // Stream framing: length-prefixed ContinuityPackets over an async byte stream
 // ---------------------------------------------------------------------------
 
-/// Write one `ContinuityPacket` (`type|0x00|len_be16|body`) and flush.
+/// Write one `ContinuityPacket` (`type|len_be24|body`) and flush.
 pub(crate) async fn write_packet<S: AsyncWrite + Unpin>(
     stream: &mut S,
     pkt: &ContinuityPacket,
 ) -> Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         stream
-            .write_all(&pkt.serialize())
+            .write_all(&pkt.serialize()?)
             .await
             .context("writing continuity packet")?;
         stream.flush().await.context("flushing continuity packet")?;
@@ -68,17 +68,7 @@ pub(crate) async fn write_packet<S: AsyncWrite + Unpin>(
     .context("continuity write timed out")?
 }
 
-/// Read one `ContinuityPacket`, framing on the 4-byte header.
-///
-/// `ContinuityPacket::serialize` advertises `body.len()+16` for EncryptedData
-/// (to account for the Poly1305 tag) but writes the raw body, so the reader
-/// mirrors that: the number of body bytes on the wire is `adv_len-16` for
-/// EncryptedData and `adv_len` otherwise. This makes stream framing round-trip
-/// exactly with `serialize`.
-///
-/// UNVALIDATED: the exact on-wire length convention for EncryptedData is a
-/// reference-derived guess (see `companion.rs`); confirmed only for our own
-/// framing, not against a real device.
+/// Read exactly the 24-bit wire body length, including the AEAD tag.
 pub(crate) async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> Result<ContinuityPacket> {
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -95,14 +85,10 @@ async fn read_packet_inner<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Conti
         .context("reading continuity packet header")?;
     let ptype = PacketType::from_u8(header[0])
         .with_context(|| format!("unknown packet type {:#04x}", header[0]))?;
-    let adv_len = u16::from_be_bytes([header[2], header[3]]) as usize;
-    let body_len = if ptype == PacketType::EncryptedData {
-        adv_len
-            .checked_sub(16)
-            .context("encrypted frame length is shorter than its tag")?
-    } else {
-        adv_len
-    };
+    let body_len = ((header[1] as usize) << 16) | ((header[2] as usize) << 8) | header[3] as usize;
+    if ptype == PacketType::EncryptedData && body_len < 16 {
+        bail!("encrypted frame is shorter than its tag");
+    }
     if body_len > MAX_PACKET_BODY {
         bail!("continuity packet body of {body_len} bytes exceeds {MAX_PACKET_BODY} cap");
     }
@@ -273,9 +259,8 @@ pub use uc::{Pasteboard, PasteboardItem, SystemInfo};
 // ---------------------------------------------------------------------------
 
 // Content-phase packets are OPACK plaintext sealed with the post-handshake
-// ContentChannel and framed as EncryptedData ContinuityPackets. UNVALIDATED:
-// we pass an empty AAD; a real device may bind the packet header as AAD.
-const CONTENT_AAD: &[u8] = b"";
+// ContentChannel and framed as EncryptedData ContinuityPackets. The exact
+// four-byte wire header is authenticated as AAD, as in the reference protocol.
 
 async fn send_opack<S: AsyncWrite + Unpin>(
     stream: &mut S,
@@ -283,7 +268,8 @@ async fn send_opack<S: AsyncWrite + Unpin>(
     value: &Value,
 ) -> Result<()> {
     let plain = opack::encode(value);
-    let sealed = channel.encrypt(&plain, CONTENT_AAD)?;
+    let header = ContinuityPacket::header(PacketType::EncryptedData, plain.len() + 16)?;
+    let sealed = channel.encrypt(&plain, &header)?;
     write_packet(
         stream,
         &ContinuityPacket::new(PacketType::EncryptedData, sealed),
@@ -302,7 +288,8 @@ async fn recv_opack<S: AsyncRead + Unpin>(
             pkt.ptype
         );
     }
-    let plain = channel.decrypt(&pkt.body, CONTENT_AAD)?;
+    let header = ContinuityPacket::header(pkt.ptype, pkt.body.len())?;
+    let plain = channel.decrypt(&pkt.body, &header)?;
     opack::decode(&plain)
 }
 
@@ -557,14 +544,14 @@ mod tests {
     fn framing_roundtrips_plain_and_encrypted() {
         // Plain packet: advertised length == body length.
         let plain = ContinuityPacket::new(PacketType::PairVerifyPublicKey, vec![1, 2, 3, 4, 5]);
-        let wire = plain.serialize();
+        let wire = plain.serialize().unwrap();
         assert_eq!(u16::from_be_bytes([wire[2], wire[3]]) as usize, 5);
 
         // Encrypted packet: advertised length == body + 16; our reader must
         // recover the raw body length. Drive it through the async reader.
         let enc = ContinuityPacket::new(PacketType::EncryptedData, vec![0xAB; 40]);
-        let enc_wire = enc.serialize();
-        assert_eq!(u16::from_be_bytes([enc_wire[2], enc_wire[3]]) as usize, 56);
+        let enc_wire = enc.serialize().unwrap();
+        assert_eq!(u16::from_be_bytes([enc_wire[2], enc_wire[3]]) as usize, 40);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

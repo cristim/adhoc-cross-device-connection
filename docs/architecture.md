@@ -2,7 +2,7 @@
 
 ## Repository boundary
 
-`ac-dc` owns BLE, same-account authentication, companion-link, AirDrop receiving,
+`ac-dc` owns BLE, same-account authentication, companion-link, Airdrop-compatible receiving,
 and the user clipboard. `brcmfmac-awdl` owns the GPL kernel patches and Rust
 `awdlctl` radio tools. The boundary is a versioned CLI/JSON contract, not a Cargo
 path dependency or a privileged script inside the user's checkout.
@@ -35,7 +35,7 @@ The clipboard owner must outlive a short-lived service: under systemd, a private
 unlinked after systemd reports exec readiness. Outside systemd, the normal
 forking wl-copy path is used with detached output descriptors.
 
-## AirDrop path
+## Airdrop-compatible path
 
 A separate explicit receive command uses a bounded TLS listener and mDNS
 publication on awdl0. HTTP handles chunked messages and persistent connections.
@@ -58,7 +58,7 @@ without changing the desktop clipboard.
   pasteboard handling does not cover Apple's bulk channel.
 - Validate `rpBA` correlation across Apple OS versions; explicit instance is the
   current fallback. `rpAD` authentication is not implemented.
-- Validate AirDrop TLS/media capabilities and management-frame discoverability
+- Validate Airdrop-compatible TLS/media capabilities and management-frame discoverability
   on a real Mac/iPhone; firmware service templates are not generated here.
 - Implement a genuine Universal Clipboard server before presenting reverse
   clipboard synchronization as supported. The old panic-only broadcast stub

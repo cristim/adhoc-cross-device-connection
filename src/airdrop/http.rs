@@ -1,4 +1,4 @@
-//! Small HTTP/1.1 subset for AirDrop. Keep one reader across Ask and Upload.
+//! Small HTTP/1.1 subset for Airdrop-compatible. Keep one reader across Ask and Upload.
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -6,11 +6,14 @@ pub struct Request {
     pub path: String,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+    pub upload: Option<tempfile::NamedTempFile>,
 }
 async fn line<S: AsyncRead + Unpin>(io: &mut BufReader<S>) -> Result<String> {
     let mut b = Vec::new();
     loop {
-        let chunk = io.fill_buf().await?;
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(30), io.fill_buf())
+            .await
+            .context("Airdrop-compatible headers stalled for 30 seconds")??;
         ensure!(!chunk.is_empty(), "connection closed");
         let n = chunk
             .iter()
@@ -28,7 +31,21 @@ async fn line<S: AsyncRead + Unpin>(io: &mut BufReader<S>) -> Result<String> {
     b.truncate(b.len() - 2);
     Ok(String::from_utf8(b)?)
 }
+#[cfg(test)]
 pub async fn read<S: AsyncRead + AsyncWrite + Unpin>(io: &mut BufReader<S>) -> Result<Request> {
+    read_inner(io, false, || true).await
+}
+pub async fn read_spooled<S: AsyncRead + AsyncWrite + Unpin>(
+    io: &mut BufReader<S>,
+    authorize: impl FnMut() -> bool,
+) -> Result<Request> {
+    read_inner(io, true, authorize).await
+}
+async fn read_inner<S: AsyncRead + AsyncWrite + Unpin>(
+    io: &mut BufReader<S>,
+    spool: bool,
+    mut authorize: impl FnMut() -> bool,
+) -> Result<Request> {
     let first = line(io).await?;
     let parts = first.split_whitespace().collect::<Vec<_>>();
     ensure!(
@@ -38,7 +55,7 @@ pub async fn read<S: AsyncRead + AsyncWrite + Unpin>(io: &mut BufReader<S>) -> R
     let path = parts[1].to_string();
     ensure!(
         matches!(path.as_str(), "/Discover" | "/Ask" | "/Upload"),
-        "unknown AirDrop endpoint"
+        "unknown Airdrop-compatible endpoint"
     );
     let mut headers = BTreeMap::new();
     let mut total = 0;
@@ -57,8 +74,16 @@ pub async fn read<S: AsyncRead + AsyncWrite + Unpin>(io: &mut BufReader<S>) -> R
             "duplicate HTTP header"
         );
     }
+    if path == "/Upload" && !authorize() {
+        respond(io.get_mut(), 403, b"").await?;
+        anyhow::bail!("Upload requires an accepted Ask");
+    }
     let limit = if path == "/Upload" {
-        32 * 1024 * 1024
+        if spool {
+            super::storage::MAX_TRANSFER as usize
+        } else {
+            64 * 1024 * 1024
+        }
     } else {
         1024 * 1024
     };
@@ -85,7 +110,17 @@ pub async fn read<S: AsyncRead + AsyncWrite + Unpin>(io: &mut BufReader<S>) -> R
             .await?;
         io.get_mut().flush().await?;
     }
+    let upload = if spool && path == "/Upload" {
+        Some(tempfile::NamedTempFile::new()?)
+    } else {
+        None
+    };
+    let mut disk = upload
+        .as_ref()
+        .map(|f| f.reopen().map(tokio::fs::File::from_std))
+        .transpose()?;
     let mut body = Vec::new();
+    let mut consumed = 0usize;
     if te.is_some() {
         loop {
             let chunk = line(io).await?;
@@ -103,22 +138,24 @@ pub async fn read<S: AsyncRead + AsyncWrite + Unpin>(io: &mut BufReader<S>) -> R
                 }
                 break;
             }
-            ensure!(n <= limit - body.len(), "chunked body exceeds limit");
-            let old = body.len();
-            body.resize(old + n, 0);
-            io.read_exact(&mut body[old..]).await?;
+            ensure!(n <= limit - consumed, "chunked body exceeds limit");
+            copy_body(io, &mut disk, &mut body, n).await?;
+            consumed += n;
             let mut end = [0; 2];
             io.read_exact(&mut end).await?;
             ensure!(end == *b"\r\n", "invalid chunk terminator");
         }
     } else {
-        body.resize(length, 0);
-        io.read_exact(&mut body).await?;
+        copy_body(io, &mut disk, &mut body, length).await?;
+    }
+    if let Some(f) = &mut disk {
+        f.flush().await?;
     }
     Ok(Request {
         path,
         headers,
         body,
+        upload,
     })
 }
 pub async fn respond<S: AsyncWrite + Unpin>(io: &mut S, status: u16, body: &[u8]) -> Result<()> {
@@ -134,6 +171,31 @@ pub async fn respond<S: AsyncWrite + Unpin>(io: &mut S, status: u16, body: &[u8]
     io.flush().await?;
     Ok(())
 }
+async fn copy_body<S: AsyncRead + Unpin>(
+    io: &mut S,
+    disk: &mut Option<tokio::fs::File>,
+    body: &mut Vec<u8>,
+    mut n: usize,
+) -> Result<()> {
+    let mut buffer = [0u8; 64 * 1024];
+    while n > 0 {
+        let size = n.min(buffer.len());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            io.read_exact(&mut buffer[..size]),
+        )
+        .await
+        .context("Airdrop-compatible body stalled for 30 seconds")??;
+        if let Some(file) = disk {
+            file.write_all(&buffer[..size]).await?;
+        } else {
+            body.extend_from_slice(&buffer[..size]);
+        }
+        n -= size;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +216,27 @@ mod tests {
         .await
         .unwrap();
         assert!(read(&mut BufReader::new(s)).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod authorization_tests {
+    use super::*;
+    #[tokio::test]
+    async fn reject_upload_before_reading_body() {
+        let (mut c, s) = tokio::io::duplex(1024);
+        c.write_all(b"POST /Upload HTTP/1.1\r\nContent-Length: 1073741824\r\n\r\n")
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_spooled(&mut BufReader::new(s), || false),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        let mut b = [0; 256];
+        let n = c.read(&mut b).await.unwrap();
+        assert!(std::str::from_utf8(&b[..n]).unwrap().contains("403"));
     }
 }

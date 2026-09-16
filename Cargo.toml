@@ -1,6 +1,6 @@
 [package]
-name = "apple-cross-device-clipboard"
-version = "0.2.0"
+name = "adhoc-cross-device-connection"
+version = "0.1.0-0"
 edition = "2021"
 description = "Receive Apple Universal Clipboard / Handoff BLE announcements on Linux by reusing keys exported from macOS"
 license = "MIT"
@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util", "process", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util", "fs", "process", "sync"] }
 futures = "0.3"
 bluer = { version = "0.17", features = ["bluetoothd"] }
 serde = { version = "1", features = ["derive"] }
@@ -37,9 +37,19 @@ chacha20poly1305 = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 rand = "0.8"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
 
 libc = "0.2"
-# Optional AirDrop receiving uses Rust HTTP/archive handling and TLS.
+# Optional Airdrop-compatible receiving uses Rust HTTP/archive handling and TLS.
 openssl = "0.10"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 flate2 = "1"
+gtk = { package = "gtk4", version = "0.11", features = ["v4_10"] }
+
+tempfile = "3"
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-openssl = "0.6"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"

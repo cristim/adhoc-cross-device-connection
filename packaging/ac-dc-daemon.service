@@ -1,0 +1,32 @@
+[Unit]
+Description=Adhoc Cross-Device Connection Airdrop-compatible protocol service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/ac-dc daemon --socket /run/ac-dc/control.sock
+User=root
+Group=root
+RuntimeDirectory=ac-dc
+RuntimeDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/cristi/Downloads/Adhoc /home/cristi/.local/share/ac-dc /run/ac-dc /run/brcmfmac-awdl
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=CAP_CHOWN CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
