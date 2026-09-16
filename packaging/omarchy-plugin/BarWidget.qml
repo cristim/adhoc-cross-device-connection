@@ -216,7 +216,8 @@ BarWidget {
           delegate: Button {
             required property var modelData; required property int index
             text: modelData.name || modelData.instance || "Nearby device"
-            checked: root.selectedPeer === index; Layout.fillWidth: true
+            foreground: root.selectedPeer === index ? Color.accent : Color.foreground
+            Layout.fillWidth: true
             onClicked: root.selectedPeer = index
           }
         }
