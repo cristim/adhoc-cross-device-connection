@@ -35,6 +35,8 @@ Transfers are limited to 32 GiB decoded/encoded, with the older odc format's
 per-file size limit. Empty-folder-only archives are not supported yet. Temporary
 files require sufficient disk space, including compressed and decoded copies.
 
-Everyone-mode identities are self-signed and not Apple account verification.
+The daemon socket is restricted to the `wheel` group; log out and back in after
+installing if your account was newly added to that group. Everyone-mode identities
+are self-signed and not Apple account verification.
 Clipboard research commands remain experimental: Airdrop-compatible success does not imply
 Universal Clipboard compatibility. See docs/owl-opendrop-localsend-research.md.

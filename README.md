@@ -65,7 +65,7 @@ ac-dc ctl status
 ```
 
 The widget and the CLI talk to the service through its local Unix socket; no
-network control port is exposed. The socket is readable by the `users` group;
+network control port is exposed. The socket is readable by the `wheel` group;
 log out and back in after installation if your account was just added to that
 group. See [packaging/INSTALL.md](packaging/INSTALL.md) for first-transfer
 guidance.
