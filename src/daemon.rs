@@ -252,13 +252,13 @@ async fn discover(state: Arc<Mutex<State>>) -> Reply {
         Ok(Err(e)) => Reply {
             ok: false,
             state: state.lock().await.phase.clone(),
-            message: e.to_string(),
+            message: format!("{e:#}"),
             data: None,
         },
         Err(e) => Reply {
             ok: false,
             state: state.lock().await.phase.clone(),
-            message: e.to_string(),
+            message: format!("{e:#}"),
             data: None,
         },
     }
