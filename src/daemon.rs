@@ -13,13 +13,27 @@ use tokio::{
 async fn start_radio(seconds: u64) -> Result<tokio::process::Child> {
     let mut child = tokio::process::Command::new("/usr/bin/awdlctl")
         .args(["discoverable", "--seconds", &seconds.to_string()])
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .context("start AWDL radio")?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = child.try_wait()? {
-            anyhow::bail!("awdlctl exited while starting AWDL radio ({status})");
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                use tokio::io::AsyncReadExt;
+                let _ = pipe.read_to_string(&mut stderr).await;
+            }
+            let detail = stderr.trim();
+            anyhow::bail!(
+                "awdlctl exited while starting AWDL radio ({status}){}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            );
         }
         if crate::health::radio()
             .await
