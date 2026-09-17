@@ -63,6 +63,30 @@ async fn command(program: &str, args: &[&str]) -> Result<()> {
     );
     Ok(())
 }
+
+/// Recipient discovery is brokered by the root daemon.  The full GUI must
+/// not invoke pkexec merely to browse nearby devices.
+async fn daemon_peers() -> Result<Vec<Peer>> {
+    let output = tokio::process::Command::new("/usr/bin/ac-dc")
+        .args(["ctl", "peers"])
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "ac-dc peers failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let reply: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    anyhow::ensure!(
+        reply["ok"] == true,
+        "{}",
+        reply["message"]
+            .as_str()
+            .unwrap_or("recipient discovery failed")
+    );
+    Ok(serde_json::from_value(reply["data"].clone())?)
+}
 async fn radio_start() -> Result<()> {
     let requested = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -199,23 +223,9 @@ async fn engine(
                 if browsing.as_ref().is_some_and(|h| !h.is_finished()) {
                     continue;
                 }
-                {
-                    if let Err(e) = radio_start().await {
-                        let _ = events.send(Event::Status(format!("Radio: {e:#}")));
-                        continue;
-                    }
-                    radio_owned = true;
-                }
                 let ev = events.clone();
                 browsing = Some(tokio::spawn(async move {
-                    let wake =
-                        crate::advertise::broadcast(crate::advertise::airdrop_wake(), 12, 100);
-                    let id = identity();
-                    let browse = airdrop::peers::browse("awdl0", &id, 8);
-                    tokio::pin!(wake);
-                    tokio::pin!(browse);
-                    let result = tokio::select! {result=&mut browse=>result,result=&mut wake=>{if let Err(error)=result{tracing::warn!(%error,"Bluetooth wake failed");}browse.await}};
-                    match result {
+                    match daemon_peers().await {
                         Ok(peers) => {
                             let _ = ev
                                 .send(Event::Status(format!("Found {} recipient(s)", peers.len())));

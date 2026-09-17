@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::{collections::BTreeMap, net::SocketAddr, path::Path, time::Duration};
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Peer {
     pub name: String,
     pub instance: String,
