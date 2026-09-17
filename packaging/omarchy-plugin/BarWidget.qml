@@ -228,7 +228,7 @@ BarWidget {
           Text { text: "Adhoc Connection"; color: Color.foreground; font.family: root.font(Style.font.body); font.pixelSize: Style.font.body; font.bold: true }
           Text { text: root.message; color: root.errorText.length > 0 ? Color.urgent : Qt.rgba(1,1,1,0.62); elide: Text.ElideRight; Layout.fillWidth: true; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
         }
-        Button { text: root.receiveActive ? ("Stop " + root.formatRemaining()) : "Receive"; enabled: !root.actionProc.running; onClicked: root.startAction(root.receiveActive ? "stop" : "receive") }
+        Button { text: root.receiveActive ? ("Stop " + root.formatRemaining()) : "Receive"; enabled: !actionProc.running; onClicked: root.startAction(root.receiveActive ? "stop" : "receive") }
       }
 
       PanelSeparator { Layout.fillWidth: true }
