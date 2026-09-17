@@ -82,7 +82,9 @@ struct State {
 
 const SOCKET: &str = "/run/ac-dc/control.sock";
 const DIRECTORY: &str = "/home/cristi/Downloads/Adhoc";
-const IDENTITY: &str = "/home/cristi/.local/share/ac-dc/airdrop";
+// The daemon is root-owned and sandboxed; keep its TLS identity in its own
+// writable state directory instead of trying to chmod a user's home tree.
+const IDENTITY: &str = "/var/lib/ac-dc/airdrop";
 
 pub async fn run(socket: PathBuf) -> Result<()> {
     if let Some(parent) = socket.parent() {
