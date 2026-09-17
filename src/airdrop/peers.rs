@@ -13,7 +13,7 @@ impl Drop for Browse {
     }
 }
 pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Peer>> {
-    super::identity(identity)?;
+    super::identity(identity).context("load Pair-Verify identity")?;
     let d = Browse(mdns_sd::ServiceDaemon::new().context("create mDNS browser")?);
     d.0.disable_interface(mdns_sd::IfKind::All)
         .context("disable mDNS interfaces")?;
