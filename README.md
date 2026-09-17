@@ -27,6 +27,19 @@ We welcome reverse-engineering help: packet captures from devices you own,
 wire-format analysis, protocol comparisons, and reproducible tests are especially
 valuable. Please do not share private keys or captures containing personal data.
 
+### Current hardware limitation
+
+On the current BCM4378/BCM4387 test machine, AWDL management traffic is
+working: nearby Apple devices advertise `_airdrop._tcp` and their endpoints are
+decoded correctly. The remaining failure is the unicast data path: IPv6
+neighbors become `FAILED`, TCP probes time out, and the firmware reports rising
+AWDL `txdrop` counters with no corresponding data RX. A graceful DKMS driver
+reload does not currently resolve this. As a result, recipient discovery may
+return zero usable recipients and real transfers are not presently reliable.
+This is being investigated in the sibling [brcmfmac-awdl repository](https://github.com/cristim/brcmfmac-awdl);
+the likely area is the patched driver/firmware data path rather than the GUI,
+Unix socket permissions, or mDNS advertisement parsing.
+
 ## Separate driver repository
 
 The patches and Linux radio tools now live in **`../brcmfmac-awdl/`**, normally
@@ -122,13 +135,13 @@ select the intended recipient, select files or enter an HTTP(S) link, and send.
 Nearby names are discovery hints, not authenticated Apple identities.
 Everyone-mode TLS uses self-signed certificates; Contacts Only is not implemented.
 
-CLI equivalents (prepare the radio service first):
+CLI equivalents (the root daemon owns the radio window; no `pkexec` is needed
+for normal discovery or transfer commands):
 
 ```sh
-sudo systemctl start ac-dc-daemon.service
-ac-dc peers --tls-identity ~/.local/share/ac-dc/airdrop
-ac-dc send --host 'fe80::PEER%awdl0' --port 8770 \
-  --tls-identity ~/.local/share/ac-dc/airdrop --name Linux /path/to/file
+ac-dc ctl peers
+ac-dc ctl send --host 'fe80::PEER%awdl0' --port 8770 \
+  --name Linux --file /path/to/file
 # For a link, replace the filename with --url https://example.com/
 ```
 
