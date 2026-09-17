@@ -123,6 +123,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     tracing::info!(path=%socket.display(), "ac-dc daemon listening");
     loop {
         let (stream, _) = listener.accept().await?;
+        tracing::debug!("accepted daemon control connection");
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(e) = handle(stream, state).await {
@@ -137,6 +138,16 @@ async fn handle(stream: UnixStream, state: Arc<Mutex<State>>) -> Result<()> {
     let mut line = String::new();
     BufReader::new(read).read_line(&mut line).await?;
     let request: Request = serde_json::from_str(line.trim()).context("invalid daemon request")?;
+    tracing::debug!(
+        op = %request.op,
+        host = ?request.host,
+        port = ?request.port,
+        name = ?request.name,
+        directory = ?request.directory,
+        files = request.files.len(),
+        links = request.links.len(),
+        "daemon request"
+    );
     let reply = match request.op.as_str() {
         "status" => {
             let s = state.lock().await;
@@ -371,6 +382,7 @@ async fn start_send(state: Arc<Mutex<State>>, request: Request) -> Reply {
 }
 
 pub async fn ctl(socket: PathBuf, request: Request) -> Result<()> {
+    tracing::debug!(socket=%socket.display(), op=%request.op, "connecting to daemon");
     let mut stream = UnixStream::connect(socket)
         .await
         .context("connect ac-dc daemon")?;
@@ -380,6 +392,7 @@ pub async fn ctl(socket: PathBuf, request: Request) -> Result<()> {
     stream.write_all(b"\n").await?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).await?;
+    tracing::debug!(response=%line.trim(), "daemon response received");
     print!("{}", line);
     Ok(())
 }

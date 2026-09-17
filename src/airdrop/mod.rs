@@ -398,6 +398,11 @@ async fn connection(
         };
         match result {
             Ok((body, done)) => {
+                if req.path == "/Discover" {
+                    http::respond_close(io.get_mut(), 200, &body).await?;
+                    tracing::debug!(%peer, "Airdrop-compatible discovery response sent; closing discovery connection");
+                    return Ok(());
+                }
                 http::respond(io.get_mut(), 200, &body).await?;
                 if done {
                     let _ = completed.try_send(());
@@ -475,7 +480,7 @@ pub async fn run(c: Config) -> Result<()> {
     let fullname = info.get_fullname().to_string();
     daemon.register(info)?;
     let _announce = Announce(daemon, fullname);
-    tracing::info!(address=%addr,seconds=c.seconds,"Airdrop-compatible receive window open (Everyone; experimental)");
+    tracing::info!(address=%addr,seconds=c.seconds,radio_managed=c.radio_managed,"Airdrop-compatible receive window open (Everyone; experimental)");
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let end = tokio::time::sleep(Duration::from_secs(c.seconds));
     tokio::pin!(end);
@@ -489,12 +494,15 @@ pub async fn run(c: Config) -> Result<()> {
     let wake = crate::advertise::broadcast(crate::advertise::airdrop_wake(), c.seconds, 100);
     tokio::pin!(wake);
     let mut wake_done = !c.ble_wake;
-    let mut monitor = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             result=&mut wake, if !wake_done=>{wake_done=true;if let Err(e)=result{tracing::warn!(error=%e,"Airdrop-compatible Bluetooth wake unavailable");}},
-            _=monitor.tick(), if c.radio_managed=>{if radio_state().is_none(){tracing::info!("Airdrop-compatible radio window ended");break;}},
-            _=&mut end, if !c.radio_managed=>break,_=&mut shutdown=>break,
+            // The discovery state file can briefly disappear while awdlctl
+            // refreshes it. The managed radio child and this bounded timer are
+            // the authoritative lifetime; do not abort receiving on a stale
+            // or transiently missing state file.
+            _=&mut end=>{tracing::info!("Airdrop-compatible receive window ended");break;},
+            _=&mut shutdown=>break,
             Some(())=rx.recv()=>{if c.once{break;}},
             Some(result)=tasks.join_next(),if !tasks.is_empty()=>{if let Ok(Err(e))=result{tracing::info!(error=%format!("{e:#}"),"Airdrop-compatible connection ended");}},
             result=listener.accept()=>{let (s,_)=result?;if tasks.len()>=4{drop(s);continue;}tasks.spawn(connection(s,acceptor.clone(),c.name.clone(),dest.clone(),c.notify,tx.clone(),sessions.clone()));}

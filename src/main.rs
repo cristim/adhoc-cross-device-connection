@@ -19,17 +19,20 @@ mod transfer_ble;
 mod ui;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "ac-dc", version, about)]
 struct Cli {
+    /// Increase diagnostic logging (-v enables debug, -vv enables trace). RUST_LOG overrides this.
+    #[arg(short = 'v', long = "verbose", global = true, action = ArgAction::Count)]
+    verbose: u8,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Cmd {
     /// Run the privileged local Airdrop-compatible protocol service.
     Daemon {
@@ -214,15 +217,21 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let default_filter = match cli.verbose {
+        0 => "ac_dc=info",
+        1 => "ac_dc=debug",
+        _ => "ac_dc=trace",
+    };
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ac_dc=info".into()),
+                .unwrap_or_else(|_| default_filter.into()),
         )
         .init();
 
-    let cli = Cli::parse();
+    tracing::debug!(verbose = cli.verbose, command = ?cli.cmd, "ac-dc command starting");
     match cli.cmd {
         Cmd::Daemon { socket } => {
             daemon::run(socket.unwrap_or_else(daemon::default_socket)).await?

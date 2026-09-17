@@ -145,6 +145,46 @@ ac-dc ctl send --host 'fe80::PEER%awdl0' --port 8770 \
 # For a link, replace the filename with --url https://example.com/
 ```
 
+### Diagnostic logging
+
+Normal commands emit compact JSON responses on stdout; diagnostic logs go to
+stderr so the widget and scripts remain machine-readable. Increase logging for
+one invocation with `-v` (debug) or `-vv` (trace):
+
+The installed `ac-dc-debug` helper automates the service setup and prints a
+health report in one pass. It asks for authentication once through `pkexec`:
+
+```sh
+ac-dc-debug
+```
+
+It checks the daemon, socket ownership, CLI status, recipient discovery, AWDL,
+and the last two minutes of daemon logs. Disable the persistent debug override
+later with `ac-dc-debug --disable`.
+
+```sh
+ac-dc -v ctl status
+ac-dc -vv ctl receive --name Omarchy --directory ~/Downloads/Adhoc
+```
+
+The same levels can be enabled for the system daemon without changing its
+protocol output by setting `RUST_LOG` in the service environment. For a live
+diagnostic session, use:
+
+```sh
+sudo systemctl edit ac-dc-daemon.service
+# Add these lines in the editor:
+# [Service]
+# Environment=RUST_LOG=ac_dc=debug
+sudo systemctl restart ac-dc-daemon.service
+journalctl -u ac-dc-daemon.service -f
+```
+
+Trace logs include control requests, peer candidates, connection/session
+identifiers, HTTP endpoints and byte counts, but never private keys, TLS
+credentials, or file contents. Use `RUST_LOG=ac_dc=trace` only while actively
+troubleshooting because it can be verbose.
+
 Sending uses scoped HTTPS Discover/Ask/Upload, with DVZip-wrapped CPIO over
 chunked HTTP and one transfer UUID shared by Ask and Upload.
 Select regular files: folders and symlinks are currently rejected, duplicate

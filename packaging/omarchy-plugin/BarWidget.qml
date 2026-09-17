@@ -25,12 +25,16 @@ BarWidget {
   property int remainingSeconds: 0
   property var pendingTransfer: null
 
-  readonly property bool busy: statusProc.running || peersProc.running || actionProc.running || fileProc.running
+  readonly property bool busy: statusProc.running || peersProc.running || actionProc.running
   readonly property bool canSend: selectedPeer >= 0 && (selectedFiles.trim().length > 0 || linkText.trim().length > 0)
 
   function font(size) { return root.bar ? root.bar.fontFamily : Style.font.family }
   function close() { root.popupOpen = false }
   function togglePopup() { root.popupOpen = !root.popupOpen }
+  function startReceiveWhenShown() {
+    if (root.popupOpen && !root.receiveActive && !actionProc.running)
+      root.startAction("receive")
+  }
   function refresh() { if (!statusProc.running) statusProc.running = true }
   function formatRemaining() {
     var minutes = Math.floor(root.remainingSeconds / 60)
@@ -132,7 +136,6 @@ BarWidget {
     actionProc.running = true
   }
 
-  function chooseFiles() { if (!fileProc.running) fileProc.running = true }
   function applyFiles(raw) {
     var value = String(raw).trim()
     if (value.length > 0) root.selectedFiles = value.replace(/\r/g, "")
@@ -162,12 +165,7 @@ BarWidget {
         } catch (e) { root.errorText = "Action failed" }
       }
     } }
-    onExited: { root.refresh(); root.popupOpen = true }
-  }
-  Process {
-    id: fileProc
-    command: ["/usr/bin/zenity", "--file-selection", "--multiple", "--separator=\n", "--title=Choose files to send"]
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.applyFiles(text) }
+    onExited: root.refresh()
   }
   Process { id: legacyProc; command: ["/usr/bin/ac-dc", "ui"] }
 
@@ -184,6 +182,7 @@ BarWidget {
     }
   }
   Component.onCompleted: root.refresh()
+  onPopupOpenChanged: root.startReceiveWhenShown()
 
   visible: true
   implicitWidth: Style.bar.statusSlot
@@ -228,7 +227,6 @@ BarWidget {
           Text { text: "Adhoc Connection"; color: Color.foreground; font.family: root.font(Style.font.body); font.pixelSize: Style.font.body; font.bold: true }
           Text { text: root.message; color: root.errorText.length > 0 ? Color.urgent : Qt.rgba(1,1,1,0.62); elide: Text.ElideRight; Layout.fillWidth: true; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
         }
-        Button { text: root.receiveActive ? ("Stop " + root.formatRemaining()) : "Receive"; enabled: !actionProc.running; onClicked: root.startAction(root.receiveActive ? "stop" : "receive") }
       }
 
       PanelSeparator { Layout.fillWidth: true }
@@ -251,27 +249,71 @@ BarWidget {
       ColumnLayout {
         visible: root.pendingTransfer !== null
         Layout.fillWidth: true; spacing: Style.space(5)
-        Text { text: "Incoming transfer from " + (root.pendingTransfer ? root.pendingTransfer.sender : "Nearby device"); color: Color.foreground; font.family: root.font(Style.font.body); font.pixelSize: Style.font.body; font.bold: true }
-        Text { text: root.pendingTransfer ? root.pendingTransfer.items.join(", ") : ""; color: Qt.rgba(1,1,1,0.65); elide: Text.ElideRight; Layout.fillWidth: true; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
-        RowLayout { Layout.fillWidth: true; Button { text: "Reject"; onClicked: root.decideTransfer("reject") }; Button { text: "Approve"; onClicked: root.decideTransfer("approve") } }
+        Text {
+          text: "Incoming transfer from " + (root.pendingTransfer ? root.pendingTransfer.sender : "Nearby device")
+          color: Color.foreground
+          font.family: root.font(Style.font.body)
+          font.pixelSize: Style.font.body
+          font.bold: true
+        }
+        Text {
+          text: root.pendingTransfer ? root.pendingTransfer.items.join(", ") : ""
+          color: Qt.rgba(1,1,1,0.65)
+          elide: Text.ElideRight
+          Layout.fillWidth: true
+          font.family: root.font(Style.font.caption)
+          font.pixelSize: Style.font.caption
+        }
+        RowLayout {
+          Layout.fillWidth: true
+          Button {
+            text: "Reject"
+            onClicked: root.decideTransfer("reject")
+          }
+          Button {
+            text: "Approve"
+            onClicked: root.decideTransfer("approve")
+          }
+        }
       }
-      RowLayout {
+      ColumnLayout {
         visible: root.peers.length > 0; Layout.fillWidth: true; spacing: Style.space(5)
         Repeater {
           model: root.peers
           delegate: Button {
             required property var modelData; required property int index
-            text: modelData.name || modelData.instance || "Nearby device"
+            text: "≋  " + (modelData.name || modelData.instance || "Nearby device")
             foreground: root.selectedPeer === index ? Color.accent : Color.foreground
             Layout.fillWidth: true
             onClicked: root.selectedPeer = index
           }
         }
       }
-      RowLayout {
+      DropArea {
         Layout.fillWidth: true
-        Button { text: "Choose files"; enabled: !root.busy; onClicked: root.chooseFiles() }
-        Text { text: root.selectedFiles.length ? (root.selectedFiles.split("\n").length + " file(s) selected") : "No files selected"; color: Qt.rgba(1,1,1,0.58); elide: Text.ElideRight; Layout.fillWidth: true; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
+        Layout.preferredHeight: Style.space(72)
+        onDropped: function(drop) {
+          var paths = []
+          for (var i = 0; i < drop.urls.length; i++) {
+            var value = String(drop.urls[i])
+            if (value.indexOf("file://") === 0) value = decodeURIComponent(value.slice(7))
+            paths.push(value)
+          }
+          if (paths.length > 0) root.selectedFiles = paths.join("\n")
+          drop.acceptProposedAction()
+        }
+        Rectangle {
+          anchors.fill: parent
+          radius: Style.spacing.cardRadius
+          color: parent.containsDrag ? Qt.rgba(0.25, 0.55, 0.95, 0.22) : Qt.rgba(1, 1, 1, 0.06)
+          border.color: parent.containsDrag ? Color.accent : Qt.rgba(1, 1, 1, 0.16)
+          border.width: 1
+          ColumnLayout {
+            anchors.centerIn: parent
+            Text { Layout.alignment: Qt.AlignHCenter; text: "≋"; color: Color.accent; font.pixelSize: Style.font.title }
+            Text { Layout.alignment: Qt.AlignHCenter; text: root.selectedFiles.length ? (root.selectedFiles.split("\n").length + " file(s) ready") : "Drop files here to send"; color: Color.foreground; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
+          }
+        }
       }
       TextField { Layout.fillWidth: true; placeholderText: "Or paste an https:// link"; text: root.linkText; onTextChanged: root.linkText = text }
       RowLayout {

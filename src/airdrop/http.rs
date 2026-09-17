@@ -171,6 +171,29 @@ pub async fn respond<S: AsyncWrite + Unpin>(io: &mut S, status: u16, body: &[u8]
     io.flush().await?;
     Ok(())
 }
+
+/// Send a terminal response for endpoints whose protocol connection is
+/// intentionally short-lived (notably AirDrop's `/Discover` request).
+pub async fn respond_close<S: AsyncWrite + Unpin>(
+    io: &mut S,
+    status: u16,
+    body: &[u8],
+) -> Result<()> {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        415 => "Unsupported Media Type",
+        _ => "Internal Server Error",
+    };
+    io.write_all(format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    ).as_bytes()).await?;
+    io.write_all(body).await?;
+    io.flush().await?;
+    Ok(())
+}
 async fn copy_body<S: AsyncRead + Unpin>(
     io: &mut S,
     disk: &mut Option<tokio::fs::File>,

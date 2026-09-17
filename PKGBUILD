@@ -10,6 +10,7 @@ options=('!strip' '!debug')
 build() { cd "$startdir"; cargo build --release --locked --offline; }
 package() {
   install -Dm755 "$startdir/target/release/ac-dc" "$pkgdir/usr/bin/ac-dc"
+  install -Dm755 "$startdir/scripts/ac-dc-debug.sh" "$pkgdir/usr/bin/ac-dc-debug"
   install -Dm644 "$startdir/packaging/org.adhoccrossdeviceconnection.desktop" "$pkgdir/usr/share/applications/org.adhoccrossdeviceconnection.desktop"
   install -Dm644 "$startdir/packaging/ac-dc-receive.service" "$pkgdir/usr/lib/systemd/user/ac-dc-receive.service"
   install -Dm644 "$startdir/packaging/ac-dc-daemon.service" "$pkgdir/usr/lib/systemd/system/ac-dc-daemon.service"
