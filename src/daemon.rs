@@ -9,6 +9,32 @@ use tokio::{
     sync::Mutex,
 };
 
+/// Wait for the asynchronous AWDL setup before the protocol checks awdl0.
+async fn start_radio(seconds: u64) -> Result<tokio::process::Child> {
+    let mut child = tokio::process::Command::new("/usr/bin/awdlctl")
+        .args(["discoverable", "--seconds", &seconds.to_string()])
+        .kill_on_drop(true)
+        .spawn()
+        .context("start AWDL radio")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("awdlctl exited while starting AWDL radio ({status})");
+        }
+        if crate::health::radio()
+            .await
+            .ok()
+            .is_some_and(|r| r["ready"] == true && r["interface"] == "awdl0")
+        {
+            return Ok(child);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("AWDL radio did not become ready within 10 seconds");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Request {
     pub op: String,
@@ -133,10 +159,7 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
     let task_state = state.clone();
     s.task = Some(tokio::spawn(async move {
         let result = async {
-            let mut radio = tokio::process::Command::new("/usr/bin/awdlctl")
-                .args(["discoverable", "--seconds", "600"])
-                .kill_on_drop(true)
-                .spawn()?;
+            let mut radio = start_radio(600).await?;
             {
                 task_state.lock().await.phase = "receiving".into();
             }
@@ -188,17 +211,13 @@ async fn stop(state: Arc<Mutex<State>>) -> Reply {
 }
 
 async fn discover(state: Arc<Mutex<State>>) -> Reply {
-    let mut radio = match tokio::process::Command::new("/usr/bin/awdlctl")
-        .args(["discoverable", "--seconds", "30"])
-        .kill_on_drop(true)
-        .spawn()
-    {
+    let mut radio = match start_radio(30).await {
         Ok(child) => child,
         Err(e) => {
             return Reply {
                 ok: false,
                 state: state.lock().await.phase.clone(),
-                message: format!("start radio: {e}"),
+                message: format!("start radio: {e:#}"),
                 data: None,
             }
         }
@@ -261,10 +280,7 @@ async fn start_send(state: Arc<Mutex<State>>, request: Request) -> Reply {
         s.phase = "sending".into();
         s.task = Some(tokio::spawn(async move {
             let result = async {
-                let mut radio = tokio::process::Command::new("/usr/bin/awdlctl")
-                    .args(["discoverable", "--seconds", "600"])
-                    .kill_on_drop(true)
-                    .spawn()?;
+                let mut radio = start_radio(600).await?;
                 let address = crate::discover::socket_target(&host, port).await?;
                 let client = airdrop::send::Client::new(address, &PathBuf::from(IDENTITY))?;
                 let receiver = client.discover().await?;
