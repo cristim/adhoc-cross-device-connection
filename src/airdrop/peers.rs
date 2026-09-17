@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::{collections::BTreeMap, net::SocketAddr, path::Path, time::Duration};
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Peer {
@@ -14,10 +14,14 @@ impl Drop for Browse {
 }
 pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Peer>> {
     super::identity(identity)?;
-    let d = Browse(mdns_sd::ServiceDaemon::new()?);
-    d.0.disable_interface(mdns_sd::IfKind::All)?;
-    d.0.enable_interface(iface)?;
-    let rx = d.0.browse("_airdrop._tcp.local.")?;
+    let d = Browse(mdns_sd::ServiceDaemon::new().context("create mDNS browser")?);
+    d.0.disable_interface(mdns_sd::IfKind::All)
+        .context("disable mDNS interfaces")?;
+    d.0.enable_interface(iface)
+        .with_context(|| format!("enable mDNS on {iface}"))?;
+    let rx =
+        d.0.browse("_airdrop._tcp.local.")
+            .context("browse _airdrop._tcp.local")?;
     let end = tokio::time::Instant::now() + Duration::from_secs(seconds);
     let mut candidates = BTreeMap::new();
     while let Ok(Ok(event)) = tokio::time::timeout_at(end, rx.recv_async()).await {

@@ -19,7 +19,7 @@ async fn start_radio(seconds: u64) -> Result<tokio::process::Child> {
         .context("start AWDL radio")?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = child.try_wait().context("check awdlctl startup")? {
             let mut stderr = String::new();
             if let Some(mut pipe) = child.stderr.take() {
                 use tokio::io::AsyncReadExt;
