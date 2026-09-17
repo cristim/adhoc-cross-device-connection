@@ -25,7 +25,7 @@ BarWidget {
   property int remainingSeconds: 0
   property var pendingTransfer: null
 
-  readonly property bool busy: statusProc.running || peersProc.running || actionProc.running || fileProc.running
+  readonly property bool busy: statusProc.running || peersProc.running || actionProc.running || receiveProc.running || fileProc.running
   readonly property bool canSend: selectedPeer >= 0 && (selectedFiles.trim().length > 0 || linkText.trim().length > 0)
 
   function font(size) { return root.bar ? root.bar.fontFamily : Style.font.family }
@@ -89,8 +89,14 @@ BarWidget {
   }
 
   function startAction(op) {
+    if (op === "receive") {
+      if (receiveProc.running) return
+      root.startReceiveCountdown()
+      receiveProc.command = ["/usr/bin/ac-dc", "ctl", "receive", "--name", root.transferName || "Omarchy", "--directory", root.receivePath || "/home/cristi/Downloads/Adhoc"]
+      receiveProc.running = true
+      return
+    }
     if (actionProc.running) return
-    if (op === "receive") root.startReceiveCountdown()
     if (op === "stop") root.stopReceiveCountdown()
     var command = ["/usr/bin/ac-dc", "ctl", op]
     if (op === "receive") {
@@ -160,6 +166,18 @@ BarWidget {
           if (value.ok === false) root.errorText = value.message || "Action failed"
           root.message = value.message || root.message
         } catch (e) { root.errorText = "Action failed" }
+      }
+    } }
+    onExited: { root.refresh(); root.popupOpen = true }
+  }
+  Process {
+    id: receiveProc
+    command: ["/usr/bin/ac-dc", "ctl", "receive"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: {
+      var raw = String(text).trim()
+      if (raw.length > 0) {
+        try { var value = JSON.parse(raw); root.message = value.message || root.message; if (value.ok === false) root.errorText = value.message || "Receive failed" }
+        catch (e) { root.errorText = "Receive failed" }
       }
     } }
     onExited: { root.refresh(); root.popupOpen = true }
