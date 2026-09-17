@@ -78,6 +78,13 @@ struct Reply {
 struct State {
     phase: String,
     task: Option<tokio::task::JoinHandle<()>>,
+    pending: Option<Pending>,
+}
+
+struct Pending {
+    sender: String,
+    items: Vec<String>,
+    decision: tokio::sync::oneshot::Sender<bool>,
 }
 
 const SOCKET: &str = "/run/ac-dc/control.sock";
@@ -111,6 +118,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     let state = Arc::new(Mutex::new(State {
         phase: "idle".into(),
         task: None,
+        pending: None,
     }));
     tracing::info!(path=%socket.display(), "ac-dc daemon listening");
     loop {
@@ -132,15 +140,21 @@ async fn handle(stream: UnixStream, state: Arc<Mutex<State>>) -> Result<()> {
     let reply = match request.op.as_str() {
         "status" => {
             let s = state.lock().await;
+            let pending = s
+                .pending
+                .as_ref()
+                .map(|p| serde_json::json!({"sender": p.sender, "items": p.items}));
             Reply {
                 ok: true,
                 state: s.phase.clone(),
                 message: s.phase.clone(),
-                data: None,
+                data: pending,
             }
         }
         "receive" => start_receive(state.clone(), request).await,
         "stop" => stop(state.clone()).await,
+        "approve" => decide(state.clone(), true).await,
+        "reject" => decide(state.clone(), false).await,
         "send" => start_send(state.clone(), request).await,
         "peers" => discover(state.clone()).await,
         _ => Reply {
@@ -179,10 +193,11 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
             {
                 task_state.lock().await.phase = "receiving".into();
             }
-            let result = airdrop::run(airdrop::Config {
+            let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(8);
+            let receive = airdrop::run(airdrop::Config {
                 radio_managed: true,
                 ble_wake: true,
-                approval: None,
+                approval: Some(approval_tx),
                 iface: "awdl0".into(),
                 directory,
                 identity: PathBuf::from(IDENTITY),
@@ -191,8 +206,17 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
                 seconds: 600,
                 once: false,
                 notify: true,
-            })
-            .await;
+            });
+            tokio::pin!(receive);
+            let result = loop {
+                tokio::select! {
+                    result = &mut receive => break result,
+                    Some(incoming) = approval_rx.recv() => {
+                        let mut s = task_state.lock().await;
+                        s.pending = Some(Pending { sender: incoming.sender, items: incoming.items, decision: incoming.decision });
+                    }
+                }
+            };
             let _ = radio.kill().await;
             result
         }
@@ -218,10 +242,35 @@ async fn stop(state: Arc<Mutex<State>>) -> Reply {
         task.abort();
     }
     s.phase = "idle".into();
+    s.pending = None;
     Reply {
         ok: true,
         state: "idle".into(),
         message: "stopped".into(),
+        data: None,
+    }
+}
+
+async fn decide(state: Arc<Mutex<State>>, accepted: bool) -> Reply {
+    let mut s = state.lock().await;
+    let Some(pending) = s.pending.take() else {
+        return Reply {
+            ok: false,
+            state: s.phase.clone(),
+            message: "no transfer is waiting for approval".into(),
+            data: None,
+        };
+    };
+    let _ = pending.decision.send(accepted);
+    Reply {
+        ok: true,
+        state: s.phase.clone(),
+        message: if accepted {
+            "transfer approved"
+        } else {
+            "transfer rejected"
+        }
+        .into(),
         data: None,
     }
 }

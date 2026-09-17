@@ -23,6 +23,7 @@ BarWidget {
   property bool receiveActive: false
   property double receiveEndsAt: 0
   property int remainingSeconds: 0
+  property var pendingTransfer: null
 
   readonly property bool busy: statusProc.running || peersProc.running || actionProc.running || fileProc.running
   readonly property bool canSend: selectedPeer >= 0 && (selectedFiles.trim().length > 0 || linkText.trim().length > 0)
@@ -62,6 +63,7 @@ BarWidget {
       var value = JSON.parse(String(raw).trim())
       root.phase = value.state || "offline"
       root.message = value.message || root.phase
+      root.pendingTransfer = value.data || null
       if (root.phase === "receiving" && !root.receiveActive) root.startReceiveCountdown()
       if ((root.phase === "idle" || root.phase === "error" || root.phase === "offline") && root.receiveActive && !actionProc.running)
         root.stopReceiveCountdown()
@@ -98,6 +100,7 @@ BarWidget {
     actionProc.command = command
     actionProc.running = true
   }
+  function decideTransfer(op) { if (!actionProc.running) { actionProc.command = ["/usr/bin/ac-dc", "ctl", op]; actionProc.running = true } }
 
   function findRecipients() {
     if (peersProc.running) return
@@ -245,6 +248,13 @@ BarWidget {
       }
 
       Text { visible: root.peers.length === 0; text: "Find a nearby Apple device to choose a recipient."; color: Qt.rgba(1,1,1,0.55); wrapMode: Text.WordWrap; Layout.fillWidth: true; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
+      ColumnLayout {
+        visible: root.pendingTransfer !== null
+        Layout.fillWidth: true; spacing: Style.space(5)
+        Text { text: "Incoming transfer from " + (root.pendingTransfer ? root.pendingTransfer.sender : "Nearby device"); color: Color.foreground; font.family: root.font(Style.font.body); font.pixelSize: Style.font.body; font.bold: true }
+        Text { text: root.pendingTransfer ? root.pendingTransfer.items.join(", ") : ""; color: Qt.rgba(1,1,1,0.65); elide: Text.ElideRight; Layout.fillWidth: true; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
+        RowLayout { Layout.fillWidth: true; Button { text: "Reject"; onClicked: root.decideTransfer("reject") }; Button { text: "Approve"; onClicked: root.decideTransfer("approve") } }
+      }
       RowLayout {
         visible: root.peers.length > 0; Layout.fillWidth: true; spacing: Style.space(5)
         Repeater {
