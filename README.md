@@ -37,6 +37,9 @@ bounded radio/band management. There is no Rust path dependency between repos.
 
 `ac-dc` runs as your desktop user. Configure AWDL with the driver tools separately;
 it never installs/reloads a driver or silently changes your Wi-Fi connection.
+The driver package includes the Omdrop-compatible AWDL action-frame patches for
+BCM4387-style firmware as well as the BCM4378 work maintained in the companion
+repository. Hardware and firmware combinations still require validation.
 
 ## Build
 
