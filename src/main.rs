@@ -17,6 +17,7 @@ mod tlv8;
 mod transfer;
 mod transfer_ble;
 mod ui;
+mod ui_widgets;
 
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
@@ -54,6 +55,10 @@ enum Cmd {
         file: Vec<PathBuf>,
         #[arg(long)]
         link: Vec<String>,
+        #[arg(long)]
+        seconds: Option<u64>,
+        #[arg(long)]
+        ble_wake: Option<bool>,
     },
     /// Open the native Airdrop-compatible send/receive window.
     Ui,
@@ -244,8 +249,10 @@ async fn main() -> Result<()> {
             directory,
             file,
             link,
+            seconds,
+            ble_wake,
         } => {
-            daemon::ctl(
+            let reply = daemon::ctl(
                 daemon::default_socket(),
                 daemon::Request {
                     op,
@@ -255,11 +262,14 @@ async fn main() -> Result<()> {
                     directory,
                     files: file,
                     links: link,
+                    seconds,
+                    ble_wake,
                 },
             )
-            .await?
+            .await?;
+            println!("{}", serde_json::to_string(&reply)?);
         }
-        Cmd::Ui => ui::run().await?,
+        Cmd::Ui => ui::run()?,
         Cmd::Peers {
             iface,
             tls_identity,

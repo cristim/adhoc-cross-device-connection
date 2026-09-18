@@ -1,8 +1,18 @@
-//! Native GTK desktop controls. Protocol and radio work runs on the Tokio runtime.
+//! Native GPUI desktop controls. Protocol and radio work runs on a private Tokio runtime.
 use crate::airdrop::{self, peers::Peer};
-use anyhow::{Context, Result};
-use gtk::{glib, prelude::*};
-use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
+use crate::daemon;
+use crate::ui_widgets as w;
+use anyhow::{Context as _, Result};
+use gpui::{
+    actions, div, px, rgb, size, white, App, Bounds, Context, Entity, Focusable, FocusHandle,
+    KeyBinding, MouseButton, MouseUpEvent, PathPromptOptions, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, prelude::*,
+};
+use gpui_platform::application;
+use std::{path::PathBuf, rc::Rc, sync::mpsc, time::Duration};
+
+actions!(ac_dc, [Quit]);
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Preferences {
     name: String,
@@ -32,12 +42,15 @@ enum Action {
     Send(Peer, Preferences, Vec<PathBuf>, Vec<String>),
     Quit,
     Cancel,
+    Approve(usize),
+    Decline(usize),
 }
 enum Event {
     Status(String),
     Radio(String),
     Peers(Vec<Peer>),
-    Incoming(airdrop::Incoming),
+    Incoming(String, Vec<String>),
+    IncomingCleared(usize),
 }
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -64,7 +77,7 @@ async fn command(program: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Recipient discovery is brokered by the root daemon.  The full GUI must
+/// Recipient discovery is brokered by the root daemon. The full GUI must
 /// not invoke pkexec merely to browse nearby devices.
 async fn daemon_peers() -> Result<Vec<Peer>> {
     let output = tokio::process::Command::new("/usr/bin/ac-dc")
@@ -121,10 +134,11 @@ async fn engine(
     mut actions: tokio::sync::mpsc::UnboundedReceiver<Action>,
     events: std::sync::mpsc::Sender<Event>,
 ) {
-    let mut receiver: Option<tokio::task::JoinHandle<()>> = None;
+    let socket = daemon::default_socket();
     let mut radio_owned = false;
     let mut transfers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut browsing: Option<tokio::task::JoinHandle<()>> = None;
+    let mut last_pending: Option<(String, Vec<String>)> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         let action = tokio::select! {
@@ -135,59 +149,60 @@ async fn engine(
                     let remaining=state["expires_at"].as_u64().unwrap_or(now).saturating_sub(now);
                     format!("Radio: {}:{:02} remaining · received frames: {} · TX completions: {}{}",remaining/60,remaining%60,state["received_frames"],state["tx_completions"],if state["phase"]=="data_observed"{" · traffic observed"}else{" · transport unproven"})
                 }else{"Radio window closed".into()};
-                let _=events.send(Event::Radio(text));continue;
+                let _=events.send(Event::Radio(text));
+                // The daemon is the receiver now; surface its pending transfer
+                // as an incoming card.
+                if let Ok(reply)=daemon::ctl(socket.clone(), daemon::request("status")).await {
+                    let pending = reply.data.as_ref().and_then(|d| {
+                        let sender = d.get("sender")?.as_str()?.to_string();
+                        let items = d.get("items")?.as_array()?.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect::<Vec<_>>();
+                        Some((sender, items))
+                    });
+                    if pending != last_pending {
+                        if let Some((sender, items)) = &pending {
+                            let _ = events.send(Event::Incoming(sender.clone(), items.clone()));
+                        }
+                        last_pending = pending;
+                    }
+                }
+                continue;
             }
         };
         transfers.retain(|h| !h.is_finished());
         match action {
             Action::Start(p) => {
-                let _ = events.send(Event::Status(
-                    "Starting Airdrop-compatible radio — authentication may be required…".into(),
-                ));
-                match radio_start().await {
-                    Err(e) => {
-                        let _ = events.send(Event::Status(format!("Could not start radio: {e:#}")));
-                    }
-                    Ok(()) => {
-                        radio_owned = true;
-                        if receiver.as_ref().is_some_and(|h| !h.is_finished()) {
-                            let _ = events.send(Event::Status(
-                                "Receive window extended by 10 minutes".into(),
-                            ));
-                            continue;
+                // Visibility is the daemon's job; it owns the radio window and
+                // the receiver, so no pkexec prompt is needed.
+                let _ = command("systemctl", &["--user", "stop", "ac-dc-receive.service"])
+                    .await;
+                let result = daemon::ctl(
+                    socket.clone(),
+                    daemon::Request {
+                        op: "receive".into(),
+                        host: None,
+                        port: None,
+                        name: Some(p.name),
+                        directory: Some(p.directory),
+                        files: Vec::new(),
+                        links: Vec::new(),
+                        seconds: Some(600),
+                        ble_wake: Some(p.ble_wake),
+                    },
+                )
+                .await;
+                let _ = events.send(Event::Status(match result {
+                    Ok(reply) if reply.ok => {
+                        if reply.message == "already receiving" {
+                            "Receive window is already active".into()
+                        } else {
+                            "Receiving for 10 minutes. Incoming transfers require your approval. Open Airdrop-compatible on your iPhone or Mac.".into()
                         }
-                        // Avoid racing the optional CLI service for the listening port.
-                        let _ = command("systemctl", &["--user", "stop", "ac-dc-receive.service"])
-                            .await;
-                        let (approval, mut requests) = tokio::sync::mpsc::channel(8);
-                        let ev = events.clone();
-                        receiver = Some(tokio::spawn(async move {
-                            let config = airdrop::Config {
-                                iface: "awdl0".into(),
-                                directory: p.directory,
-                                identity: identity(),
-                                name: p.name,
-                                port: 8771,
-                                seconds: 600,
-                                once: false,
-                                notify: true,
-                                open_destination: true,
-                                radio_managed: true,
-                                ble_wake: p.ble_wake,
-                                approval: Some(approval),
-                            };
-                            let task = airdrop::run(config);
-                            tokio::pin!(task);
-                            loop {
-                                tokio::select! {
-                                    result=&mut task=>{let msg=match result {Ok(())=>"Receiving window ended".into(),Err(e)=>format!("Receiver stopped: {e:#}")};let _=ev.send(Event::Status(msg));break;}
-                                    Some(request)=requests.recv()=>{let _=ev.send(Event::Incoming(request));}
-                                }
-                            }
-                        }));
-                        let _=events.send(Event::Status("Receiving for 10 minutes. Incoming transfers require your approval. Open Airdrop-compatible on your iPhone or Mac.".into()));
                     }
-                }
+                    Ok(reply) => format!("Could not start receiving: {}", reply.message),
+                    Err(e) => format!("Could not reach the ac-dc daemon: {e:#}"),
+                }));
             }
             Action::Stop | Action::Quit => {
                 let quit = matches!(action, Action::Quit);
@@ -196,10 +211,6 @@ async fn engine(
                     let _ = h.await;
                 }
                 if let Some(h) = browsing.take() {
-                    h.abort();
-                    let _ = h.await;
-                }
-                if let Some(h) = receiver.take() {
                     h.abort();
                     let _ = h.await;
                 }
@@ -215,9 +226,45 @@ async fn engine(
                         Err(e) => format!("Receiver stopped; radio cleanup: {e:#}"),
                     }));
                 }
+                match daemon::ctl(socket.clone(), daemon::request("stop")).await {
+                    Ok(reply) => {
+                        let _ = events.send(Event::Status(match reply.message.as_str() {
+                            "stopped" => "Airdrop-compatible stopped".into(),
+                            message => message.into(),
+                        }));
+                    }
+                    Err(e) => {
+                        let _ = events.send(Event::Status(format!(
+                            "Could not stop the ac-dc daemon: {e:#}"
+                        )));
+                    }
+                }
+                last_pending = None;
                 if quit {
                     break;
                 }
+            }
+            Action::Approve(id) | Action::Decline(id) => {
+                let accepted = matches!(action, Action::Approve(_));
+                match daemon::ctl(
+                    socket.clone(),
+                    daemon::request(if accepted { "approve" } else { "reject" }),
+                )
+                .await
+                {
+                    Ok(reply) => {
+                        let _ = events.send(Event::Status(reply.message));
+                    }
+                    Err(e) => {
+                        let _ = events.send(Event::Status(format!(
+                            "Could not reach the ac-dc daemon: {e:#}"
+                        )));
+                    }
+                }
+                // If the pending transfer changed while deciding, drop the
+                // stale card so the next status poll repaints the current one.
+                last_pending = None;
+                let _ = events.send(Event::IncomingCleared(id));
             }
             Action::Browse => {
                 let _=events.send(Event::Status("Looking for nearby recipients. Set the Apple device to Everyone for 10 Minutes.".into()));
@@ -292,346 +339,615 @@ async fn engine(
     if let Some(h) = browsing {
         h.abort();
     }
-    if let Some(h) = receiver {
-        h.abort();
+}
+
+struct IncomingCard {
+    id: usize,
+    label: String,
+}
+
+struct AcDcApp {
+    name: Entity<w::TextField>,
+    directory: Entity<w::TextField>,
+    link: Entity<w::TextField>,
+    ble_wake_checked: bool,
+    peers: Vec<Peer>,
+    peers_display: Vec<String>,
+    peer_selected: usize,
+    peer_drop_open: bool,
+    files: Vec<PathBuf>,
+    file_label: String,
+    status: String,
+    radio_text: String,
+    incoming: Vec<IncomingCard>,
+    incoming_counter: usize,
+    actions_tx: tokio::sync::mpsc::UnboundedSender<Action>,
+    prefs_path: PathBuf,
+    focus_handle: FocusHandle,
+}
+
+impl AcDcApp {
+    fn new(
+        actions_tx: tokio::sync::mpsc::UnboundedSender<Action>,
+        events_rx: mpsc::Receiver<Event>,
+        prefs_path: PathBuf,
+        prefs: &Preferences,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let name = cx.new(|cx| w::TextField::new(&prefs.name, "Your device name", cx));
+        let directory = cx.new(|cx| {
+            w::TextField::new(&prefs.directory.to_string_lossy(), "Receive folder", cx)
+        });
+        let link = cx.new(|cx| w::TextField::new("", "Or paste an https:// link", cx));
+        let view = Self {
+            name,
+            directory,
+            link,
+            ble_wake_checked: prefs.ble_wake,
+            peers: Vec::new(),
+            peers_display: Vec::new(),
+            peer_selected: 0,
+            peer_drop_open: false,
+            files: Vec::new(),
+            file_label: "No files selected".into(),
+            status: "Ready. Everyone mode only; Apple-device compatibility is being tested."
+                .into(),
+            radio_text: "Radio window closed".into(),
+            incoming: Vec::new(),
+            incoming_counter: 0,
+            actions_tx,
+            prefs_path,
+            focus_handle: cx.focus_handle(),
+        };
+
+        // Event pump: forwards engine events into the view and requests a redraw. Polling
+        // is cheap (a non-blocking channel read) so a steady cadence only matters while idle.
+        cx.spawn(async move |weak, cx| {
+            let rx = events_rx;
+            loop {
+                let mut changed = false;
+                while let Ok(event) = rx.try_recv() {
+                    changed = true;
+                    cx.update(|cx| {
+                        if let Some(entity) = weak.upgrade() {
+                            entity.update(cx, |this, cx| {
+                                match event {
+                                    Event::Status(text) => this.status = text,
+                                    Event::Radio(text) => this.radio_text = text,
+                                    Event::Peers(list) => {
+                                        this.peers = list;
+                                        this.peers_display = this
+                                            .peers
+                                            .iter()
+                                            .map(|p| format!("{} — {}", p.name, p.address))
+                                            .collect();
+                                        this.peer_selected = 0;
+                                        this.peer_drop_open = false;
+                                    }
+                                    Event::Incoming(sender, items) => {
+                                        this.incoming_counter += 1;
+                                        this.incoming.push(IncomingCard {
+                                            id: this.incoming_counter,
+                                            label: format!(
+                                                "{sender} wants to share:\n{}",
+                                                items.join("\n")
+                                            ),
+                                        });
+                                    }
+                                    Event::IncomingCleared(id) => {
+                                        this.incoming.retain(|card| card.id != id);
+                                    }
+                                }
+                                cx.notify();
+                            });
+                        }
+                    });
+                }
+                if !changed {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                }
+            }
+        })
+        .detach();
+
+        view
+    }
+
+    fn read_prefs(&self, cx: &App) -> Result<Preferences> {
+        let p = Preferences {
+            name: self.name.read(cx).text.to_string(),
+            directory: PathBuf::from(self.directory.read(cx).text.to_string()),
+            ble_wake: self.ble_wake_checked,
+        };
+        anyhow::ensure!(
+            !p.name.is_empty() && p.name.len() <= 63,
+            "Use a device name between 1 and 63 bytes"
+        );
+        anyhow::ensure!(
+            p.directory.is_absolute(),
+            "Use an absolute receive folder path"
+        );
+        Ok(p)
+    }
+
+    fn save_prefs(&self, cx: &App) -> Result<()> {
+        let prefs = self.read_prefs(cx)?;
+        let dir = self
+            .prefs_path
+            .parent()
+            .context("preferences directory")?;
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(&self.prefs_path, serde_json::to_vec_pretty(&prefs)?)?;
+        Ok(())
+    }
+
+    fn on_receive(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        match self.read_prefs(cx) {
+            Ok(prefs) => {
+                let _ = self.save_prefs(cx);
+                let _ = self.actions_tx.send(Action::Start(prefs));
+            }
+            Err(e) => {
+                self.status = e.to_string();
+                cx.notify();
+            }
+        }
+    }
+
+    fn on_stop(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        let _ = self.actions_tx.send(Action::Stop);
+    }
+
+    fn on_find(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        let _ = self.actions_tx.send(Action::Browse);
+    }
+
+    fn on_choose_files(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Choose files to send".into()),
+        });
+        cx.spawn(async move |weak, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                cx.update(|cx| {
+                    if let Some(view) = weak.upgrade() {
+                        view.update(cx, |this, cx| {
+                            let count = paths.len();
+                            this.files = paths;
+                            this.file_label = format!("{count} file(s) selected");
+                            cx.notify();
+                        });
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn on_choose_folder(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose folder to send".into()),
+        });
+        cx.spawn(async move |weak, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                cx.update(|cx| {
+                    if let Some(view) = weak.upgrade() {
+                        view.update(cx, |this, cx| {
+                            if let Some(path) = paths.into_iter().next() {
+                                this.file_label = format!("Folder: {}", path.display());
+                                this.files = vec![path];
+                            }
+                            cx.notify();
+                        });
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn on_send(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let peer = self.peers.get(self.peer_selected).cloned();
+        let Some(peer) = peer else {
+            self.status = "Choose a recipient first".into();
+            cx.notify();
+            return;
+        };
+        let link_text = self.link.read(cx).text.clone();
+        let links = if link_text.trim().is_empty() {
+            vec![]
+        } else {
+            vec![link_text.trim().into()]
+        };
+        let files = if links.is_empty() {
+            self.files.clone()
+        } else {
+            vec![]
+        };
+        let prefs = match self.read_prefs(cx) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = e.to_string();
+                cx.notify();
+                return;
+            }
+        };
+        let _ = self.actions_tx.send(Action::Send(peer, prefs, files, links));
+    }
+
+    fn on_cancel(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        let _ = self.actions_tx.send(Action::Cancel);
+    }
+
+    fn on_toggle_ble(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.ble_wake_checked = !self.ble_wake_checked;
+        cx.notify();
     }
 }
-pub async fn run() -> Result<()> {
-    let runtime = tokio::runtime::Handle::current();
+
+impl Focusable for AcDcApp {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for AcDcApp {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let weak = cx.entity().downgrade();
+
+        let on_toggle_peer = {
+            let weak = weak.clone();
+            Rc::new(move |cx: &mut App| {
+                if let Some(view) = weak.upgrade() {
+                    view.update(cx, |this, cx| {
+                        this.peer_drop_open = !this.peer_drop_open;
+                        cx.notify();
+                    });
+                }
+            })
+        };
+        let on_select_peer = {
+            let weak = weak.clone();
+            Rc::new(move |idx: usize, cx: &mut App| {
+                if let Some(view) = weak.upgrade() {
+                    view.update(cx, |this, cx| {
+                        this.peer_selected = idx;
+                        this.peer_drop_open = false;
+                        cx.notify();
+                    });
+                }
+            })
+        };
+        let on_accept = {
+            let weak = weak.clone();
+            let actions = self.actions_tx.clone();
+            Rc::new(move |id: usize, cx: &mut App| {
+                if let Some(view) = weak.upgrade() {
+                    view.update(cx, |this, cx| {
+                        let _ = actions.send(Action::Approve(id));
+                        this.incoming.retain(|card| card.id != id);
+                        cx.notify();
+                    });
+                }
+            })
+        };
+        let on_decline = {
+            let weak = weak.clone();
+            let actions = self.actions_tx.clone();
+            Rc::new(move |id: usize, cx: &mut App| {
+                if let Some(view) = weak.upgrade() {
+                    view.update(cx, |this, cx| {
+                        let _ = actions.send(Action::Decline(id));
+                        this.incoming.retain(|card| card.id != id);
+                        cx.notify();
+                    });
+                }
+            })
+        };
+
+        let file_label = self.file_label.clone();
+        let radio_text = self.radio_text.clone();
+        let status = self.status.clone();
+        let peer_display = self.peers_display.clone();
+        let peer_selected = self.peer_selected;
+        let peer_drop_open = self.peer_drop_open;
+        let ble_checked = self.ble_wake_checked;
+        let cards: Vec<_> = self
+            .incoming
+            .iter()
+            .map(|card| {
+                let id = card.id;
+                let label = card.label.clone();
+                let on_accept = on_accept.clone();
+                let on_decline = on_decline.clone();
+                div()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0xBBBBBB))
+                    .bg(rgb(0xFFF8E1))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_sm().child(label))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(0x007AFF))
+                                    .text_color(white())
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_, _, cx| on_accept(id, cx),
+                                    )
+                                    .child("Accept"),
+                            )
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(0xCCCCCC))
+                                    .text_color(rgb(0x333333))
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_, _, cx| on_decline(id, cx),
+                                    )
+                                    .child("Decline"),
+                            ),
+                    )
+            })
+            .collect();
+
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h_full()
+            .child(
+                div()
+                    .id("ac-dc-scroll")
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .p_6()
+                    .gap_4()
+                    .child(div().text_xl().child("Airdrop-compatible"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x666666))
+                            .child("Share files and links with nearby Apple devices"),
+                    )
+                    .child(self.name.clone())
+                    .child(self.directory.clone())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_toggle_ble))
+                            .child(
+                                div()
+                                    .w(px(20.))
+                                    .h(px(20.))
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(0x666666))
+                                    .when(ble_checked, |d| {
+                                        d.bg(rgb(0x007AFF))
+                                            .child(div().text_size(px(12.)).child("✓"))
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child("Use Bluetooth to help nearby devices find me"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .h(px(34.))
+                                    .px_4()
+                                    .rounded_md()
+                                    .bg(rgb(0x007AFF))
+                                    .text_color(white())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_receive))
+                                    .child("Receive for 10 minutes"),
+                            )
+                            .child(
+                                div()
+                                    .h(px(34.))
+                                    .px_4()
+                                    .rounded_md()
+                                    .bg(rgb(0xCCCCCC))
+                                    .text_color(rgb(0x333333))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_stop))
+                                    .child("Stop receiving"),
+                            ),
+                    )
+                    .child(div().h(px(1.)).w_full().bg(rgb(0xDDDDDD)))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(w::dropdown(
+                                &peer_display,
+                                peer_selected,
+                                peer_drop_open,
+                                on_toggle_peer,
+                                on_select_peer,
+                            ))
+                            .child(
+                                div()
+                                    .h(px(34.))
+                                    .px_4()
+                                    .rounded_md()
+                                    .bg(rgb(0xCCCCCC))
+                                    .text_color(rgb(0x333333))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_find))
+                                    .child("Find recipients"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(34.))
+                            .px_4()
+                            .rounded_md()
+                            .bg(rgb(0xCCCCCC))
+                            .text_color(rgb(0x333333))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_choose_files))
+                            .child("Choose files…"),
+                    )
+                    .child(
+                        div()
+                            .h(px(34.))
+                            .px_4()
+                            .rounded_md()
+                            .bg(rgb(0xCCCCCC))
+                            .text_color(rgb(0x333333))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_choose_folder))
+                            .child("Choose folder…"),
+                    )
+                    .child(div().text_sm().text_color(rgb(0x444444)).child(file_label))
+                    .child(self.link.clone())
+                    .child(
+                        div()
+                            .h(px(34.))
+                            .px_4()
+                            .rounded_md()
+                            .bg(rgb(0x007AFF))
+                            .text_color(white())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_send))
+                            .child("Send to selected recipient"),
+                    )
+                    .child(
+                        div()
+                            .h(px(34.))
+                            .px_4()
+                            .rounded_md()
+                            .bg(rgb(0xCCCCCC))
+                            .text_color(rgb(0x333333))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_cancel))
+                            .child("Cancel outgoing transfer"),
+                    )
+                    .child(div().text_sm().child(radio_text))
+                    .child(div().text_sm().child(status))
+                    .children(cards),
+            )
+    }
+}
+
+pub fn run() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
     let prefs_path = home().join(".config/ac-dc/ui.json");
     let prefs: Preferences = std::fs::read(&prefs_path)
         .ok()
         .and_then(|v| serde_json::from_slice(&v).ok())
         .unwrap_or_default();
-    let (actions, rx) = tokio::sync::mpsc::unbounded_channel();
-    let (events, results) = std::sync::mpsc::channel();
-    let worker = runtime.spawn(engine(rx, events));
-    let results = Rc::new(RefCell::new(Some(results)));
-    let application = gtk::Application::builder()
-        .application_id("org.omarchy.adhoccrossdeviceconnection")
-        .build();
-    let shutdown = actions.clone();
-    application.connect_activate(move |app| {
-        let Some(results) = results.borrow_mut().take() else {
-            if let Some(window) = app.active_window() {
-                window.present();
+    let (actions_tx, actions_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (events_tx, events_rx) = mpsc::channel();
+    let worker = runtime.spawn(engine(actions_rx, events_tx));
+
+    let shutdown = actions_tx.clone();
+    let final_shutdown = shutdown.clone();
+    application().run(move |cx: &mut App| {
+        w::bind_text_input_keys(cx);
+        cx.bind_keys([
+            KeyBinding::new("escape", Quit, None),
+            KeyBinding::new("cmd-q", Quit, None),
+        ]);
+
+        let close_actions = shutdown.clone();
+        cx.on_window_closed(move |cx, _window_id| {
+            let _ = close_actions.send(Action::Quit);
+            if cx.windows().is_empty() {
+                cx.quit();
             }
-            return;
-        };
-        let window = gtk::ApplicationWindow::builder()
-            .application(app)
-            .title(concat!(
-                "ac-dc ",
-                env!("CARGO_PKG_VERSION"),
-                " · Airdrop-compatible"
-            ))
-            .default_width(640)
-            .default_height(620)
-            .build();
-        let column = gtk::Box::new(gtk::Orientation::Vertical, 14);
-        column.set_margin_top(24);
-        column.set_margin_bottom(24);
-        column.set_margin_start(24);
-        column.set_margin_end(24);
-        let heading = gtk::Label::new(Some("Airdrop-compatible"));
-        heading.add_css_class("title-1");
-        heading.set_xalign(0.0);
-        column.append(&heading);
-        let subtitle = gtk::Label::new(Some("Share files and links with nearby Apple devices"));
-        subtitle.set_xalign(0.0);
-        column.append(&subtitle);
-        let name = gtk::Entry::builder()
-            .placeholder_text("Your device name")
-            .text(&prefs.name)
-            .build();
-        column.append(&name);
-        let folder = gtk::Entry::builder()
-            .placeholder_text("Receive folder")
-            .text(prefs.directory.to_string_lossy())
-            .build();
-        column.append(&folder);
-        let ble_wake = gtk::CheckButton::with_label("Use Bluetooth to help nearby devices find me");
-        ble_wake.set_active(prefs.ble_wake);
-        column.append(&ble_wake);
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let receive = gtk::Button::with_label("Receive for 10 minutes");
-        receive.add_css_class("suggested-action");
-        let stop = gtk::Button::with_label("Stop receiving");
-        row.append(&receive);
-        row.append(&stop);
-        column.append(&row);
-        let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
-        column.append(&separator);
-        let peers = Rc::new(RefCell::new(Vec::<Peer>::new()));
-        let recipients = gtk::DropDown::from_strings(&[]);
-        recipients.set_hexpand(true);
-        let find = gtk::Button::with_label("Find recipients");
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        row.append(&recipients);
-        row.append(&find);
-        column.append(&row);
-        let files = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
-        let file_label = gtk::Label::new(Some("No files selected"));
-        file_label.set_wrap(true);
-        file_label.set_xalign(0.0);
-        let choose = gtk::Button::with_label("Choose files…");
-        column.append(&choose);
-        let choose_folder = gtk::Button::with_label("Choose folder…");
-        column.append(&choose_folder);
-        column.append(&file_label);
-        let link = gtk::Entry::builder()
-            .placeholder_text("Or paste an https:// link")
-            .build();
-        column.append(&link);
-        let send = gtk::Button::with_label("Send to selected recipient");
-        send.add_css_class("suggested-action");
-        column.append(&send);
-        let cancel = gtk::Button::with_label("Cancel outgoing transfer");
-        column.append(&cancel);
-        let radio_label = gtk::Label::new(Some("Radio window closed"));
-        radio_label.set_wrap(true);
-        radio_label.set_xalign(0.0);
-        column.append(&radio_label);
-        let status = gtk::Label::new(Some(
-            "Ready. Everyone mode only; Apple-device compatibility is being tested.",
-        ));
-        status.set_wrap(true);
-        status.set_xalign(0.0);
-        status.set_selectable(true);
-        column.append(&status);
-        let approval_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        column.append(&approval_box);
-        let scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .child(&column)
-            .build();
-        window.set_child(Some(&scroller));
-        let preferences = {
-            let name = name.clone();
-            let folder = folder.clone();
-            let ble_wake = ble_wake.clone();
-            let path = prefs_path.clone();
-            move || -> Result<Preferences> {
-                let p = Preferences {
-                    name: name.text().to_string(),
-                    directory: PathBuf::from(folder.text().as_str()),
-                    ble_wake: ble_wake.is_active(),
-                };
-                anyhow::ensure!(
-                    !p.name.is_empty() && p.name.len() <= 63,
-                    "Use a device name between 1 and 63 bytes"
-                );
-                anyhow::ensure!(
-                    p.directory.is_absolute(),
-                    "Use an absolute receive folder path"
-                );
-                std::fs::create_dir_all(path.parent().context("preferences directory")?)?;
-                std::fs::write(&path, serde_json::to_vec_pretty(&p)?)?;
-                Ok(p)
-            }
-        };
-        let preferences = Rc::new(preferences);
-        {
-            let tx = actions.clone();
-            let p = preferences.clone();
-            let label = status.clone();
-            receive.connect_clicked(move |_| match p() {
-                Ok(p) => {
-                    let _ = tx.send(Action::Start(p));
-                }
-                Err(e) => label.set_text(&e.to_string()),
-            });
-        }
-        {
-            let tx = actions.clone();
-            stop.connect_clicked(move |_| {
-                let _ = tx.send(Action::Stop);
-            });
-        }
-        {
-            let tx = actions.clone();
-            find.connect_clicked(move |_| {
-                let _ = tx.send(Action::Browse);
-            });
-        }
-        {
-            let parent = window.clone();
-            let files = files.clone();
-            let label = file_label.clone();
-            choose.connect_clicked(move |_| {
-                #[allow(deprecated)]
-                {
-                    let files = files.clone();
-                    let label = label.clone();
-                    // FileChooserNative (deprecated in GTK 4.10 in favor of FileDialog) keeps a
-                    // fallback to an in-process dialog when the XDG file-chooser portal is missing.
-                    let dialog = gtk::FileChooserNative::builder()
-                        .title("Choose files to send")
-                        .select_multiple(true)
-                        .transient_for(&parent)
-                        .build();
-                    dialog.connect_response(move |dialog, response| {
-                        if response != gtk::ResponseType::Accept {
-                            dialog.destroy();
-                            return;
-                        }
-                        let selection = dialog.files();
-                        let selected = (0..selection.n_items())
-                            .filter_map(|i| {
-                                selection.item(i)?.downcast::<gtk::gio::File>().ok()?.path()
-                            })
-                            .collect::<Vec<_>>();
-                        label.set_text(&format!("{} file(s) selected", selected.len()));
-                        *files.borrow_mut() = selected;
-                        dialog.destroy();
-                    });
-                    dialog.show();
-                }
-            });
-        }
-        {
-            let tx = actions.clone();
-            let peers = peers.clone();
-            let recipients = recipients.clone();
-            let prefs = preferences.clone();
-            let files = files.clone();
-            let link = link.clone();
-            let label = status.clone();
-            send.connect_clicked(move |_| {
-                let result = (|| -> Result<Action> {
-                    let peer = peers
-                        .borrow()
-                        .get(recipients.selected() as usize)
-                        .cloned()
-                        .context("Choose a recipient first")?;
-                    let url = link.text().to_string();
-                    let links = if url.trim().is_empty() {
-                        vec![]
-                    } else {
-                        vec![url.trim().into()]
-                    };
-                    let files = if links.is_empty() {
-                        files.borrow().clone()
-                    } else {
-                        vec![]
-                    };
-                    Ok(Action::Send(peer, prefs()?, files, links))
-                })();
-                match result {
-                    Ok(action) => {
-                        let _ = tx.send(action);
-                    }
-                    Err(e) => label.set_text(&e.to_string()),
-                }
-            });
-        }
-        {
-            let tx = actions.clone();
-            cancel.connect_clicked(move |_| {
-                let _ = tx.send(Action::Cancel);
-            });
-        }
-        {
-            let parent = window.clone();
-            let selected = files.clone();
-            let label = file_label.clone();
-            choose_folder.connect_clicked(move |_| {
-                #[allow(deprecated)]
-                {
-                    let selected = selected.clone();
-                    let label = label.clone();
-                    // Same portal-fallback rationale as the "Choose files" dialog above.
-                    let dialog = gtk::FileChooserNative::builder()
-                        .title("Choose folder to send")
-                        .action(gtk::FileChooserAction::SelectFolder)
-                        .transient_for(&parent)
-                        .build();
-                    dialog.connect_response(move |dialog, response| {
-                        if response != gtk::ResponseType::Accept {
-                            dialog.destroy();
-                            return;
-                        }
-                        if let Some(path) = dialog.file().and_then(|file| file.path()) {
-                            label.set_text(&format!("Folder: {}", path.display()));
-                            *selected.borrow_mut() = vec![path];
-                        }
-                        dialog.destroy();
-                    });
-                    dialog.show();
-                }
-            });
-        }
-        type Decision = Rc<RefCell<Option<tokio::sync::oneshot::Sender<bool>>>>;
-        let mut decisions: Vec<(gtk::Box, Decision)> = Vec::new();
-        glib::timeout_add_local(Duration::from_millis(100), move || {
-            while let Ok(event) = results.try_recv() {
-                match event {
-                    Event::Status(text) => status.set_text(&text),
-                    Event::Radio(text) => radio_label.set_text(&text),
-                    Event::Peers(list) => {
-                        let names = list
-                            .iter()
-                            .map(|peer| format!("{} — {}", peer.name, peer.address))
-                            .collect::<Vec<_>>();
-                        let refs = names.iter().map(String::as_str).collect::<Vec<_>>();
-                        recipients.set_model(Some(&gtk::StringList::new(&refs)));
-                        if !list.is_empty() {
-                            recipients.set_selected(0);
-                        }
-                        *peers.borrow_mut() = list;
-                    }
-                    Event::Incoming(request) => {
-                        let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
-                        let text = gtk::Label::new(Some(&format!(
-                            "{} wants to share:\n{}",
-                            request.sender,
-                            request.items.join("\n")
-                        )));
-                        text.set_wrap(true);
-                        card.append(&text);
-                        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                        let accept = gtk::Button::with_label("Accept");
-                        let decline = gtk::Button::with_label("Decline");
-                        row.append(&accept);
-                        row.append(&decline);
-                        card.append(&row);
-                        approval_box.append(&card);
-                        let decision = Rc::new(RefCell::new(Some(request.decision)));
-                        for (button, value) in [(accept, true), (decline, false)] {
-                            let d = decision.clone();
-                            let card = card.clone();
-                            let parent = approval_box.clone();
-                            button.connect_clicked(move |_| {
-                                if let Some(tx) = d.borrow_mut().take() {
-                                    let _ = tx.send(value);
-                                }
-                                parent.remove(&card);
-                            });
-                        }
-                        decisions.push((card, decision));
-                    }
-                }
-            }
-            decisions.retain(|(card, decision)| {
-                let expired = decision.borrow().as_ref().is_none_or(|tx| tx.is_closed());
-                if expired && card.parent().is_some() {
-                    approval_box.remove(card);
-                }
-                !expired
-            });
-            glib::ControlFlow::Continue
+        })
+        .detach();
+
+        let quit_actions = shutdown.clone();
+        cx.on_action(move |_: &Quit, cx| {
+            let _ = quit_actions.send(Action::Quit);
+            cx.quit();
         });
-        let tx = actions.clone();
-        window.connect_close_request(move |_| {
-            let _ = tx.send(Action::Quit);
-            glib::Propagation::Proceed
-        });
-        window.present();
+
+        let bounds = Bounds::centered(None, size(px(640.), px(720.)), cx);
+        cx.open_window(
+            WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some(
+                        format!("ac-dc {} · Airdrop-compatible", env!("CARGO_PKG_VERSION")).into(),
+                    ),
+                    appears_transparent: false,
+                    traffic_light_position: None,
+                }),
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            move |window, cx| {
+                let actions = shutdown.clone();
+                let view = cx.new(|cx| AcDcApp::new(actions, events_rx, prefs_path, &prefs, cx));
+                window.focus(&view.focus_handle(cx), cx);
+                cx.activate(true);
+                view
+            },
+        )
+        .unwrap();
     });
-    application.run_with_args::<&str>(&[]);
-    // A secondary invocation forwards activation to the existing GTK instance
-    // and returns without a window. Its worker must still be shut down.
-    let _ = shutdown.send(Action::Quit);
-    worker.await?;
+
+    // The window has closed. Tell the engine to tear down and join it so radio
+    // cleanup and pkexec stops complete before the runtime is dropped.
+    let _ = final_shutdown.send(Action::Quit);
+    runtime.block_on(worker)?;
     Ok(())
 }

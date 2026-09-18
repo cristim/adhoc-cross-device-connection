@@ -64,15 +64,19 @@ pub struct Request {
     pub files: Vec<PathBuf>,
     #[serde(default)]
     pub links: Vec<String>,
+    #[serde(default)]
+    pub seconds: Option<u64>,
+    #[serde(default)]
+    pub ble_wake: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
-struct Reply {
-    ok: bool,
-    state: String,
-    message: String,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Reply {
+    pub ok: bool,
+    pub state: String,
+    pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<serde_json::Value>,
+    pub data: Option<serde_json::Value>,
 }
 
 struct State {
@@ -187,6 +191,8 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
         .directory
         .unwrap_or_else(|| PathBuf::from(DIRECTORY));
     let name = request.name.unwrap_or_else(|| "Omarchy".into());
+    let seconds = request.seconds.unwrap_or(600);
+    let ble_wake = request.ble_wake.unwrap_or(true);
     let mut s = state.lock().await;
     if s.task.as_ref().is_some_and(|t| !t.is_finished()) {
         return Reply {
@@ -200,21 +206,21 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
     let task_state = state.clone();
     s.task = Some(tokio::spawn(async move {
         let result = async {
-            let mut radio = start_radio(600).await?;
+            let mut radio = start_radio(seconds).await?;
             {
                 task_state.lock().await.phase = "receiving".into();
             }
             let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(8);
             let receive = airdrop::run(airdrop::Config {
                 radio_managed: true,
-                ble_wake: true,
+                ble_wake,
                 approval: Some(approval_tx),
                 iface: "awdl0".into(),
                 directory,
                 identity: PathBuf::from(IDENTITY),
                 name,
                 port: 8771,
-                seconds: 600,
+                seconds,
                 once: false,
                 notify: true,
                 open_destination: false,
@@ -382,7 +388,7 @@ async fn start_send(state: Arc<Mutex<State>>, request: Request) -> Reply {
     }
 }
 
-pub async fn ctl(socket: PathBuf, request: Request) -> Result<()> {
+pub async fn ctl(socket: PathBuf, request: Request) -> Result<Reply> {
     tracing::debug!(socket=%socket.display(), op=%request.op, "connecting to daemon");
     let mut stream = UnixStream::connect(socket)
         .await
@@ -394,10 +400,23 @@ pub async fn ctl(socket: PathBuf, request: Request) -> Result<()> {
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).await?;
     tracing::debug!(response=%line.trim(), "daemon response received");
-    print!("{}", line);
-    Ok(())
+    serde_json::from_str(&line).context("parse daemon response")
 }
 
 pub fn default_socket() -> PathBuf {
     PathBuf::from(SOCKET)
+}
+
+pub fn request(op: impl Into<String>) -> Request {
+    Request {
+        op: op.into(),
+        host: None,
+        port: None,
+        name: None,
+        directory: None,
+        files: Vec::new(),
+        links: Vec::new(),
+        seconds: None,
+        ble_wake: None,
+    }
 }
