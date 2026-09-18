@@ -309,6 +309,7 @@ async fn main() -> Result<()> {
                 seconds,
                 once,
                 notify,
+                open_destination: true,
             })
             .await?;
         }

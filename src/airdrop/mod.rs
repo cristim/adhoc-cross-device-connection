@@ -202,6 +202,19 @@ async fn deliver(entries: Vec<archive::Entry>, dest: PathBuf, notify: bool) -> R
     }
     Ok(())
 }
+async fn open_directory(directory: &Path, opener: &str) -> Result<()> {
+    let status = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::process::Command::new(opener)
+            .arg(directory)
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .context("opening the receive folder timed out")??;
+    anyhow::ensure!(status.success(), "{opener} exited with {status}");
+    Ok(())
+}
 fn is_link_transfer(value: Option<&plist::Value>) -> bool {
     match value {
         Some(plist::Value::Dictionary(d)) => d.contains_key("links"),
@@ -226,6 +239,7 @@ async fn connection(
     name: String,
     dest: PathBuf,
     notify: bool,
+    open_destination: bool,
     completed: tokio::sync::mpsc::Sender<()>,
     sessions: Sessions,
 ) -> Result<()> {
@@ -406,6 +420,14 @@ async fn connection(
                 http::respond(io.get_mut(), 200, &body).await?;
                 if done {
                     let _ = completed.try_send(());
+                    if open_destination {
+                        let dest = dest.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = open_directory(&dest, "xdg-open").await {
+                                tracing::warn!(error=%format!("{e:#}"), "open the receive folder");
+                            }
+                        });
+                    }
                 }
             }
             Err(e) => {
@@ -425,6 +447,7 @@ pub struct Config {
     pub seconds: u64,
     pub once: bool,
     pub notify: bool,
+    pub open_destination: bool,
     pub radio_managed: bool,
     pub ble_wake: bool,
     pub approval: Option<tokio::sync::mpsc::Sender<Incoming>>,
@@ -505,7 +528,7 @@ pub async fn run(c: Config) -> Result<()> {
             _=&mut shutdown=>break,
             Some(())=rx.recv()=>{if c.once{break;}},
             Some(result)=tasks.join_next(),if !tasks.is_empty()=>{if let Ok(Err(e))=result{tracing::info!(error=%format!("{e:#}"),"Airdrop-compatible connection ended");}},
-            result=listener.accept()=>{let (s,_)=result?;if tasks.len()>=4{drop(s);continue;}tasks.spawn(connection(s,acceptor.clone(),c.name.clone(),dest.clone(),c.notify,tx.clone(),sessions.clone()));}
+            result=listener.accept()=>{let (s,_)=result?;if tasks.len()>=4{drop(s);continue;}tasks.spawn(connection(s,acceptor.clone(),c.name.clone(),dest.clone(),c.notify,c.open_destination,tx.clone(),sessions.clone()));}
         }
     }
     tasks.abort_all();
@@ -545,6 +568,7 @@ mod tests {
                 acceptor,
                 "Test".into(),
                 server_dest,
+                false,
                 false,
                 tx,
                 Sessions::default(),
@@ -667,6 +691,31 @@ mod tests {
         assert_eq!(std::fs::read(&files[0]).unwrap(), b"first");
         assert_eq!(std::fs::read(&files[1]).unwrap(), b"second");
     }
+    #[tokio::test]
+    async fn open_directory_launches_the_opener_with_the_destination() {
+        let tmp = Temp(std::env::temp_dir().join(format!(
+            "ac-dc-open-test-{:032x}",
+            rand::random::<u128>()
+        )));
+        std::fs::create_dir(&tmp.0).unwrap();
+        let stub = tmp.0.join("xdg-open");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$(dirname \"$0\")/opened.txt\"\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+        let dest = tmp.0.join("received");
+        open_directory(&dest, stub.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.0.join("opened.txt")).unwrap().trim(),
+            dest.to_str().unwrap()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -714,6 +763,7 @@ mod sender_tests {
                     acceptor.clone(),
                     "Test Mac".into(),
                     dest.clone(),
+                    false,
                     false,
                     done.clone(),
                     sessions.clone(),

@@ -171,6 +171,7 @@ async fn engine(
                                 seconds: 600,
                                 once: false,
                                 notify: true,
+                                open_destination: true,
                                 radio_managed: true,
                                 ble_wake: p.ble_wake,
                                 approval: Some(approval),

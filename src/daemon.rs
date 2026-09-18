@@ -217,6 +217,7 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
                 seconds: 600,
                 once: false,
                 notify: true,
+                open_destination: false,
             });
             tokio::pin!(receive);
             let result = loop {
