@@ -459,14 +459,23 @@ pub async fn run() -> Result<()> {
             let files = files.clone();
             let label = file_label.clone();
             choose.connect_clicked(move |_| {
-                let parent = parent.clone();
-                let files = files.clone();
-                let label = label.clone();
-                glib::spawn_future_local(async move {
-                    let dialog = gtk::FileDialog::builder()
+                #[allow(deprecated)]
+                {
+                    let files = files.clone();
+                    let label = label.clone();
+                    // FileChooserNative (deprecated in GTK 4.10 in favor of FileDialog) keeps a
+                    // fallback to an in-process dialog when the XDG file-chooser portal is missing.
+                    let dialog = gtk::FileChooserNative::builder()
                         .title("Choose files to send")
+                        .select_multiple(true)
+                        .transient_for(&parent)
                         .build();
-                    if let Ok(selection) = dialog.open_multiple_future(Some(&parent)).await {
+                    dialog.connect_response(move |dialog, response| {
+                        if response != gtk::ResponseType::Accept {
+                            dialog.destroy();
+                            return;
+                        }
+                        let selection = dialog.files();
                         let selected = (0..selection.n_items())
                             .filter_map(|i| {
                                 selection.item(i)?.downcast::<gtk::gio::File>().ok()?.path()
@@ -474,8 +483,10 @@ pub async fn run() -> Result<()> {
                             .collect::<Vec<_>>();
                         label.set_text(&format!("{} file(s) selected", selected.len()));
                         *files.borrow_mut() = selected;
-                    }
-                });
+                        dialog.destroy();
+                    });
+                    dialog.show();
+                }
             });
         }
         {
@@ -525,22 +536,29 @@ pub async fn run() -> Result<()> {
             let selected = files.clone();
             let label = file_label.clone();
             choose_folder.connect_clicked(move |_| {
-                let parent = parent.clone();
-                let selected = selected.clone();
-                let label = label.clone();
-                glib::spawn_future_local(async move {
-                    if let Ok(folder) = gtk::FileDialog::builder()
+                #[allow(deprecated)]
+                {
+                    let selected = selected.clone();
+                    let label = label.clone();
+                    // Same portal-fallback rationale as the "Choose files" dialog above.
+                    let dialog = gtk::FileChooserNative::builder()
                         .title("Choose folder to send")
-                        .build()
-                        .select_folder_future(Some(&parent))
-                        .await
-                    {
-                        if let Some(path) = folder.path() {
+                        .action(gtk::FileChooserAction::SelectFolder)
+                        .transient_for(&parent)
+                        .build();
+                    dialog.connect_response(move |dialog, response| {
+                        if response != gtk::ResponseType::Accept {
+                            dialog.destroy();
+                            return;
+                        }
+                        if let Some(path) = dialog.file().and_then(|file| file.path()) {
                             label.set_text(&format!("Folder: {}", path.display()));
                             *selected.borrow_mut() = vec![path];
                         }
-                    }
-                });
+                        dialog.destroy();
+                    });
+                    dialog.show();
+                }
             });
         }
         type Decision = Rc<RefCell<Option<tokio::sync::oneshot::Sender<bool>>>>;
