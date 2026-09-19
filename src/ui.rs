@@ -4,9 +4,9 @@ use crate::daemon;
 use crate::ui_widgets as w;
 use anyhow::{Context as _, Result};
 use gpui::{
-    actions, div, px, rgb, size, white, App, Bounds, Context, Entity, Focusable, FocusHandle,
-    KeyBinding, MouseButton, MouseUpEvent, PathPromptOptions, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, prelude::*,
+    actions, div, prelude::*, px, rgb, size, white, App, Bounds, Context, Entity, FocusHandle,
+    Focusable, KeyBinding, MouseButton, MouseUpEvent, PathPromptOptions, TitlebarOptions, Window,
+    WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use std::{path::PathBuf, rc::Rc, sync::mpsc, time::Duration};
@@ -175,8 +175,7 @@ async fn engine(
             Action::Start(p) => {
                 // Visibility is the daemon's job; it owns the radio window and
                 // the receiver, so no pkexec prompt is needed.
-                let _ = command("systemctl", &["--user", "stop", "ac-dc-receive.service"])
-                    .await;
+                let _ = command("systemctl", &["--user", "stop", "ac-dc-receive.service"]).await;
                 let result = daemon::ctl(
                     socket.clone(),
                     daemon::Request {
@@ -375,9 +374,8 @@ impl AcDcApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let name = cx.new(|cx| w::TextField::new(&prefs.name, "Your device name", cx));
-        let directory = cx.new(|cx| {
-            w::TextField::new(&prefs.directory.to_string_lossy(), "Receive folder", cx)
-        });
+        let directory = cx
+            .new(|cx| w::TextField::new(&prefs.directory.to_string_lossy(), "Receive folder", cx));
         let link = cx.new(|cx| w::TextField::new("", "Or paste an https:// link", cx));
         let view = Self {
             name,
@@ -390,8 +388,7 @@ impl AcDcApp {
             peer_drop_open: false,
             files: Vec::new(),
             file_label: "No files selected".into(),
-            status: "Ready. Everyone mode only; Apple-device compatibility is being tested."
-                .into(),
+            status: "Ready. Everyone mode only; Apple-device compatibility is being tested.".into(),
             radio_text: "Radio window closed".into(),
             incoming: Vec::new(),
             incoming_counter: 0,
@@ -474,10 +471,7 @@ impl AcDcApp {
 
     fn save_prefs(&self, cx: &App) -> Result<()> {
         let prefs = self.read_prefs(cx)?;
-        let dir = self
-            .prefs_path
-            .parent()
-            .context("preferences directory")?;
+        let dir = self.prefs_path.parent().context("preferences directory")?;
         std::fs::create_dir_all(dir)?;
         std::fs::write(&self.prefs_path, serde_json::to_vec_pretty(&prefs)?)?;
         Ok(())
@@ -579,7 +573,9 @@ impl AcDcApp {
                 return;
             }
         };
-        let _ = self.actions_tx.send(Action::Send(peer, prefs, files, links));
+        let _ = self
+            .actions_tx
+            .send(Action::Send(peer, prefs, files, links));
     }
 
     fn on_cancel(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
@@ -690,10 +686,9 @@ impl Render for AcDcApp {
                                     .text_color(white())
                                     .text_sm()
                                     .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        move |_, _, cx| on_accept(id, cx),
-                                    )
+                                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                        on_accept(id, cx)
+                                    })
                                     .child("Accept"),
                             )
                             .child(
@@ -705,184 +700,178 @@ impl Render for AcDcApp {
                                     .text_color(rgb(0x333333))
                                     .text_sm()
                                     .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        move |_, _, cx| on_decline(id, cx),
-                                    )
+                                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                        on_decline(id, cx)
+                                    })
                                     .child("Decline"),
                             ),
                     )
             })
             .collect();
 
-        div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .h_full()
-            .child(
-                div()
-                    .id("ac-dc-scroll")
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .h_full()
-                    .overflow_y_scroll()
-                    .p_6()
-                    .gap_4()
-                    .child(div().text_xl().child("Airdrop-compatible"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x666666))
-                            .child("Share files and links with nearby Apple devices"),
-                    )
-                    .child(self.name.clone())
-                    .child(self.directory.clone())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_toggle_ble))
-                            .child(
-                                div()
-                                    .w(px(20.))
-                                    .h(px(20.))
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(rgb(0x666666))
-                                    .when(ble_checked, |d| {
-                                        d.bg(rgb(0x007AFF))
-                                            .child(div().text_size(px(12.)).child("✓"))
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .child("Use Bluetooth to help nearby devices find me"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .h(px(34.))
-                                    .px_4()
-                                    .rounded_md()
-                                    .bg(rgb(0x007AFF))
-                                    .text_color(white())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_receive))
-                                    .child("Receive for 10 minutes"),
-                            )
-                            .child(
-                                div()
-                                    .h(px(34.))
-                                    .px_4()
-                                    .rounded_md()
-                                    .bg(rgb(0xCCCCCC))
-                                    .text_color(rgb(0x333333))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_stop))
-                                    .child("Stop receiving"),
-                            ),
-                    )
-                    .child(div().h(px(1.)).w_full().bg(rgb(0xDDDDDD)))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(w::dropdown(
-                                &peer_display,
-                                peer_selected,
-                                peer_drop_open,
-                                on_toggle_peer,
-                                on_select_peer,
-                            ))
-                            .child(
-                                div()
-                                    .h(px(34.))
-                                    .px_4()
-                                    .rounded_md()
-                                    .bg(rgb(0xCCCCCC))
-                                    .text_color(rgb(0x333333))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_find))
-                                    .child("Find recipients"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .h(px(34.))
-                            .px_4()
-                            .rounded_md()
-                            .bg(rgb(0xCCCCCC))
-                            .text_color(rgb(0x333333))
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_choose_files))
-                            .child("Choose files…"),
-                    )
-                    .child(
-                        div()
-                            .h(px(34.))
-                            .px_4()
-                            .rounded_md()
-                            .bg(rgb(0xCCCCCC))
-                            .text_color(rgb(0x333333))
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_choose_folder))
-                            .child("Choose folder…"),
-                    )
-                    .child(div().text_sm().text_color(rgb(0x444444)).child(file_label))
-                    .child(self.link.clone())
-                    .child(
-                        div()
-                            .h(px(34.))
-                            .px_4()
-                            .rounded_md()
-                            .bg(rgb(0x007AFF))
-                            .text_color(white())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_send))
-                            .child("Send to selected recipient"),
-                    )
-                    .child(
-                        div()
-                            .h(px(34.))
-                            .px_4()
-                            .rounded_md()
-                            .bg(rgb(0xCCCCCC))
-                            .text_color(rgb(0x333333))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_cancel))
-                            .child("Cancel outgoing transfer"),
-                    )
-                    .child(div().text_sm().child(radio_text))
-                    .child(div().text_sm().child(status))
-                    .children(cards),
-            )
+        div().flex().flex_col().w_full().h_full().child(
+            div()
+                .id("ac-dc-scroll")
+                .flex()
+                .flex_col()
+                .w_full()
+                .h_full()
+                .overflow_y_scroll()
+                .p_6()
+                .gap_4()
+                .child(div().text_xl().child("Airdrop-compatible"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0x666666))
+                        .child("Share files and links with nearby Apple devices"),
+                )
+                .child(self.name.clone())
+                .child(self.directory.clone())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::on_toggle_ble))
+                        .child(
+                            div()
+                                .w(px(20.))
+                                .h(px(20.))
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x666666))
+                                .when(ble_checked, |d| {
+                                    d.bg(rgb(0x007AFF))
+                                        .child(div().text_size(px(12.)).child("✓"))
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .child("Use Bluetooth to help nearby devices find me"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .h(px(34.))
+                                .px_4()
+                                .rounded_md()
+                                .bg(rgb(0x007AFF))
+                                .text_color(white())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_receive))
+                                .child("Receive for 10 minutes"),
+                        )
+                        .child(
+                            div()
+                                .h(px(34.))
+                                .px_4()
+                                .rounded_md()
+                                .bg(rgb(0xCCCCCC))
+                                .text_color(rgb(0x333333))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_stop))
+                                .child("Stop receiving"),
+                        ),
+                )
+                .child(div().h(px(1.)).w_full().bg(rgb(0xDDDDDD)))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(w::dropdown(
+                            &peer_display,
+                            peer_selected,
+                            peer_drop_open,
+                            on_toggle_peer,
+                            on_select_peer,
+                        ))
+                        .child(
+                            div()
+                                .h(px(34.))
+                                .px_4()
+                                .rounded_md()
+                                .bg(rgb(0xCCCCCC))
+                                .text_color(rgb(0x333333))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_find))
+                                .child("Find recipients"),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(34.))
+                        .px_4()
+                        .rounded_md()
+                        .bg(rgb(0xCCCCCC))
+                        .text_color(rgb(0x333333))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::on_choose_files))
+                        .child("Choose files…"),
+                )
+                .child(
+                    div()
+                        .h(px(34.))
+                        .px_4()
+                        .rounded_md()
+                        .bg(rgb(0xCCCCCC))
+                        .text_color(rgb(0x333333))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::on_choose_folder))
+                        .child("Choose folder…"),
+                )
+                .child(div().text_sm().text_color(rgb(0x444444)).child(file_label))
+                .child(self.link.clone())
+                .child(
+                    div()
+                        .h(px(34.))
+                        .px_4()
+                        .rounded_md()
+                        .bg(rgb(0x007AFF))
+                        .text_color(white())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::on_send))
+                        .child("Send to selected recipient"),
+                )
+                .child(
+                    div()
+                        .h(px(34.))
+                        .px_4()
+                        .rounded_md()
+                        .bg(rgb(0xCCCCCC))
+                        .text_color(rgb(0x333333))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::on_cancel))
+                        .child("Cancel outgoing transfer"),
+                )
+                .child(div().text_sm().child(radio_text))
+                .child(div().text_sm().child(status))
+                .children(cards),
+        )
     }
 }
 

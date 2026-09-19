@@ -1,11 +1,11 @@
 use std::{ops::Range, rc::Rc};
 
 use gpui::{
-    actions, div, fill, hsla, point, px, relative, rgb, rgba, size, white, App, Bounds,
+    actions, div, fill, hsla, point, prelude::*, px, relative, rgb, rgba, size, white, App, Bounds,
     ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, Window, prelude::*,
+    SharedString, Style, TextRun, UTF16Selection, Window,
 };
 use unicode_segmentation::*;
 
@@ -319,7 +319,8 @@ impl EntityInputHandler for TextField {
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .unwrap_or_else(|| self.selected_range.clone());
-        self.text = (self.text[0..range.start].to_owned() + new_text + &self.text[range.end..]).into();
+        self.text =
+            (self.text[0..range.start].to_owned() + new_text + &self.text[range.end..]).into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.selection_reversed = false;
         cx.notify();
@@ -337,7 +338,8 @@ impl EntityInputHandler for TextField {
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .unwrap_or_else(|| self.selected_range.clone());
-        self.text = (self.text[0..range.start].to_owned() + new_text + &self.text[range.end..]).into();
+        self.text =
+            (self.text[0..range.start].to_owned() + new_text + &self.text[range.end..]).into();
         self.selected_range = new_selected_range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -567,13 +569,9 @@ impl Render for TextField {
             .bg(rgba(0xF7F7F7FF))
             .line_height(px(28.))
             .text_size(px(16.))
-            .child(
-                div()
-                    .h(px(32.))
-                    .w_full()
-                    .p_1()
-                    .child(TextFieldElement { entity: cx.entity() }),
-            )
+            .child(div().h(px(32.)).w_full().p_1().child(TextFieldElement {
+                entity: cx.entity(),
+            }))
     }
 }
 
@@ -616,13 +614,10 @@ pub fn dropdown(
                 .flex()
                 .items_center()
                 .justify_between()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    {
-                        let on_toggle = on_toggle.clone();
-                        move |_, _, cx| on_toggle(cx)
-                    },
-                )
+                .on_mouse_down(MouseButton::Left, {
+                    let on_toggle = on_toggle.clone();
+                    move |_, _, cx| on_toggle(cx)
+                })
                 .child(display)
                 .child("▾"),
         )
@@ -649,10 +644,7 @@ pub fn dropdown(
                             .py_1()
                             .hover(|s| s.bg(rgb(0xE8F0FF)))
                             .when(i == selected, |s| s.bg(rgb(0xDDF0FF)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                move |_, _, cx| on_select(i, cx),
-                            )
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| on_select(i, cx))
                             .child(label)
                     })),
             )
