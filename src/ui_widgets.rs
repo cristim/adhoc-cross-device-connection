@@ -585,12 +585,14 @@ impl Focusable for TextField {
 
 // ─── Dropdown ─────────────────────────────────────────────────────────
 
+type OnSelect = Rc<dyn Fn(usize, &mut App)>;
+
 pub fn dropdown(
     options: &[String],
     selected: usize,
     open: bool,
     on_toggle: Rc<dyn Fn(&mut App)>,
-    on_select: Rc<dyn Fn(usize, &mut App)>,
+    on_select: OnSelect,
 ) -> impl IntoElement {
     let display = options.get(selected).cloned().unwrap_or_default();
     let outside_toggle = on_toggle.clone();
