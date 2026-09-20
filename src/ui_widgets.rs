@@ -35,13 +35,27 @@ pub fn bind_text_input_keys(cx: &mut App) {
         KeyBinding::new("right", Right, None),
         KeyBinding::new("shift-left", SelectLeft, None),
         KeyBinding::new("shift-right", SelectRight, None),
-        KeyBinding::new("cmd-a", SelectAll, None),
-        KeyBinding::new("cmd-v", Paste, None),
-        KeyBinding::new("cmd-c", Copy, None),
-        KeyBinding::new("cmd-x", Cut, None),
+        KeyBinding::new("secondary-a", SelectAll, None),
+        KeyBinding::new("secondary-v", Paste, None),
+        KeyBinding::new("secondary-c", Copy, None),
+        KeyBinding::new("secondary-x", Cut, None),
         KeyBinding::new("home", Home, None),
         KeyBinding::new("end", End, None),
     ]);
+}
+
+/// The UTF-8 offset `utf16_offset` names in `text`, clamped to its length.
+fn utf8_offset_of(text: &str, utf16_offset: usize) -> usize {
+    let mut utf8_offset = 0;
+    let mut utf16_count = 0;
+    for ch in text.chars() {
+        if utf16_count >= utf16_offset {
+            break;
+        }
+        utf16_count += ch.len_utf16();
+        utf8_offset += ch.len_utf8();
+    }
+    utf8_offset
 }
 
 // ─── TextField ────────────────────────────────────────────────────────
@@ -119,7 +133,7 @@ impl TextField {
             }
             self.select_to(prev, cx)
         }
-        self.replace_text_in_range(None, "", window, cx)
+        self.replace_selection("", cx)
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
@@ -131,13 +145,13 @@ impl TextField {
             }
             self.select_to(next, cx)
         }
-        self.replace_text_in_range(None, "", window, cx)
+        self.replace_selection("", cx)
     }
 
-    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let sanitized = text.replace('\n', " ");
-            self.replace_text_in_range(None, &sanitized, window, cx);
+            self.replace_selection(&sanitized, cx);
         }
     }
 
@@ -149,12 +163,12 @@ impl TextField {
         }
     }
 
-    fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+    fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.text[self.selected_range.clone()].to_string(),
             ));
-            self.replace_text_in_range(None, "", window, cx)
+            self.replace_selection("", cx)
         }
     }
 
@@ -227,16 +241,7 @@ impl TextField {
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-        for ch in self.text.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-        utf8_offset
+        utf8_offset_of(&self.text, offset)
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
@@ -254,6 +259,21 @@ impl TextField {
 
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
         self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+    }
+
+    /// Replace the selection, dropping any composition in progress. The key
+    /// handlers go through here so a live preedit cannot capture them.
+    fn replace_selection(&mut self, new_text: &str, cx: &mut Context<Self>) {
+        self.replace_range(self.selected_range.clone(), new_text, cx);
+    }
+
+    fn replace_range(&mut self, range: Range<usize>, new_text: &str, cx: &mut Context<Self>) {
+        self.text =
+            (self.text[0..range.start].to_owned() + new_text + &self.text[range.end..]).into();
+        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.marked_range = None;
+        self.selection_reversed = false;
+        cx.notify();
     }
 
     /// The range an IME edit applies to when it names none: the text still being
@@ -334,12 +354,7 @@ impl EntityInputHandler for TextField {
         cx: &mut Context<Self>,
     ) {
         let range = self.pending_range(range_utf16.as_ref());
-        self.text =
-            (self.text[0..range.start].to_owned() + new_text + &self.text[range.end..]).into();
-        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
-        self.marked_range = None;
-        self.selection_reversed = false;
-        cx.notify();
+        self.replace_range(range, new_text, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -357,8 +372,10 @@ impl EntityInputHandler for TextField {
             (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
         self.selected_range = new_selected_range_utf16
             .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
+            .map(|range_utf16| {
+                range.start + utf8_offset_of(new_text, range_utf16.start)
+                    ..range.start + utf8_offset_of(new_text, range_utf16.end)
+            })
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.selection_reversed = false;
         cx.notify();
@@ -393,7 +410,9 @@ impl EntityInputHandler for TextField {
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&position)?;
         let last_layout = self.last_layout.as_ref()?;
-        assert_eq!(last_layout.text, self.text);
+        if last_layout.text != self.text {
+            return None;
+        }
         let utf8_index = last_layout.index_for_x(line_point.x)?;
         Some(self.offset_to_utf16(utf8_index))
     }
