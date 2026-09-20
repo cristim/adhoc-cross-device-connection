@@ -55,3 +55,7 @@ tokio-openssl = "0.6"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+
+[dev-dependencies]
+# `start_paused` in the daemon timeout test needs tokio time control.
+tokio = { version = "1", features = ["test-util"] }

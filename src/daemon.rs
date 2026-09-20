@@ -194,6 +194,18 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
     let seconds = request.seconds.unwrap_or(600);
     let ble_wake = request.ble_wake.unwrap_or(true);
     let mut s = state.lock().await;
+    if !airdrop::RECEIVE_SECONDS.contains(&seconds) {
+        return Reply {
+            ok: false,
+            state: s.phase.clone(),
+            message: format!(
+                "receive duration must be {}..{} seconds",
+                airdrop::RECEIVE_SECONDS.start(),
+                airdrop::RECEIVE_SECONDS.end()
+            ),
+            data: None,
+        };
+    }
     if s.task.as_ref().is_some_and(|t| !t.is_finished()) {
         return Reply {
             ok: true,
@@ -388,19 +400,29 @@ async fn start_send(state: Arc<Mutex<State>>, request: Request) -> Reply {
     }
 }
 
+/// Every handler answers from state it already holds, so a request still
+/// outstanding after this long is one the daemon will never answer. The UI awaits
+/// `ctl` in its single engine loop, where an indefinite wait also blocks stop,
+/// approve and quit.
+const CTL_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub async fn ctl(socket: PathBuf, request: Request) -> Result<Reply> {
-    tracing::debug!(socket=%socket.display(), op=%request.op, "connecting to daemon");
-    let mut stream = UnixStream::connect(socket)
-        .await
-        .context("connect ac-dc daemon")?;
-    stream
-        .write_all(serde_json::to_string(&request)?.as_bytes())
-        .await?;
-    stream.write_all(b"\n").await?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).await?;
-    tracing::debug!(response=%line.trim(), "daemon response received");
-    serde_json::from_str(&line).context("parse daemon response")
+    tokio::time::timeout(CTL_TIMEOUT, async move {
+        tracing::debug!(socket=%socket.display(), op=%request.op, "connecting to daemon");
+        let mut stream = UnixStream::connect(socket)
+            .await
+            .context("connect ac-dc daemon")?;
+        stream
+            .write_all(serde_json::to_string(&request)?.as_bytes())
+            .await?;
+        stream.write_all(b"\n").await?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).await?;
+        tracing::debug!(response=%line.trim(), "daemon response received");
+        serde_json::from_str(&line).context("parse daemon response")
+    })
+    .await
+    .context("ac-dc daemon did not respond")?
 }
 
 pub fn default_socket() -> PathBuf {
@@ -418,5 +440,61 @@ pub fn request(op: impl Into<String>) -> Request {
         links: Vec::new(),
         seconds: None,
         ble_wake: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idle_state() -> Arc<Mutex<State>> {
+        Arc::new(Mutex::new(State {
+            phase: "idle".into(),
+            task: None,
+            pending: None,
+        }))
+    }
+
+    #[tokio::test]
+    async fn start_receive_rejects_a_window_outside_the_allowed_range() {
+        for seconds in [0, 3601] {
+            let state = idle_state();
+            let mut req = request("receive");
+            req.seconds = Some(seconds);
+
+            let reply = start_receive(state.clone(), req).await;
+
+            assert!(!reply.ok, "{seconds}s was accepted");
+            assert!(
+                reply.message.contains("1..3600"),
+                "unexpected message: {}",
+                reply.message
+            );
+            let s = state.lock().await;
+            assert!(s.task.is_none(), "{seconds}s started a receive task");
+            assert_eq!(s.phase, "idle");
+        }
+    }
+
+    // `start_paused` lets the runtime jump the CTL_TIMEOUT deadline as soon as
+    // both sides are idle, so this costs no wall-clock time.
+    #[tokio::test(start_paused = true)]
+    async fn ctl_gives_up_when_the_daemon_accepts_but_never_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mute = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+
+        let error = ctl(socket, request("status")).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("did not respond"),
+            "unexpected error: {error:#}"
+        );
+        mute.abort();
     }
 }
