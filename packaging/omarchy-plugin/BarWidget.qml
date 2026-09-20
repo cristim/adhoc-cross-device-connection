@@ -1,5 +1,7 @@
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Layouts
+import Qt.labs.folderlistmodel
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -21,35 +23,65 @@ BarWidget {
   property string transferName: String(setting("name", "Omarchy"))
   property string receivePath: String(setting("directory", "/home/cristi/Downloads/Adhoc"))
   property bool receiveActive: false
-  property double receiveEndsAt: 0
   property int remainingSeconds: 0
   property var pendingTransfer: null
+  property var peerSeen: ({})
+  property int peerTtlMs: 30000
+  property bool browseOpen: false
+  property string browseFolder: ""
+  property var browseStack: []
+  property var browsePicked: []
 
-  readonly property bool busy: statusProc.running || peersProc.running || actionProc.running
+  function openBrowse() {
+    root.browseFolder = String(root.receivePath || "").trim() || "/home/cristi"
+    root.browseStack = []
+    root.browsePicked = []
+    root.browseOpen = true
+  }
+  function closeBrowse() {
+    root.browseOpen = false
+    root.browseStack = []
+    root.browsePicked = []
+  }
+  function upFolder() {
+    if (root.browseStack.length > 0) root.browseFolder = root.browseStack.pop()
+  }
+  function enterFolder(name) {
+    if (!name || name === "." || name === "..") return
+    root.browseStack.push(root.browseFolder)
+    root.browseFolder = root.browseFolder.replace(/\/+$/, "") + "/" + name
+  }
+  function togglePick(name) {
+    var pickedPath = root.browseFolder.replace(/\/+$/, "") + "/" + name
+    var idx = root.browsePicked.indexOf(pickedPath)
+    if (idx >= 0) root.browsePicked.splice(idx, 1)
+    else root.browsePicked.push(pickedPath)
+  }
+  function pickCount() { return root.browsePicked.length }
+  function usePicked() {
+    if (root.browsePicked.length === 0) return
+    var picked = root.browsePicked.slice()
+    root.browseOpen = false
+    root.browsePicked = []
+    root.browseStack = []
+    if (root.selectedFiles.trim().length > 0) {
+      var existing = root.selectedFiles.trim().split("\n")
+      for (var i = 0; i < existing.length; i++) if (picked.indexOf(existing[i]) < 0) picked.push(existing[i])
+    }
+    root.selectedFiles = picked.join("\n")
+  }
+
+  readonly property bool busy: statusProc.running || actionProc.running
   readonly property bool canSend: selectedPeer >= 0 && (selectedFiles.trim().length > 0 || linkText.trim().length > 0)
 
   function font(size) { return root.bar ? root.bar.fontFamily : Style.font.family }
   function close() { root.popupOpen = false }
   function togglePopup() { root.popupOpen = !root.popupOpen }
-  function startReceiveWhenShown() {
-    if (root.popupOpen && !root.receiveActive && !actionProc.running)
-      root.startAction("receive")
-  }
   function refresh() { if (!statusProc.running) statusProc.running = true }
   function formatRemaining() {
     var minutes = Math.floor(root.remainingSeconds / 60)
     var seconds = root.remainingSeconds % 60
     return minutes + ":" + (seconds < 10 ? "0" : "") + seconds
-  }
-  function startReceiveCountdown() {
-    root.receiveActive = true
-    root.receiveEndsAt = Date.now() + 600000
-    root.remainingSeconds = 600
-  }
-  function stopReceiveCountdown() {
-    root.receiveActive = false
-    root.receiveEndsAt = 0
-    root.remainingSeconds = 0
   }
 
   function persistSettings(values) {
@@ -62,15 +94,33 @@ BarWidget {
       root.bar.shell.updateEntryInline(root.moduleName, entry)
   }
 
+  function byteLength(value) { return unescape(encodeURIComponent(value)).length }
+
+  function validateSettings() {
+    var name = String(root.transferName || "").trim()
+    if (name.length === 0) return "Device name can't be empty"
+    if (root.byteLength(name) > 63) return "Device name must be at most 63 bytes"
+    var dir = String(root.receivePath || "").trim()
+    if (dir.length === 0) return "Receive folder can't be empty"
+    if (dir.charAt(0) !== "/") return "Receive folder must be an absolute path"
+    return ""
+  }
+
   function applyStatus(raw) {
     try {
       var value = JSON.parse(String(raw).trim())
       root.phase = value.state || "offline"
       root.message = value.message || root.phase
       root.pendingTransfer = value.data || null
-      if (root.phase === "receiving" && !root.receiveActive) root.startReceiveCountdown()
-      if ((root.phase === "idle" || root.phase === "error" || root.phase === "offline") && root.receiveActive && !actionProc.running)
-        root.stopReceiveCountdown()
+      if (root.phase === "receiving") {
+        if (!root.receiveActive) {
+          root.receiveActive = true
+          root.remainingSeconds = 600
+        }
+      } else if (root.receiveActive) {
+        root.receiveActive = false
+        root.remainingSeconds = 0
+      }
       if (root.phase !== "error") root.errorText = ""
     } catch (e) {
       root.phase = "offline"
@@ -81,12 +131,44 @@ BarWidget {
   function applyPeers(raw) {
     try {
       var value = JSON.parse(String(raw).trim())
-      root.peers = value.data || []
-      root.selectedPeer = root.peers.length ? 0 : -1
+      var prevAddress = root.selectedPeer >= 0 && root.peers.length > root.selectedPeer
+        ? String(root.peers[root.selectedPeer].address || "") : ""
+      var fresh = value.data || []
+      var now = Date.now()
+      var seenInFresh = {}
+      for (var f = 0; f < fresh.length; f++) {
+        var fk = String(fresh[f].address || "")
+        if (fk.length > 0) seenInFresh[fk] = true
+      }
+      var merged = []
+      var mergedSeen = {}
+      for (var o = 0; o < root.peers.length; o++) {
+        var peer = root.peers[o]
+        var ok = String(peer.address || "")
+        if (seenInFresh[ok]) continue
+        if (root.peerSeen[ok] && now - root.peerSeen[ok] < root.peerTtlMs) {
+          mergedSeen[ok] = root.peerSeen[ok]
+          merged.push(peer)
+        }
+      }
+      for (var n = 0; n < fresh.length; n++) {
+        var nk = String(fresh[n].address || "")
+        if (nk.length === 0) continue
+        mergedSeen[nk] = now
+        merged.push(fresh[n])
+      }
+      root.peers = merged
+      root.peerSeen = mergedSeen
+      root.selectedPeer = -1
+      for (var i = 0; i < merged.length; i++) {
+        if (String(merged[i].address || "") === prevAddress) { root.selectedPeer = i; break }
+      }
+      if (root.selectedPeer < 0 && root.peers.length > 0) root.selectedPeer = 0
       root.message = value.message || (root.peers.length + " recipient(s)")
       root.errorText = value.ok === false ? root.message : ""
     } catch (e) {
       root.peers = []
+      root.peerSeen = {}
       root.selectedPeer = -1
       root.errorText = "Could not read recipients"
     }
@@ -94,12 +176,10 @@ BarWidget {
 
   function startAction(op) {
     if (actionProc.running) return
-    if (op === "receive") root.startReceiveCountdown()
-    if (op === "stop") root.stopReceiveCountdown()
     var command = ["/usr/bin/ac-dc", "ctl", op]
     if (op === "receive") {
-      command.push("--name"); command.push(root.transferName || "Omarchy")
-      command.push("--directory"); command.push(root.receivePath || "/home/cristi/Downloads/Adhoc")
+      command.push("--name"); command.push(root.transferName.trim() || "Omarchy")
+      command.push("--directory"); command.push(root.receivePath.trim() || "/home/cristi/Downloads/Adhoc")
     }
     actionProc.command = command
     actionProc.running = true
@@ -127,18 +207,13 @@ BarWidget {
   function send() {
     if (!root.canSend || actionProc.running) return
     var peer = root.peers[root.selectedPeer]
-    var command = ["/usr/bin/ac-dc", "ctl", "send", "--host", root.peerHost(peer), "--port", String(root.peerPort(peer)), "--name", root.transferName || "Omarchy"]
+    var command = ["/usr/bin/ac-dc", "ctl", "send", "--host", root.peerHost(peer), "--port", String(root.peerPort(peer)), "--name", root.transferName.trim() || "Omarchy"]
     var files = root.selectedFiles.split("\n").filter(function(path) { return path.trim().length > 0 })
     files.forEach(function(path) { command.push("--file"); command.push(path.trim()) })
     if (root.linkText.trim().length > 0) { command.push("--link"); command.push(root.linkText.trim()) }
     root.errorText = ""
     actionProc.command = command
     actionProc.running = true
-  }
-
-  function applyFiles(raw) {
-    var value = String(raw).trim()
-    if (value.length > 0) root.selectedFiles = value.replace(/\r/g, "")
   }
 
   Process {
@@ -167,22 +242,43 @@ BarWidget {
     } }
     onExited: root.refresh()
   }
-  Process { id: legacyProc; command: ["/usr/bin/ac-dc", "ui"] }
+  Process {
+    id: legacyProc
+    command: ["/usr/bin/ac-dc", "ui"]
+    onExited: function(code) { if (code !== 0) root.errorText = "The full window failed to open" }
+  }
+
+  FolderListModel {
+    id: folderModel
+    folder: root.browseOpen ? ("file://" + root.browseFolder) : "file:///"
+    showDirs: true
+    showFiles: true
+    showDirsFirst: true
+    showDotAndDotDot: false
+    sortField: FolderListModel.Name
+    sortCaseSensitive: false
+  }
 
   Timer { interval: root.popupOpen ? 1500 : 4000; running: true; repeat: true; triggeredOnStart: true; onTriggered: root.refresh() }
-  Timer { interval: 1000; running: root.popupOpen; repeat: true; triggeredOnStart: true; onTriggered: root.findRecipients() }
+  Timer {
+    interval: root.peers.length > 0 ? 1000 : 5000
+    running: root.popupOpen
+    repeat: true
+    onTriggered: { if (!root.receiveActive) root.findRecipients() }
+  }
   Timer {
     interval: 1000
     running: root.receiveActive
     repeat: true
-    triggeredOnStart: true
-    onTriggered: {
-      root.remainingSeconds = Math.max(0, Math.ceil((root.receiveEndsAt - Date.now()) / 1000))
-      if (root.remainingSeconds === 0) root.stopReceiveCountdown()
-    }
+    onTriggered: { if (root.remainingSeconds > 0) root.remainingSeconds-- }
   }
   Component.onCompleted: root.refresh()
-  onPopupOpenChanged: root.startReceiveWhenShown()
+  onPopupOpenChanged: {
+    if (root.popupOpen) {
+      root.refresh()
+      if (!root.receiveActive) root.findRecipients()
+    }
+  }
 
   visible: true
   implicitWidth: Style.bar.statusSlot
@@ -196,7 +292,10 @@ BarWidget {
     fontSize: Style.font.caption
     foreground: root.phase === "error" || root.errorText.length > 0 ? Color.urgent : (root.phase === "offline" ? Qt.rgba(1,1,1,0.45) : (root.bar ? root.bar.barForeground : Color.foreground))
     tooltipText: "Adhoc: " + root.message
-    onPressed: root.togglePopup()
+    onPressed: {
+      if (root.phase === "error" || root.errorText.length > 0) root.refresh()
+      root.togglePopup()
+    }
   }
 
   PopupCard {
@@ -225,7 +324,7 @@ BarWidget {
         ColumnLayout {
           Layout.fillWidth: true; spacing: Style.space(2)
           Text { text: "Adhoc Connection"; color: Color.foreground; font.family: root.font(Style.font.body); font.pixelSize: Style.font.body; font.bold: true }
-          Text { text: root.message; color: root.errorText.length > 0 ? Color.urgent : Qt.rgba(1,1,1,0.62); elide: Text.ElideRight; Layout.fillWidth: true; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
+          Text { text: root.phase === "sending" ? "Transfer in progress…" : root.message; color: root.errorText.length > 0 ? Color.urgent : Qt.rgba(1,1,1,0.62); elide: Text.ElideRight; Layout.fillWidth: true; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
         }
       }
 
@@ -233,8 +332,27 @@ BarWidget {
 
       RowLayout {
         Layout.fillWidth: true
+        Text { text: "Receive"; color: Color.foreground; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption; font.bold: true }
+        Button {
+          Layout.fillWidth: true
+          text: root.receiveActive ? ("Stop receive · " + root.formatRemaining()) : "Receive 10 min"
+          selected: root.receiveActive
+          enabled: !root.busy
+          onClicked: root.startAction(root.receiveActive ? "stop" : "receive")
+        }
+      }
+
+      RowLayout {
+        Layout.fillWidth: true
         Text { text: "Send to"; color: Color.foreground; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption; font.bold: true }
-        Button { text: root.configOpen ? "Save" : "Settings"; onClicked: { if (root.configOpen) root.persistSettings({ name: root.transferName || "Omarchy", directory: root.receivePath || "/home/cristi/Downloads/Adhoc" }); root.configOpen = !root.configOpen } }
+        Button { text: root.configOpen ? "Save" : "Settings"; onClicked: {
+          if (root.configOpen) {
+            var error = root.validateSettings()
+            if (error.length > 0) { root.errorText = error; return }
+            root.persistSettings({ name: root.transferName.trim() || "Omarchy", directory: root.receivePath.trim() || "/home/cristi/Downloads/Adhoc" })
+          }
+          root.configOpen = !root.configOpen
+        } }
       }
 
       ColumnLayout {
@@ -257,7 +375,7 @@ BarWidget {
           font.bold: true
         }
         Text {
-          text: root.pendingTransfer ? root.pendingTransfer.items.join(", ") : ""
+          text: root.itemsLabel()
           color: Qt.rgba(1,1,1,0.65)
           elide: Text.ElideRight
           Layout.fillWidth: true
@@ -268,10 +386,12 @@ BarWidget {
           Layout.fillWidth: true
           Button {
             text: "Reject"
+            enabled: !root.busy
             onClicked: root.decideTransfer("reject")
           }
           Button {
             text: "Approve"
+            enabled: !root.busy
             onClicked: root.decideTransfer("approve")
           }
         }
@@ -290,6 +410,7 @@ BarWidget {
         }
       }
       DropArea {
+        visible: !root.browseOpen
         Layout.fillWidth: true
         Layout.preferredHeight: Style.space(72)
         onDropped: function(drop) {
@@ -304,7 +425,7 @@ BarWidget {
         }
         Rectangle {
           anchors.fill: parent
-          radius: Style.spacing.cardRadius
+          radius: Style.cornerRadius
           color: parent.containsDrag ? Qt.rgba(0.25, 0.55, 0.95, 0.22) : Qt.rgba(1, 1, 1, 0.06)
           border.color: parent.containsDrag ? Color.accent : Qt.rgba(1, 1, 1, 0.16)
           border.width: 1
@@ -312,7 +433,56 @@ BarWidget {
             anchors.centerIn: parent
             Text { Layout.alignment: Qt.AlignHCenter; text: "≋"; color: Color.accent; font.pixelSize: Style.font.title }
             Text { Layout.alignment: Qt.AlignHCenter; text: root.selectedFiles.length ? (root.selectedFiles.split("\n").length + " file(s) ready") : "Drop files here to send"; color: Color.foreground; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
+            Button { Layout.alignment: Qt.AlignHCenter; text: "Browse…"; enabled: !root.busy; onClicked: root.openBrowse() }
           }
+        }
+      }
+      ColumnLayout {
+        visible: root.browseOpen
+        Layout.fillWidth: true
+        spacing: Style.space(5)
+        RowLayout {
+          Layout.fillWidth: true
+          Button { text: "↩"; enabled: root.browseStack.length > 0; onClicked: root.upFolder() }
+          Text {
+            Layout.fillWidth: true
+            text: root.browseFolder
+            color: Qt.rgba(1, 1, 1, 0.72)
+            elide: Text.ElideMiddle
+            font.family: root.font(Style.font.caption)
+            font.pixelSize: Style.font.caption
+          }
+          Button { text: "Cancel"; onClicked: root.closeBrowse() }
+        }
+        ListView {
+          Layout.fillWidth: true
+          Layout.preferredHeight: Style.space(220)
+          clip: true
+          model: folderModel
+          delegate: Item {
+            required property int index
+            width: parent ? parent.width : 0
+            height: Style.space(28)
+            Button {
+              anchors.fill: parent
+              text: {
+                var name = folderModel.get(index, "fileName") || ""
+                if (folderModel.isFolder(index)) return name + "  /"
+                return name
+              }
+              foreground: folderModel.isFolder(index) ? Color.accent : Color.foreground
+              onClicked: {
+                if (folderModel.isFolder(index)) root.enterFolder(folderModel.get(index, "fileName"))
+                else root.togglePick(folderModel.get(index, "fileName"))
+              }
+            }
+          }
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        }
+        RowLayout {
+          Layout.fillWidth: true
+          Text { text: root.pickCount() + " file(s) picked"; color: Qt.rgba(1, 1, 1, 0.6); font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
+          Button { text: "Add"; enabled: root.pickCount() > 0; Layout.alignment: Qt.AlignRight; onClicked: root.usePicked() }
         }
       }
       TextField { Layout.fillWidth: true; placeholderText: "Or paste an https:// link"; text: root.linkText; onTextChanged: root.linkText = text }
@@ -323,5 +493,11 @@ BarWidget {
       }
       Text { visible: root.errorText.length > 0; text: root.errorText; color: Color.urgent; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
     }
+  }
+
+  function itemsLabel() {
+    var items = root.pendingTransfer ? (root.pendingTransfer.items || []) : []
+    if (items.length > 3) return items.length + " items"
+    return items.join(", ")
   }
 }
