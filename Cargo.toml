@@ -45,7 +45,9 @@ libc = "0.2"
 openssl = "0.10"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 flate2 = "1"
-gtk = { package = "gtk4", version = "0.11", features = ["v4_10"] }
+gpui = { package = "gpui-unofficial", version = "1.20.2" }
+gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "1.20.2", features = ["wayland", "x11"] }
+unicode-segmentation = "1"
 
 tempfile = "3"
 tokio-util = { version = "0.7", features = ["io"] }
@@ -53,3 +55,7 @@ tokio-openssl = "0.6"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+
+[dev-dependencies]
+# `start_paused` in the daemon timeout test needs tokio time control.
+tokio = { version = "1", features = ["test-util"] }

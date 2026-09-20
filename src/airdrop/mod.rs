@@ -439,6 +439,19 @@ async fn connection(
     }
     Ok(())
 }
+/// Bounds the receive window. Enforced here and by the daemon's control socket,
+/// which must reject an out-of-range request before it starts the radio.
+pub const RECEIVE_SECONDS: std::ops::RangeInclusive<u64> = 1..=3600;
+
+/// One wording for the rejection, so the daemon and `run` cannot drift apart.
+pub fn receive_seconds_error() -> String {
+    format!(
+        "receive duration must be {}..{} seconds",
+        RECEIVE_SECONDS.start(),
+        RECEIVE_SECONDS.end()
+    )
+}
+
 pub struct Config {
     pub iface: String,
     pub directory: PathBuf,
@@ -455,8 +468,9 @@ pub struct Config {
 }
 pub async fn run(c: Config) -> Result<()> {
     ensure!(
-        (1..=3600).contains(&c.seconds),
-        "receive duration must be 1..3600 seconds"
+        RECEIVE_SECONDS.contains(&c.seconds),
+        "{}",
+        receive_seconds_error()
     );
     ensure!(c.port > 0, "port must be nonzero");
     ensure!(

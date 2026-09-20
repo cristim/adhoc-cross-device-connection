@@ -4,7 +4,7 @@ pkgrel=0
 pkgdesc='Rust Airdrop-compatible desktop UI and Apple clipboard research tools'
 arch=('aarch64')
 license=('MIT')
-depends=('brcmfmac-awdl-local>=0.2.2' 'dbus' 'openssl' 'wl-clipboard' 'libnotify' 'gtk4')
+depends=('brcmfmac-awdl-local>=0.2.2' 'dbus' 'openssl' 'wl-clipboard' 'libnotify' 'libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'libglvnd' 'vulkan-icd-loader' 'fontconfig' 'freetype2' 'ttf-font')
 makedepends=('rust' 'pkgconf')
 options=('!strip' '!debug')
 build() { cd "$startdir"; cargo build --release --locked --offline; }
