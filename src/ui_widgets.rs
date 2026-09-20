@@ -51,6 +51,7 @@ pub struct TextField {
     pub text: SharedString,
     pub placeholder: SharedString,
     selected_range: Range<usize>,
+    marked_range: Option<Range<usize>>,
     selection_reversed: bool,
     is_selecting: bool,
     last_layout: Option<ShapedLine>,
@@ -64,6 +65,7 @@ impl TextField {
             text: text.into(),
             placeholder: placeholder.into(),
             selected_range: 0..0,
+            marked_range: None,
             selection_reversed: false,
             is_selecting: false,
             last_layout: None,
@@ -254,6 +256,18 @@ impl TextField {
         self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
     }
 
+    /// The range an IME edit applies to when it names none: the text still being
+    /// composed if there is any, otherwise the selection.
+    fn pending_range(&self, range_utf16: Option<&Range<usize>>) -> Range<usize> {
+        match range_utf16 {
+            Some(range_utf16) => self.range_from_utf16(range_utf16),
+            None => self
+                .marked_range
+                .clone()
+                .unwrap_or_else(|| self.selected_range.clone()),
+        }
+    }
+
     fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
         self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
     }
@@ -303,10 +317,14 @@ impl EntityInputHandler for TextField {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        None
+        self.marked_range
+            .as_ref()
+            .map(|range| self.range_to_utf16(range))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked_range = None;
+    }
 
     fn replace_text_in_range(
         &mut self,
@@ -315,13 +333,11 @@ impl EntityInputHandler for TextField {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .unwrap_or_else(|| self.selected_range.clone());
+        let range = self.pending_range(range_utf16.as_ref());
         self.text =
             (self.text[0..range.start].to_owned() + new_text + &self.text[range.end..]).into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.marked_range = None;
         self.selection_reversed = false;
         cx.notify();
     }
@@ -334,12 +350,11 @@ impl EntityInputHandler for TextField {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .unwrap_or_else(|| self.selected_range.clone());
+        let range = self.pending_range(range_utf16.as_ref());
         self.text =
             (self.text[0..range.start].to_owned() + new_text + &self.text[range.end..]).into();
+        self.marked_range =
+            (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
         self.selected_range = new_selected_range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -379,7 +394,7 @@ impl EntityInputHandler for TextField {
         let line_point = self.last_bounds?.localize(&position)?;
         let last_layout = self.last_layout.as_ref()?;
         assert_eq!(last_layout.text, self.text);
-        let utf8_index = last_layout.index_for_x(position.x - line_point.x)?;
+        let utf8_index = last_layout.index_for_x(line_point.x)?;
         Some(self.offset_to_utf16(utf8_index))
     }
 }
