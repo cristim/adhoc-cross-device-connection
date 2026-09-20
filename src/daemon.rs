@@ -9,6 +9,11 @@ use tokio::{
     sync::Mutex,
 };
 
+/// How long `start_radio` waits for awdlctl to report the radio ready.
+const RADIO_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `discover` waits for the peer browse before giving up on it.
+const BROWSE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Wait for the asynchronous AWDL setup before the protocol checks awdl0.
 async fn start_radio(seconds: u64) -> Result<tokio::process::Child> {
     let mut child = tokio::process::Command::new("/usr/bin/awdlctl")
@@ -17,7 +22,7 @@ async fn start_radio(seconds: u64) -> Result<tokio::process::Child> {
         .kill_on_drop(true)
         .spawn()
         .context("start AWDL radio")?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + RADIO_READY_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait().context("check awdlctl startup")? {
             let mut stderr = String::new();
@@ -198,11 +203,7 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
         return Reply {
             ok: false,
             state: s.phase.clone(),
-            message: format!(
-                "receive duration must be {}..{} seconds",
-                airdrop::RECEIVE_SECONDS.start(),
-                airdrop::RECEIVE_SECONDS.end()
-            ),
+            message: airdrop::receive_seconds_error(),
             data: None,
         };
     }
@@ -318,7 +319,7 @@ async fn discover(state: Arc<Mutex<State>>) -> Reply {
         }
     };
     let result = tokio::time::timeout(
-        Duration::from_secs(20),
+        BROWSE_TIMEOUT,
         airdrop::peers::browse("awdl0", &PathBuf::from(IDENTITY), 8),
     )
     .await;
@@ -400,14 +401,23 @@ async fn start_send(state: Arc<Mutex<State>>, request: Request) -> Reply {
     }
 }
 
-/// Every handler answers from state it already holds, so a request still
+/// Most handlers answer from state they already hold, so a request still
 /// outstanding after this long is one the daemon will never answer. The UI awaits
 /// `ctl` in its single engine loop, where an indefinite wait also blocks stop,
 /// approve and quit.
 const CTL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `peers` is the exception: `discover` starts the radio and browses before it
+/// replies, so its deadline has to cover both of those budgets as well.
+fn ctl_timeout(op: &str) -> Duration {
+    match op {
+        "peers" => RADIO_READY_TIMEOUT + BROWSE_TIMEOUT + CTL_TIMEOUT,
+        _ => CTL_TIMEOUT,
+    }
+}
+
 pub async fn ctl(socket: PathBuf, request: Request) -> Result<Reply> {
-    tokio::time::timeout(CTL_TIMEOUT, async move {
+    tokio::time::timeout(ctl_timeout(&request.op), async move {
         tracing::debug!(socket=%socket.display(), op=%request.op, "connecting to daemon");
         let mut stream = UnixStream::connect(socket)
             .await
@@ -476,6 +486,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn peers_outlasts_the_radio_and_browse_it_waits_on() {
+        let work = RADIO_READY_TIMEOUT + BROWSE_TIMEOUT;
+        assert!(
+            ctl_timeout("peers") > work,
+            "peers deadline {:?} does not cover {:?}",
+            ctl_timeout("peers"),
+            work
+        );
+        assert_eq!(ctl_timeout("status"), CTL_TIMEOUT);
+        assert_eq!(ctl_timeout("receive"), CTL_TIMEOUT);
+    }
+
     // `start_paused` lets the runtime jump the CTL_TIMEOUT deadline as soon as
     // both sides are idle, so this costs no wall-clock time.
     #[tokio::test(start_paused = true)]
@@ -484,12 +507,14 @@ mod tests {
         let socket = dir.path().join("control.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let mute = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let _connection = listener.accept().await.unwrap();
             std::future::pending::<()>().await;
-            drop(stream);
         });
 
-        let error = ctl(socket, request("status")).await.unwrap_err();
+        let error = tokio::time::timeout(CTL_TIMEOUT * 4, ctl(socket, request("status")))
+            .await
+            .expect("ctl ignored its own deadline")
+            .unwrap_err();
 
         assert!(
             error.to_string().contains("did not respond"),
