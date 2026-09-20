@@ -1,9 +1,14 @@
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
+/// How long a single `awdlctl status` probe may take. Callers that wait on a
+/// readiness loop have to add this to their own budget: the loop can start a
+/// probe just before its deadline and still owe it this long.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub async fn radio() -> Result<Value> {
     let output = tokio::time::timeout(
-        Duration::from_secs(5),
+        PROBE_TIMEOUT,
         tokio::process::Command::new("awdlctl")
             .args(["status", "--json"])
             .kill_on_drop(true)

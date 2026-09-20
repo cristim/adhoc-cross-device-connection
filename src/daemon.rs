@@ -407,11 +407,19 @@ async fn start_send(state: Arc<Mutex<State>>, request: Request) -> Reply {
 /// approve and quit.
 const CTL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `peers` is the exception: `discover` starts the radio and browses before it
-/// replies, so its deadline has to cover both of those budgets as well.
+/// The work `discover` does before it replies, and therefore what a `peers`
+/// request has to be allowed to wait for. The readiness loop checks its deadline
+/// only after awaiting a probe, so a probe starting just inside
+/// `RADIO_READY_TIMEOUT` still runs for up to `health::PROBE_TIMEOUT` more.
+const DISCOVER_WORST_CASE: Duration = RADIO_READY_TIMEOUT
+    .saturating_add(crate::health::PROBE_TIMEOUT)
+    .saturating_add(BROWSE_TIMEOUT);
+
+/// `peers` is the exception: `discover` works before it replies, so its deadline
+/// covers that work plus the slack every other operation gets.
 fn ctl_timeout(op: &str) -> Duration {
     match op {
-        "peers" => RADIO_READY_TIMEOUT + BROWSE_TIMEOUT + CTL_TIMEOUT,
+        "peers" => DISCOVER_WORST_CASE + CTL_TIMEOUT,
         _ => CTL_TIMEOUT,
     }
 }
@@ -488,7 +496,9 @@ mod tests {
 
     #[test]
     fn peers_outlasts_the_radio_and_browse_it_waits_on() {
-        let work = RADIO_READY_TIMEOUT + BROWSE_TIMEOUT;
+        // The readiness loop can overrun its own deadline by one probe, so the
+        // probe budget counts too; leaving it out is what made 35s too tight.
+        let work = RADIO_READY_TIMEOUT + crate::health::PROBE_TIMEOUT + BROWSE_TIMEOUT;
         assert!(
             ctl_timeout("peers") > work,
             "peers deadline {:?} does not cover {:?}",
