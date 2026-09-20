@@ -309,8 +309,11 @@ async fn decide(state: Arc<Mutex<State>>, accepted: bool) -> Reply {
     }
 }
 
+/// How long the radio stays up for one discovery pass.
+const DISCOVER_SECONDS: u64 = 30;
+
 async fn discover(state: Arc<Mutex<State>>) -> Reply {
-    let mut radio = match start_radio(30).await {
+    let mut radio = match start_radio(DISCOVER_SECONDS).await {
         Ok(child) => child,
         Err(e) => {
             return Reply {
@@ -321,11 +324,21 @@ async fn discover(state: Arc<Mutex<State>>) -> Reply {
             }
         }
     };
+    // A sleeping iPhone keeps AWDL down until it sees an AirDrop wake beacon, and
+    // the only other caller of this is the receive path. Without it here, no
+    // sequence exists that wakes a phone and then sends to it: receiving holds the
+    // daemon's single slot, so the send is refused while the wake is running.
+    let wake = tokio::spawn(crate::advertise::broadcast(
+        crate::advertise::airdrop_wake(),
+        DISCOVER_SECONDS,
+        100,
+    ));
     let result = tokio::time::timeout(
         BROWSE_TIMEOUT,
         airdrop::peers::browse("awdl0", &PathBuf::from(IDENTITY), 8),
     )
     .await;
+    wake.abort();
     let _ = radio.kill().await;
     match result {
         Ok(Ok(peers)) => Reply {
