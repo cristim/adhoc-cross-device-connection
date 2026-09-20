@@ -238,14 +238,20 @@ async fn engine(
                             "stopped" => "Airdrop-compatible stopped".into(),
                             message => message.into(),
                         }));
+                        // The daemon has dropped its pending transfer, so the next
+                        // poll sees None == None and emits nothing: clear here or
+                        // the card stays with live approve/reject buttons.
+                        last_pending = None;
+                        let _ = events.send(Event::IncomingAllCleared);
                     }
                     Err(e) => {
                         let _ = events.send(Event::Status(format!(
                             "Could not stop the ac-dc daemon: {e:#}"
                         )));
+                        // Leave last_pending alone: the daemon may still hold the
+                        // transfer, and resetting it would re-append the card.
                     }
                 }
-                last_pending = None;
                 if quit {
                     break;
                 }
