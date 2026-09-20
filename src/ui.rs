@@ -51,6 +51,7 @@ enum Event {
     Peers(Vec<Peer>),
     Incoming(String, Vec<String>),
     IncomingCleared(usize),
+    IncomingAllCleared,
 }
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -161,8 +162,14 @@ async fn engine(
                         Some((sender, items))
                     });
                     if pending != last_pending {
-                        if let Some((sender, items)) = &pending {
-                            let _ = events.send(Event::Incoming(sender.clone(), items.clone()));
+                        match &pending {
+                            Some((sender, items)) => {
+                                let _ =
+                                    events.send(Event::Incoming(sender.clone(), items.clone()));
+                            }
+                            None => {
+                                let _ = events.send(Event::IncomingAllCleared);
+                            }
                         }
                         last_pending = pending;
                     }
@@ -434,6 +441,7 @@ impl AcDcApp {
                                     Event::IncomingCleared(id) => {
                                         this.incoming.retain(|card| card.id != id);
                                     }
+                                    Event::IncomingAllCleared => this.incoming.clear(),
                                 }
                                 cx.notify();
                             });
@@ -892,7 +900,7 @@ pub fn run() -> Result<()> {
         w::bind_text_input_keys(cx);
         cx.bind_keys([
             KeyBinding::new("escape", Quit, None),
-            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("secondary-q", Quit, None),
         ]);
 
         let close_actions = shutdown.clone();
