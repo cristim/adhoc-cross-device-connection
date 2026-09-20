@@ -233,6 +233,7 @@ struct Sessions {
         Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, std::time::Instant>>>,
     approval: Option<tokio::sync::mpsc::Sender<Incoming>>,
 }
+#[allow(clippy::too_many_arguments)]
 async fn connection(
     stream: tokio::net::TcpStream,
     acceptor: TlsAcceptor,
