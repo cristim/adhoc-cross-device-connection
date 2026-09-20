@@ -220,8 +220,7 @@ enum Cmd {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let default_filter = match cli.verbose {
         0 => "ac_dc=info",
@@ -237,7 +236,19 @@ async fn main() -> Result<()> {
         .init();
 
     tracing::debug!(verbose = cli.verbose, command = ?cli.cmd, "ac-dc command starting");
+    // `ui::run` owns the main thread for the window loop and drives its own
+    // runtime, joining the engine with `block_on` once the window closes. That
+    // panics inside a runtime context, so the UI must be dispatched before one
+    // exists rather than from an async main.
     match cli.cmd {
+        Cmd::Ui => ui::run(),
+        cmd => tokio::runtime::Runtime::new()?.block_on(command(cmd)),
+    }
+}
+
+async fn command(cmd: Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Ui => unreachable!("dispatched by main before the runtime starts"),
         Cmd::Daemon { socket } => {
             daemon::run(socket.unwrap_or_else(daemon::default_socket)).await?
         }
@@ -269,7 +280,6 @@ async fn main() -> Result<()> {
             .await?;
             println!("{}", serde_json::to_string(&reply)?);
         }
-        Cmd::Ui => ui::run()?,
         Cmd::Peers {
             iface,
             tls_identity,
