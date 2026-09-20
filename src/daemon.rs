@@ -11,8 +11,11 @@ use tokio::{
 
 /// How long `start_radio` waits for awdlctl to report the radio ready.
 const RADIO_READY_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long `discover` waits for the peer browse before giving up on it.
-const BROWSE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long `discover` waits for the peer browse before giving up on it. `browse`
+/// spends its mDNS window, then up to that window again polling awdlctl's
+/// service-record file, then may run the `awdlctl events` fallback for the same
+/// window, so this covers three such windows plus slack.
+const BROWSE_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// Wait for the asynchronous AWDL setup before the protocol checks awdl0.
 async fn start_radio(seconds: u64) -> Result<tokio::process::Child> {
@@ -306,8 +309,14 @@ async fn decide(state: Arc<Mutex<State>>, accepted: bool) -> Reply {
     }
 }
 
+/// How long the radio stays up for one discovery pass. It has to outlast
+/// everything `discover` does after spawning it -- readiness polling, one probe,
+/// and the whole browse -- or the radio and the wake expire mid-search, which is
+/// exactly what a picked 30s did. Derived, not chosen.
+const DISCOVER_SECONDS: u64 = DISCOVER_WORST_CASE.as_secs();
+
 async fn discover(state: Arc<Mutex<State>>) -> Reply {
-    let mut radio = match start_radio(30).await {
+    let mut radio = match start_radio(DISCOVER_SECONDS).await {
         Ok(child) => child,
         Err(e) => {
             return Reply {
@@ -318,11 +327,21 @@ async fn discover(state: Arc<Mutex<State>>) -> Reply {
             }
         }
     };
+    // A sleeping iPhone keeps AWDL down until it sees an AirDrop wake beacon, and
+    // the only other caller of this is the receive path. Without it here, no
+    // sequence exists that wakes a phone and then sends to it: receiving holds the
+    // daemon's single slot, so the send is refused while the wake is running.
+    let wake = tokio::spawn(crate::advertise::broadcast(
+        crate::advertise::airdrop_wake(),
+        DISCOVER_SECONDS,
+        100,
+    ));
     let result = tokio::time::timeout(
         BROWSE_TIMEOUT,
         airdrop::peers::browse("awdl0", &PathBuf::from(IDENTITY), 8),
     )
     .await;
+    wake.abort();
     let _ = radio.kill().await;
     match result {
         Ok(Ok(peers)) => Reply {
@@ -504,6 +523,12 @@ mod tests {
             "peers deadline {:?} does not cover {:?}",
             ctl_timeout("peers"),
             work
+        );
+        // The radio and the wake must outlast the search they exist for.
+        assert!(
+            Duration::from_secs(DISCOVER_SECONDS)
+                >= RADIO_READY_TIMEOUT + crate::health::PROBE_TIMEOUT + BROWSE_TIMEOUT,
+            "radio window {DISCOVER_SECONDS}s expires before readiness plus the browse"
         );
         assert_eq!(ctl_timeout("status"), CTL_TIMEOUT);
         assert_eq!(ctl_timeout("receive"), CTL_TIMEOUT);

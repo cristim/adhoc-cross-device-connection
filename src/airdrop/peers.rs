@@ -6,6 +6,80 @@ pub struct Peer {
     pub instance: String,
     pub address: SocketAddr,
 }
+/// `awdlctl` writes the service records it decoded from AWDL management frames
+/// here, refreshing the file while a discoverable window runs.
+const FIRMWARE_PEERS: &str = "/run/brcmfmac-awdl/airdrop-peers.json";
+/// Records older than this are refused, so a stale file cannot resurrect a peer
+/// that has since gone away.
+const FIRMWARE_MAX_AGE: u64 = 30;
+
+/// Endpoints from one `awdlctl` service-record file, empty when the file is older
+/// than [`FIRMWARE_MAX_AGE`]. `now` is unix seconds.
+fn firmware_peers(bytes: &[u8], now: u64, iface: &str) -> Result<Vec<(SocketAddr, String)>> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Ok(Vec::new());
+    };
+    if !value["timestamp"]
+        .as_u64()
+        .is_some_and(|t| t <= now && now - t <= FIRMWARE_MAX_AGE)
+    {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    for p in value["peers"].as_array().into_iter().flatten() {
+        let (Some(host), Some(port)) = (
+            p["host"].as_str(),
+            p["port"].as_u64().filter(|n| *n > 0 && *n <= 65535),
+        ) else {
+            continue;
+        };
+        let Ok(ip) = host.parse::<std::net::Ipv6Addr>() else {
+            continue;
+        };
+        if !ip.is_unicast_link_local() {
+            continue;
+        }
+        let mut a = crate::discover::scope_address(ip.into(), iface)?;
+        a.set_port(port as u16);
+        found.push((
+            a,
+            p["instance"]
+                .as_str()
+                .unwrap_or("Airdrop-compatible")
+                .into(),
+        ));
+    }
+    Ok(found)
+}
+
+/// Poll `path` until it holds fresh records or `deadline` passes. `awdlctl` writes
+/// the file only once it has decoded service records, so the first read routinely
+/// comes too early; a single read made discovery succeed or fail by timing.
+async fn firmware_peers_within(
+    path: &std::path::Path,
+    iface: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<(SocketAddr, String)>> {
+    loop {
+        if let Ok(bytes) = std::fs::read(path) {
+            let found = firmware_peers(&bytes, unix_now()?, iface)?;
+            if !found.is_empty() {
+                return Ok(found);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(Vec::new());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn unix_now() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs())
+}
+
 struct Browse(mdns_sd::ServiceDaemon);
 impl Drop for Browse {
     fn drop(&mut self) {
@@ -37,38 +111,13 @@ pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Pe
         }
     }
     // Firmware service records provide endpoints even when peer mDNS is silent.
-    if let Ok(bytes) = std::fs::read("/run/brcmfmac-awdl/airdrop-peers.json") {
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
-            if value["timestamp"]
-                .as_u64()
-                .is_some_and(|t| t <= now && now - t <= 30)
-            {
-                for p in value["peers"].as_array().into_iter().flatten() {
-                    if let (Some(host), Some(port)) = (
-                        p["host"].as_str(),
-                        p["port"].as_u64().filter(|n| *n > 0 && *n <= 65535),
-                    ) {
-                        if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
-                            if ip.is_unicast_link_local() {
-                                let mut a = crate::discover::scope_address(ip.into(), iface)?;
-                                a.set_port(port as u16);
-                                candidates.insert(
-                                    a,
-                                    p["instance"]
-                                        .as_str()
-                                        .unwrap_or("Airdrop-compatible")
-                                        .into(),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // The `awdlctl discoverable` child refreshes the file only once it has decoded
+    // service records, which routinely lands after the mDNS window closes: reading
+    // once made discovery a race that returned no peers whenever it read early.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+    candidates.extend(
+        firmware_peers_within(std::path::Path::new(FIRMWARE_PEERS), iface, deadline).await?,
+    );
     // The AWDL driver can decode mDNS service records from management frames
     // even when a userspace mDNS socket does not receive the multicast packet.
     // Use those decoded SRV records as a fallback for Linux AWDL adapters.
@@ -163,4 +212,97 @@ pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Pe
     }
     peers.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(peers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(timestamp: u64) -> Vec<u8> {
+        format!(
+            r#"{{"peers":[{{"host":"fe80::c897:44ff:fe50:6963","instance":"a._airdrop._tcp.local","port":8770}}],"timestamp":{timestamp}}}"#
+        )
+        .into_bytes()
+    }
+
+    // `lo` stands in for awdl0: scope_address only needs an interface that exists.
+    const IFACE: &str = "lo";
+
+    // The race the single read lost: the file is stale when discovery first looks
+    // and only becomes fresh afterwards. Pre-fix this returned no peers.
+    #[tokio::test]
+    async fn a_file_that_turns_fresh_after_the_first_read_is_still_picked_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("airdrop-peers.json");
+        std::fs::write(&path, file(unix_now().unwrap() - FIRMWARE_MAX_AGE - 60)).unwrap();
+
+        let writer = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                std::fs::write(&path, file(unix_now().unwrap())).unwrap();
+            })
+        };
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let found = firmware_peers_within(&path, IFACE, deadline).await.unwrap();
+        writer.await.unwrap();
+
+        assert_eq!(found.len(), 1, "the refreshed file was never picked up");
+        assert_eq!(found[0].0.port(), 8770);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_never_refreshes_gives_up_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("airdrop-peers.json");
+        std::fs::write(&path, file(unix_now().unwrap() - FIRMWARE_MAX_AGE - 60)).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        assert!(firmware_peers_within(&path, IFACE, deadline)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_fresh_service_record_file_yields_its_peer() {
+        let now = 1_789_944_322;
+        let found = firmware_peers(&file(now - 5), now, IFACE).unwrap();
+        assert_eq!(found.len(), 1, "fresh file was not accepted");
+        assert_eq!(found[0].0.port(), 8770);
+        assert_eq!(found[0].1, "a._airdrop._tcp.local");
+    }
+
+    #[test]
+    fn a_stale_file_cannot_resurrect_a_peer_that_has_gone() {
+        let now = 1_789_944_322;
+        let stale = now - FIRMWARE_MAX_AGE - 1;
+        assert!(firmware_peers(&file(stale), now, IFACE).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_timestamp_from_the_future_is_refused() {
+        let now = 1_789_944_322;
+        assert!(firmware_peers(&file(now + 60), now, IFACE)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn malformed_or_routable_records_are_skipped_without_failing() {
+        let now = 1_789_944_322;
+        assert!(firmware_peers(b"not json", now, IFACE).unwrap().is_empty());
+        let routable = format!(
+            r#"{{"peers":[{{"host":"2001:db8::1","instance":"a","port":8770}}],"timestamp":{now}}}"#
+        );
+        assert!(firmware_peers(routable.as_bytes(), now, IFACE)
+            .unwrap()
+            .is_empty());
+        let zero_port = format!(
+            r#"{{"peers":[{{"host":"fe80::1","instance":"a","port":0}}],"timestamp":{now}}}"#
+        );
+        assert!(firmware_peers(zero_port.as_bytes(), now, IFACE)
+            .unwrap()
+            .is_empty());
+    }
 }
