@@ -693,10 +693,9 @@ mod tests {
     }
     #[tokio::test]
     async fn open_directory_launches_the_opener_with_the_destination() {
-        let tmp = Temp(std::env::temp_dir().join(format!(
-            "ac-dc-open-test-{:032x}",
-            rand::random::<u128>()
-        )));
+        let tmp = Temp(
+            std::env::temp_dir().join(format!("ac-dc-open-test-{:032x}", rand::random::<u128>())),
+        );
         std::fs::create_dir(&tmp.0).unwrap();
         let stub = tmp.0.join("xdg-open");
         std::fs::write(
@@ -708,11 +707,11 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
         std::fs::set_permissions(&stub, perms).unwrap();
         let dest = tmp.0.join("received");
-        open_directory(&dest, stub.to_str().unwrap())
-            .await
-            .unwrap();
+        open_directory(&dest, stub.to_str().unwrap()).await.unwrap();
         assert_eq!(
-            std::fs::read_to_string(tmp.0.join("opened.txt")).unwrap().trim(),
+            std::fs::read_to_string(tmp.0.join("opened.txt"))
+                .unwrap()
+                .trim(),
             dest.to_str().unwrap()
         );
     }
