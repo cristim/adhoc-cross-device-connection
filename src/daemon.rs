@@ -11,8 +11,11 @@ use tokio::{
 
 /// How long `start_radio` waits for awdlctl to report the radio ready.
 const RADIO_READY_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long `discover` waits for the peer browse before giving up on it.
-const BROWSE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long `discover` waits for the peer browse before giving up on it. `browse`
+/// spends its mDNS window, then up to that window again polling awdlctl's
+/// service-record file, then may run the `awdlctl events` fallback for the same
+/// window, so this covers three such windows plus slack.
+const BROWSE_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// Wait for the asynchronous AWDL setup before the protocol checks awdl0.
 async fn start_radio(seconds: u64) -> Result<tokio::process::Child> {
