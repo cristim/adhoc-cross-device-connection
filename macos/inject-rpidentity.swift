@@ -98,7 +98,7 @@ func opackBytes(_ b: Data) -> Data {
     precondition(b.count <= 0x20, "value too long for short OPACK bytes")
     return Data([0x70 + UInt8(b.count)]) + b
 }
-var opack = Data([0xE0 + 2]) // dict, 2 pairs
+var opack = Data([UInt8(0xE0 + 2)]) // dict, 2 pairs
 opack += opackStr("edPK"); opack += opackBytes(edPK)
 opack += opackStr("dIRK"); opack += opackBytes(dirkData)
 
@@ -157,10 +157,10 @@ if status == errSecMissingEntitlement || status == errSecParam {
 guard status == errSecSuccess else {
     let msg = SecCopyErrorMessageString(status, nil) as String? ?? "unknown"
     FileHandle.standardError.write("SecItemAdd FAILED: OSStatus \(status) (\(msg))\n".data(using: .utf8)!)
-    FileHandle.standardError.write(
+    FileHandle.standardError.write((
         "Common causes: -34018 missing entitlement (try --no-access-group), or the\n"
         + "item already exists. Nothing was written to \(outPath).\n"
-        .data(using: .utf8)!)
+        ).data(using: .utf8)!)
     exit(1)
 }
 
