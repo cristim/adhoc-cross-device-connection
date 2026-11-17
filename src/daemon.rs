@@ -88,6 +88,8 @@ struct State {
     phase: String,
     task: Option<tokio::task::JoinHandle<()>>,
     pending: Option<Pending>,
+    last_error: Option<String>,
+    send_progress: Option<(u64, u64)>,
 }
 
 struct Pending {
@@ -128,6 +130,8 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         phase: "idle".into(),
         task: None,
         pending: None,
+        last_error: None,
+        send_progress: None,
     }));
     tracing::info!(path=%socket.display(), "ac-dc daemon listening");
     loop {
@@ -139,6 +143,28 @@ pub async fn run(socket: PathBuf) -> Result<()> {
                 tracing::debug!(error=%e, "daemon client disconnected");
             }
         });
+    }
+}
+
+fn status_reply(s: &State) -> Reply {
+    let data = if let Some(p) = s.pending.as_ref() {
+        Some(serde_json::json!({"sender": p.sender, "items": p.items}))
+    } else if s.phase == "sending" {
+        s.send_progress
+            .map(|(sent, total)| serde_json::json!({"sent": sent, "total": total}))
+    } else {
+        None
+    };
+    let message = if s.phase == "error" {
+        s.last_error.clone().unwrap_or_else(|| s.phase.clone())
+    } else {
+        s.phase.clone()
+    };
+    Reply {
+        ok: true,
+        state: s.phase.clone(),
+        message,
+        data,
     }
 }
 
@@ -160,16 +186,7 @@ async fn handle(stream: UnixStream, state: Arc<Mutex<State>>) -> Result<()> {
     let reply = match request.op.as_str() {
         "status" => {
             let s = state.lock().await;
-            let pending = s
-                .pending
-                .as_ref()
-                .map(|p| serde_json::json!({"sender": p.sender, "items": p.items}));
-            Reply {
-                ok: true,
-                state: s.phase.clone(),
-                message: s.phase.clone(),
-                data: pending,
-            }
+            status_reply(&s)
         }
         "receive" => start_receive(state.clone(), request).await,
         "stop" => stop(state.clone()).await,
@@ -216,6 +233,8 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
         };
     }
     s.phase = "starting".into();
+    s.last_error = None;
+    s.send_progress = None;
     let task_state = state.clone();
     s.task = Some(tokio::spawn(async move {
         let result = async {
@@ -257,6 +276,7 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
         s.task = None;
         if let Err(e) = result {
             tracing::error!(error=%e, "Airdrop-compatible receiver stopped");
+            s.last_error = Some(format!("{e:#}"));
         }
     }));
     Reply {
@@ -274,6 +294,8 @@ async fn stop(state: Arc<Mutex<State>>) -> Reply {
     }
     s.phase = "idle".into();
     s.pending = None;
+    s.last_error = None;
+    s.send_progress = None;
     Reply {
         ok: true,
         state: "idle".into(),
@@ -307,15 +329,30 @@ async fn decide(state: Arc<Mutex<State>>, accepted: bool) -> Reply {
 }
 
 async fn discover(state: Arc<Mutex<State>>) -> Reply {
-    let mut radio = match start_radio(30).await {
-        Ok(child) => child,
-        Err(e) => {
-            return Reply {
-                ok: false,
-                state: state.lock().await.phase.clone(),
-                message: format!("start radio: {e:#}"),
-                data: None,
+    let radio = {
+        let s = state.lock().await;
+        if s.task.as_ref().is_some_and(|t| !t.is_finished()) {
+            if s.phase == "sending" {
+                return Reply {
+                    ok: false,
+                    state: s.phase.clone(),
+                    message: "cannot browse peers while sending".into(),
+                    data: None,
+                };
             }
+            None
+        } else {
+            Some(match start_radio(30).await {
+                Ok(child) => child,
+                Err(e) => {
+                    return Reply {
+                        ok: false,
+                        state: state.lock().await.phase.clone(),
+                        message: format!("start radio: {e:#}"),
+                        data: None,
+                    }
+                }
+            })
         }
     };
     let result = tokio::time::timeout(
@@ -323,7 +360,9 @@ async fn discover(state: Arc<Mutex<State>>) -> Reply {
         airdrop::peers::browse("awdl0", &PathBuf::from(IDENTITY), 8),
     )
     .await;
-    let _ = radio.kill().await;
+    if let Some(mut child) = radio {
+        let _ = child.kill().await;
+    }
     match result {
         Ok(Ok(peers)) => Reply {
             ok: true,
@@ -374,22 +413,38 @@ async fn start_send(state: Arc<Mutex<State>>, request: Request) -> Reply {
             };
         }
         s.phase = "sending".into();
+        s.last_error = None;
+        s.send_progress = Some((0, 0));
         s.task = Some(tokio::spawn(async move {
             let result = async {
                 let mut radio = start_radio(600).await?;
                 let address = crate::discover::socket_target(&host, port).await?;
                 let client = airdrop::send::Client::new(address, &PathBuf::from(IDENTITY))?;
                 let receiver = client.discover().await?;
-                client.transfer(&name, files, links).await?;
+                let (ptx, mut prx) = tokio::sync::watch::channel((0u64, 0u64));
+                let progress_state = task_state.clone();
+                let pump = tokio::spawn(async move {
+                    while prx.changed().await.is_ok() {
+                        let val = *prx.borrow_and_update();
+                        progress_state.lock().await.send_progress = Some(val);
+                    }
+                });
+                let xfer = client
+                    .transfer_with_progress(&name, files, links, Some(ptx))
+                    .await;
+                pump.abort();
+                xfer?;
                 let _ = radio.kill().await;
                 Ok::<String, anyhow::Error>(receiver)
             }
             .await;
             let mut s = task_state.lock().await;
             s.phase = if result.is_ok() { "idle" } else { "error" }.into();
+            s.send_progress = None;
             s.task = None;
             if let Err(e) = result {
                 tracing::error!(error=%e, "Airdrop-compatible send failed");
+                s.last_error = Some(format!("{e:#}"));
             }
         }));
     }
@@ -470,7 +525,54 @@ mod tests {
             phase: "idle".into(),
             task: None,
             pending: None,
+            last_error: None,
+            send_progress: None,
         }))
+    }
+
+    #[tokio::test]
+    async fn status_surfaces_last_error_and_send_progress() {
+        let state = idle_state();
+        {
+            let mut s = state.lock().await;
+            s.phase = "error".into();
+            s.last_error = Some("peer timed out".into());
+        }
+        let err_reply = status_reply(&*state.lock().await);
+        assert_eq!(err_reply.message, "peer timed out");
+        assert!(err_reply.data.is_none());
+
+        {
+            let mut s = state.lock().await;
+            s.phase = "sending".into();
+            s.last_error = None;
+            s.send_progress = Some((512, 1024));
+        }
+        let prog_reply = status_reply(&*state.lock().await);
+        assert_eq!(prog_reply.message, "sending");
+        assert_eq!(
+            prog_reply.data,
+            Some(serde_json::json!({"sent": 512, "total": 1024}))
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_when_sending() {
+        let state = idle_state();
+        {
+            let mut s = state.lock().await;
+            s.phase = "sending".into();
+            s.task = Some(tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }));
+        }
+        let reply = discover(state.clone()).await;
+        assert!(!reply.ok);
+        assert!(reply.message.contains("while sending"));
+        let task = state.lock().await.task.take();
+        if let Some(t) = task {
+            t.abort();
+        }
     }
 
     #[tokio::test]

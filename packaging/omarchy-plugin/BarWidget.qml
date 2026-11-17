@@ -11,6 +11,12 @@ BarWidget {
   id: root
   moduleName: "org.omarchy.adhoccrossdeviceconnection"
 
+  function defaultHome() {
+    var h = Quickshell.env("HOME")
+    return (h && h.length > 0) ? h : "/tmp"
+  }
+  function defaultReceivePath() { return root.defaultHome() + "/Downloads/Adhoc" }
+
   property bool popupOpen: false
   property bool configOpen: false
   property string phase: "offline"
@@ -21,10 +27,11 @@ BarWidget {
   property string linkText: ""
   property string errorText: ""
   property string transferName: String(setting("name", "Omarchy"))
-  property string receivePath: String(setting("directory", "/home/cristi/Downloads/Adhoc"))
+  property string receivePath: String(setting("directory", root.defaultReceivePath()))
   property bool receiveActive: false
   property int remainingSeconds: 0
   property var pendingTransfer: null
+  property var sendProgress: null
   property var peerSeen: ({})
   property int peerTtlMs: 30000
   property bool browseOpen: false
@@ -33,7 +40,7 @@ BarWidget {
   property var browsePicked: []
 
   function openBrowse() {
-    root.browseFolder = String(root.receivePath || "").trim() || "/home/cristi"
+    root.browseFolder = String(root.receivePath || "").trim() || root.defaultHome()
     root.browseStack = []
     root.browsePicked = []
     root.browseOpen = true
@@ -111,7 +118,8 @@ BarWidget {
       var value = JSON.parse(String(raw).trim())
       root.phase = value.state || "offline"
       root.message = value.message || root.phase
-      root.pendingTransfer = value.data || null
+      root.pendingTransfer = (value.data && value.data.sender) ? value.data : null
+      root.sendProgress = (value.data && value.data.total !== undefined) ? value.data : null
       if (root.phase === "receiving") {
         if (!root.receiveActive) {
           root.receiveActive = true
@@ -179,7 +187,7 @@ BarWidget {
     var command = ["/usr/bin/ac-dc", "ctl", op]
     if (op === "receive") {
       command.push("--name"); command.push(root.transferName.trim() || "Omarchy")
-      command.push("--directory"); command.push(root.receivePath.trim() || "/home/cristi/Downloads/Adhoc")
+      command.push("--directory"); command.push(root.receivePath.trim() || root.defaultReceivePath())
     }
     actionProc.command = command
     actionProc.running = true
@@ -324,7 +332,16 @@ BarWidget {
         ColumnLayout {
           Layout.fillWidth: true; spacing: Style.space(2)
           Text { text: "Adhoc Connection"; color: Color.foreground; font.family: root.font(Style.font.body); font.pixelSize: Style.font.body; font.bold: true }
-          Text { text: root.phase === "sending" ? "Transfer in progress…" : root.message; color: root.errorText.length > 0 ? Color.urgent : Qt.rgba(1,1,1,0.62); elide: Text.ElideRight; Layout.fillWidth: true; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
+          Text {
+            text: root.phase === "sending"
+              ? (root.sendProgress && root.sendProgress.total > 0
+                  ? ("Sending… " + Math.round(root.sendProgress.sent * 100 / root.sendProgress.total) + "%")
+                  : "Transfer in progress…")
+              : root.message
+            color: root.errorText.length > 0 ? Color.urgent : Qt.rgba(1,1,1,0.62)
+            elide: Text.ElideRight; Layout.fillWidth: true
+            font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption
+          }
         }
       }
 
@@ -345,11 +362,12 @@ BarWidget {
       RowLayout {
         Layout.fillWidth: true
         Text { text: "Send to"; color: Color.foreground; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption; font.bold: true }
+        Button { text: "Open folder"; onClicked: Quickshell.execDetached(["xdg-open", root.receivePath.trim() || root.defaultReceivePath()]) }
         Button { text: root.configOpen ? "Save" : "Settings"; onClicked: {
           if (root.configOpen) {
             var error = root.validateSettings()
             if (error.length > 0) { root.errorText = error; return }
-            root.persistSettings({ name: root.transferName.trim() || "Omarchy", directory: root.receivePath.trim() || "/home/cristi/Downloads/Adhoc" })
+            root.persistSettings({ name: root.transferName.trim() || "Omarchy", directory: root.receivePath.trim() || root.defaultReceivePath() })
           }
           root.configOpen = !root.configOpen
         } }
