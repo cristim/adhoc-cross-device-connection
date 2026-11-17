@@ -2,7 +2,7 @@
 use anyhow::{ensure, Context, Result};
 use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent};
 use std::{
-    net::{IpAddr, SocketAddr, SocketAddrV6},
+    net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
     time::Duration,
 };
 const SERVICE: &str = "_companion-link._tcp.local.";
@@ -37,6 +37,18 @@ pub async fn socket_target(host: &str, port: u16) -> Result<SocketAddr> {
         };
         ensure!(index > 0, "invalid IPv6 scope {zone}");
         return Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, index)));
+    }
+    // A link-local address names nothing without a link, and `connect` reports that
+    // only as EINVAL, so say which scope is missing and how to supply it.
+    if let Ok(ip) = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<Ipv6Addr>()
+    {
+        ensure!(
+            !ip.is_unicast_link_local(),
+            "IPv6 link-local {ip} needs an interface scope, e.g. {ip}%awdl0"
+        );
     }
     tokio::net::lookup_host((host, port))
         .await?
@@ -225,5 +237,30 @@ mod event_tests {
         assert!(from_events(&path, "02:11:22:33:44:55", "awdl0", 140_000).is_err());
         assert!(from_events(&path, "02:11:22:33:44:55", "awdl0", 99_999).is_err());
         assert!(from_events(&path, "02:11:22:33:44:55", "lo", 100_001).is_err());
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_unscoped_link_local_is_refused_with_the_remedy() {
+        let error = socket_target("fe80::c897:44ff:fe50:6963", 8770)
+            .await
+            .expect_err("an unscoped link-local must not be accepted");
+        let text = format!("{error:#}");
+        assert!(text.contains("needs an interface scope"), "{text}");
+        assert!(text.contains("%awdl0"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_scoped_link_local_keeps_working() {
+        let target = socket_target("fe80::1%lo", 8770).await.unwrap();
+        assert_eq!(target.port(), 8770);
+        match target {
+            SocketAddr::V6(v6) => assert_ne!(v6.scope_id(), 0, "scope was dropped"),
+            other => panic!("expected a v6 target, got {other}"),
+        }
     }
 }
