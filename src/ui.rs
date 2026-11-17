@@ -589,6 +589,7 @@ impl AcDcApp {
                 return;
             }
         };
+        let _ = self.save_prefs(cx);
         let _ = self
             .actions_tx
             .send(Action::Send(peer, prefs, files, links));
@@ -600,6 +601,7 @@ impl AcDcApp {
 
     fn on_toggle_ble(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.ble_wake_checked = !self.ble_wake_checked;
+        let _ = self.save_prefs(cx);
         cx.notify();
     }
 }
@@ -742,7 +744,19 @@ impl Render for AcDcApp {
                         .text_color(rgb(0x666666))
                         .child("Share files and links with nearby Apple devices"),
                 )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x666666))
+                        .child("Device name"),
+                )
                 .child(self.name.clone())
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x666666))
+                        .child("Receive folder"),
+                )
                 .child(self.directory.clone())
                 .child(
                     div()
@@ -906,10 +920,7 @@ pub fn run() -> Result<()> {
     let final_shutdown = shutdown.clone();
     application().run(move |cx: &mut App| {
         w::bind_text_input_keys(cx);
-        cx.bind_keys([
-            KeyBinding::new("escape", Quit, None),
-            KeyBinding::new("secondary-q", Quit, None),
-        ]);
+        cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
 
         let close_actions = shutdown.clone();
         cx.on_window_closed(move |cx, _window_id| {
