@@ -35,33 +35,36 @@ impl HandoffBle {
     /// begins at the first Continuity TLV (`0c ...`). We accept both framings:
     /// with the leading `4c 00` (raw HCI) and without (BlueZ ManufacturerData).
     pub fn parse(data: &[u8]) -> Option<Self> {
-        // Locate the 0x0c TLV. Two common shapes:
-        //   raw:   4c 00 0c len ...
-        //   bluez: 0c len ...   (company id already consumed)
         let body = if data.len() >= 3 && data[0] == 0x4c && data[1] == 0x00 {
             &data[2..]
         } else {
             data
         };
 
-        if body.len() < 2 || body[0] != TYPE_HANDOFF {
-            return None;
+        // Walk bounded Continuity TLVs (type(1) | len(1) | value(len)).
+        let mut pos = 0;
+        let mut hops = 0usize;
+        while pos < body.len() && hops < 16 {
+            hops += 1;
+            let tlv_type = *body.get(pos)?;
+            let len = *body.get(pos + 1)? as usize;
+            let val_start = pos + 2;
+            let val_end = val_start.checked_add(len)?;
+            let content = body.get(val_start..val_end)?;
+            if tlv_type == TYPE_HANDOFF {
+                if content.len() < 4 {
+                    return None;
+                }
+                return Some(HandoffBle {
+                    status: content[0],
+                    counter_iv: [content[1], content[2]],
+                    tag: [content[3]],
+                    ciphertext: content[4..].to_vec(),
+                });
+            }
+            pos = val_end;
         }
-        let len = body[1] as usize;
-        let content = body.get(2..2 + len)?;
-        if content.len() < 4 {
-            return None;
-        }
-        let status = content[0];
-        let counter_iv = [content[1], content[2]];
-        let tag = [content[3]];
-        let ciphertext = content[4..].to_vec();
-        Some(HandoffBle {
-            status,
-            counter_iv,
-            tag,
-            ciphertext,
-        })
+        None
     }
 }
 
@@ -180,6 +183,23 @@ mod tests {
         let mut data = vec![0x4c, 0x00, 0x0c, 0x0e, 0x08, 0x2a, 0x00, 0x99];
         data.extend_from_slice(&[0xde; 10]);
         assert!(HandoffBle::parse(&data).is_some());
+    }
+
+    #[test]
+    fn parses_handoff_after_preceding_continuity_tlv() {
+        // Nearby Info (0x10, len 2) followed by Handoff (0x0c, len 14).
+        let mut data = vec![0x10, 0x02, 0xaa, 0xbb, 0x0c, 0x0e, 0x08, 0x2a, 0x00, 0x99];
+        data.extend_from_slice(&[0xde; 10]);
+        let h = HandoffBle::parse(&data).expect("should find 0x0c after 0x10");
+        assert_eq!(h.counter_iv, [0x2a, 0x00]);
+    }
+
+    #[test]
+    fn rejects_truncated_tlv() {
+        // Preceding TLV claims 5 bytes, only 2 present.
+        assert!(HandoffBle::parse(&[0x10, 0x05, 0xaa, 0xbb]).is_none());
+        // Handoff TLV claims 14 bytes, truncated.
+        assert!(HandoffBle::parse(&[0x0c, 0x0e, 0x08, 0x2a, 0x00]).is_none());
     }
 
     #[test]

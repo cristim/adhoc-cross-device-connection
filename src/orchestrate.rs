@@ -30,7 +30,16 @@ pub async fn run(cfg: AutoConfig) -> Result<()> {
         .with_events(tx);
     let process = async {
         while let Some(event) = rx.recv().await {
-            tracing::info!(device=%event.device, key=%event.key_id, activity=%event.activity,"copy detected");
+            tracing::info!(
+                device=%event.device,
+                key=%event.key_id,
+                activity=%event.activity,
+                flags=event.flags,
+                iv=%hex::encode(event.iv),
+                adv_len=event.raw_adv.len(),
+                timestamp_ms=event.timestamp_ms,
+                "copy detected"
+            );
             let result = tokio::time::timeout(Duration::from_secs(40), async {
                 health::require_radio().await?;
                 let (host, port) = discover::resolve(
@@ -46,6 +55,7 @@ pub async fn run(cfg: AutoConfig) -> Result<()> {
                     PairingIdentity::load(&cfg.identity_path)?,
                 )
                 .await?;
+                tracing::info!(peer=?session.peer_label(), "Pair-Verify authenticated");
                 session
                     .system_info_exchange(&SystemInfo {
                         name: "ac-dc".into(),
