@@ -9,6 +9,7 @@ mod daemon;
 mod discover;
 mod gcm;
 mod health;
+mod ipc;
 mod keystore;
 mod opack;
 mod orchestrate;
@@ -47,18 +48,22 @@ enum Cmd {
         host: Option<String>,
         #[arg(long)]
         port: Option<u16>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         directory: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         file: Vec<PathBuf>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         link: Vec<String>,
         #[arg(long)]
         seconds: Option<u64>,
         #[arg(long)]
         ble_wake: Option<bool>,
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long)]
+        once: bool,
     },
     /// Open the native Airdrop-compatible send/receive window.
     Ui,
@@ -262,23 +267,39 @@ async fn command(cmd: Cmd) -> Result<()> {
             link,
             seconds,
             ble_wake,
+            mode,
+            once,
         } => {
-            let reply = daemon::ctl(
-                daemon::default_socket(),
-                daemon::Request {
-                    op,
-                    host,
-                    port,
-                    name,
-                    directory,
-                    files: file,
-                    links: link,
-                    seconds,
-                    ble_wake,
-                },
-            )
-            .await?;
-            println!("{}", serde_json::to_string(&reply)?);
+            if op == "subscribe" {
+                daemon::ctl_subscribe(daemon::default_socket()).await?;
+            } else {
+                let parsed_mode = match mode.as_deref() {
+                    Some("timed") => Some(ipc::ReceiveMode::Timed),
+                    Some("once") => Some(ipc::ReceiveMode::Once),
+                    Some("always") => Some(ipc::ReceiveMode::Always),
+                    Some(other) => anyhow::bail!("unknown receive mode: {other}"),
+                    None => None,
+                };
+                let reply = daemon::ctl(
+                    daemon::default_socket(),
+                    daemon::Request {
+                        op,
+                        host,
+                        port,
+                        name,
+                        directory,
+                        files: file,
+                        links: link,
+                        seconds,
+                        ble_wake,
+                        mode: parsed_mode,
+                        once: once.then_some(true),
+                        clipboard: None,
+                    },
+                )
+                .await?;
+                println!("{}", serde_json::to_string(&reply)?);
+            }
         }
         Cmd::Peers {
             iface,

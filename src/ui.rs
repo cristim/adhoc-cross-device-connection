@@ -195,6 +195,7 @@ async fn engine(
                         links: Vec::new(),
                         seconds: Some(600),
                         ble_wake: Some(p.ble_wake),
+                        ..Default::default()
                     },
                 )
                 .await;

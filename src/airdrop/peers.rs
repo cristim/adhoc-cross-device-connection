@@ -12,6 +12,22 @@ impl Drop for Browse {
         let _ = self.0.shutdown();
     }
 }
+const MAX_INSTANCE_LEN: usize = 128;
+
+pub(crate) fn sanitize_instance(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_INSTANCE_LEN)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "Airdrop-compatible".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Peer>> {
     super::identity(identity).context("load Pair-Verify identity")?;
     let d = Browse(mdns_sd::ServiceDaemon::new().context("create mDNS browser")?);
@@ -146,7 +162,7 @@ pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Pe
             .await??;
             Ok::<_, anyhow::Error>(Peer {
                 name,
-                instance,
+                instance: sanitize_instance(&instance),
                 address,
             })
         });
@@ -163,4 +179,20 @@ pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Pe
     }
     peers.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(peers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_instance_strips_controls_and_bounds_length() {
+        assert_eq!(
+            sanitize_instance("  \x00\n\x1b[31m  "),
+            "Airdrop-compatible"
+        );
+        assert_eq!(sanitize_instance("Mac\nBook\tPro"), "MacBookPro");
+        let long = "a".repeat(300);
+        assert_eq!(sanitize_instance(&long).len(), MAX_INSTANCE_LEN);
+    }
 }
