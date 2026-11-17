@@ -1,6 +1,6 @@
 //! Native GPUI desktop controls. Protocol and radio work runs on a private Tokio runtime.
-use crate::airdrop::{self, peers::Peer};
-use crate::daemon;
+use crate::airdrop::peers::Peer;
+use crate::daemon::{self, DaemonSnapshot, ReceiveMode};
 use crate::ui_widgets as w;
 use anyhow::{Context as _, Result};
 use gpui::{
@@ -58,24 +58,112 @@ fn home() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_default()
 }
-fn identity() -> PathBuf {
-    home().join(".local/share/ac-dc/airdrop")
+
+fn format_radio_banner(snap: &DaemonSnapshot) -> String {
+    match snap.phase.as_str() {
+        "starting" => "Radio: starting AWDL…".into(),
+        "receiving" => {
+            let win = match snap.window.as_ref() {
+                Some(w) => match w.mode {
+                    ReceiveMode::Once => "Once".to_string(),
+                    ReceiveMode::Always => "Always".to_string(),
+                    ReceiveMode::Timed => match w.remaining_seconds {
+                        Some(rem) => format!("{}:{:02} remaining", rem / 60, rem % 60),
+                        None => "Timed".to_string(),
+                    },
+                },
+                None => "Active".to_string(),
+            };
+            let vis = match snap.radio.visible {
+                Some(true) => "visible",
+                Some(false) => "not advertising",
+                None => "radio unknown",
+            };
+            format!("Radio: {win} · {vis}")
+        }
+        "sending" => {
+            if let Some(t) = snap.active_transfer.as_ref() {
+                match t.total_bytes {
+                    Some(total) if total > 0 => format!(
+                        "Sending to {} ({}%)",
+                        t.target,
+                        (t.sent_bytes.saturating_mul(100) / total).min(100)
+                    ),
+                    _ => format!("Sending to {}…", t.target),
+                }
+            } else {
+                "Sending…".into()
+            }
+        }
+        "error" => snap
+            .last_error
+            .as_deref()
+            .map(|e| format!("Error: {e}"))
+            .unwrap_or_else(|| "Radio error".into()),
+        _ => "Radio window closed".into(),
+    }
 }
-async fn command(program: &str, args: &[&str]) -> Result<()> {
-    let result = tokio::time::timeout(
-        Duration::from_secs(120),
-        tokio::process::Command::new(program)
-            .args(args)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await??;
-    anyhow::ensure!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr).trim()
-    );
-    Ok(())
+
+fn apply_snapshot(
+    snap: &DaemonSnapshot,
+    last_pending: &mut Option<(String, Vec<String>)>,
+    events: &mpsc::Sender<Event>,
+) {
+    let _ = events.send(Event::Radio(format_radio_banner(snap)));
+    let pending = snap
+        .pending
+        .as_ref()
+        .map(|p| (p.sender.clone(), p.items.clone()));
+    if pending != *last_pending {
+        match &pending {
+            Some((sender, items)) => {
+                let _ = events.send(Event::Incoming(sender.clone(), items.clone()));
+            }
+            None => {
+                let _ = events.send(Event::IncomingAllCleared);
+            }
+        }
+        *last_pending = pending;
+    }
+    if let Some(err) = snap.last_error.as_ref() {
+        let _ = events.send(Event::Status(format!("Error: {err}")));
+    } else if let Some(t) = snap.active_transfer.as_ref() {
+        let msg = match t.total_bytes {
+            Some(total) if total > 0 => format!(
+                "Sending to {}: {:.1} / {:.1} MiB ({}%)",
+                t.target,
+                t.sent_bytes as f64 / 1_048_576.0,
+                total as f64 / 1_048_576.0,
+                (t.sent_bytes.saturating_mul(100) / total).min(100)
+            ),
+            _ => format!("Preparing transfer for {}…", t.target),
+        };
+        let _ = events.send(Event::Status(msg));
+    }
+}
+
+async fn subscribe_loop(socket: PathBuf, events: mpsc::Sender<Event>) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut last_pending: Option<(String, Vec<String>)> = None;
+    loop {
+        if let Ok(mut stream) = tokio::net::UnixStream::connect(&socket).await {
+            if stream.write_all(b"{\"op\":\"subscribe\"}\n").await.is_ok() {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while let Ok(n) = reader.read_line(&mut line).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(snap) = serde_json::from_str::<DaemonSnapshot>(line.trim()) {
+                        apply_snapshot(&snap, &mut last_pending, &events);
+                    }
+                    line.clear();
+                }
+            }
+        }
+        let _ = events.send(Event::Radio("Daemon unavailable".into()));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 /// Recipient discovery is brokered by the root daemon. The full GUI must
@@ -101,98 +189,27 @@ async fn daemon_peers() -> Result<Vec<Peer>> {
     );
     Ok(serde_json::from_value(reply["data"].clone())?)
 }
-async fn radio_start() -> Result<()> {
-    let requested = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-    command(
-        "pkexec",
-        &[
-            "/usr/bin/systemctl",
-            "reload-or-restart",
-            "ac-dc-airdrop-radio.service",
-        ],
-    )
-    .await?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-    loop {
-        let announced = airdrop::radio_state().is_some_and(|s| {
-            s["expires_at"]
-                .as_u64()
-                .is_some_and(|end| end >= requested + 590)
-        });
-        if announced && crate::health::radio().await?["ready"] == true {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "Airdrop-compatible radio did not become ready; inspect journalctl -u ac-dc-airdrop-radio"
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
 async fn engine(
     mut actions: tokio::sync::mpsc::UnboundedReceiver<Action>,
     events: std::sync::mpsc::Sender<Event>,
 ) {
     let socket = daemon::default_socket();
-    let mut radio_owned = false;
-    let mut transfers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut browsing: Option<tokio::task::JoinHandle<()>> = None;
-    let mut last_pending: Option<(String, Vec<String>)> = None;
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let sub_task = tokio::spawn(subscribe_loop(socket.clone(), events.clone()));
     loop {
-        let action = tokio::select! {
-            action=actions.recv()=>{let Some(a)=action else{break};a},
-            _=tick.tick()=>{
-                let text=if let Some(state)=airdrop::radio_state(){
-                    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                    let remaining=state["expires_at"].as_u64().unwrap_or(now).saturating_sub(now);
-                    format!("Radio: {}:{:02} remaining · received frames: {} · TX completions: {}{}",remaining/60,remaining%60,state["received_frames"],state["tx_completions"],if state["phase"]=="data_observed"{" · traffic observed"}else{" · transport unproven"})
-                }else{"Radio window closed".into()};
-                let _=events.send(Event::Radio(text));
-                // The daemon is the receiver now; surface its pending transfer
-                // as an incoming card.
-                if let Ok(reply)=daemon::ctl(socket.clone(), daemon::request("status")).await {
-                    let pending = reply.data.as_ref().and_then(|d| {
-                        let sender = d.get("sender")?.as_str()?.to_string();
-                        let items = d.get("items")?.as_array()?.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect::<Vec<_>>();
-                        Some((sender, items))
-                    });
-                    if pending != last_pending {
-                        match &pending {
-                            Some((sender, items)) => {
-                                let _ =
-                                    events.send(Event::Incoming(sender.clone(), items.clone()));
-                            }
-                            None => {
-                                let _ = events.send(Event::IncomingAllCleared);
-                            }
-                        }
-                        last_pending = pending;
-                    }
-                }
-                continue;
-            }
+        let Some(action) = actions.recv().await else {
+            break;
         };
-        transfers.retain(|h| !h.is_finished());
         match action {
             Action::Start(p) => {
                 // Visibility is the daemon's job; it owns the radio window and
                 // the receiver, so no pkexec prompt is needed.
-                let _ = command("systemctl", &["--user", "stop", "ac-dc-receive.service"]).await;
                 let result = daemon::ctl(
                     socket.clone(),
                     daemon::Request {
                         op: "receive".into(),
-                        host: None,
-                        port: None,
                         name: Some(p.name),
                         directory: Some(p.directory),
-                        files: Vec::new(),
-                        links: Vec::new(),
                         seconds: Some(600),
                         ble_wake: Some(p.ble_wake),
                         ..Default::default()
@@ -211,27 +228,10 @@ async fn engine(
                     Err(e) => format!("Could not reach the ac-dc daemon: {e:#}"),
                 }));
             }
-            Action::Stop | Action::Quit => {
-                let quit = matches!(action, Action::Quit);
-                for h in transfers.drain(..) {
-                    h.abort();
-                    let _ = h.await;
-                }
+            Action::Stop => {
                 if let Some(h) = browsing.take() {
                     h.abort();
                     let _ = h.await;
-                }
-                if radio_owned {
-                    let result = command(
-                        "pkexec",
-                        &["/usr/bin/systemctl", "stop", "ac-dc-airdrop-radio.service"],
-                    )
-                    .await;
-                    radio_owned = false;
-                    let _ = events.send(Event::Status(match result {
-                        Ok(()) => "Airdrop-compatible stopped".into(),
-                        Err(e) => format!("Receiver stopped; radio cleanup: {e:#}"),
-                    }));
                 }
                 match daemon::ctl(socket.clone(), daemon::request("stop")).await {
                     Ok(reply) => {
@@ -239,23 +239,21 @@ async fn engine(
                             "stopped" => "Airdrop-compatible stopped".into(),
                             message => message.into(),
                         }));
-                        // The daemon has dropped its pending transfer, so the next
-                        // poll sees None == None and emits nothing: clear here or
-                        // the card stays with live approve/reject buttons.
-                        last_pending = None;
                         let _ = events.send(Event::IncomingAllCleared);
                     }
                     Err(e) => {
                         let _ = events.send(Event::Status(format!(
                             "Could not stop the ac-dc daemon: {e:#}"
                         )));
-                        // Leave last_pending alone: the daemon may still hold the
-                        // transfer, and resetting it would re-append the card.
                     }
                 }
-                if quit {
-                    break;
+            }
+            Action::Quit => {
+                if let Some(h) = browsing.take() {
+                    h.abort();
+                    let _ = h.await;
                 }
+                break;
             }
             Action::Approve(id) | Action::Decline(id) => {
                 let accepted = matches!(action, Action::Approve(_));
@@ -274,13 +272,12 @@ async fn engine(
                         )));
                     }
                 }
-                // If the pending transfer changed while deciding, drop the
-                // stale card so the next status poll repaints the current one.
-                last_pending = None;
                 let _ = events.send(Event::IncomingCleared(id));
             }
             Action::Browse => {
-                let _=events.send(Event::Status("Looking for nearby recipients. Set the Apple device to Everyone for 10 Minutes.".into()));
+                let _ = events.send(Event::Status(
+                    "Looking for nearby recipients. Set the Apple device to Everyone for 10 Minutes.".into(),
+                ));
                 if browsing.as_ref().is_some_and(|h| !h.is_finished()) {
                     continue;
                 }
@@ -298,57 +295,43 @@ async fn engine(
                     }
                 }));
             }
-            Action::Cancel => {
-                for h in transfers.drain(..) {
-                    h.abort();
-                    let _ = h.await;
+            Action::Cancel => match daemon::ctl(socket.clone(), daemon::request("cancel")).await {
+                Ok(reply) => {
+                    let _ = events.send(Event::Status(reply.message));
                 }
-                let _ = events.send(Event::Status("Outgoing transfer cancelled".into()));
-            }
+                Err(e) => {
+                    let _ = events.send(Event::Status(format!("Could not cancel transfer: {e:#}")));
+                }
+            },
             Action::Send(peer, p, files, links) => {
-                if !transfers.is_empty() {
-                    let _ = events.send(Event::Status(
-                        "A transfer is already running; cancel it before sending again".into(),
-                    ));
-                    continue;
-                }
-                if let Err(e) = radio_start().await {
-                    let _ = events.send(Event::Status(format!("Radio: {e:#}")));
-                    continue;
-                }
-                radio_owned = true;
-                let ev = events.clone();
-                transfers.push(tokio::spawn(async move {
-                    let _ = ev.send(Event::Status(format!(
-                        "Preparing transfer for {}…",
-                        peer.name
-                    )));
-                    let result = async {
-                        let client = airdrop::send::Client::new(peer.address, &identity())?;
-                        let(tx,mut progress)=tokio::sync::watch::channel((0u64,0u64));
-                        let transfer=client.transfer_with_progress(&p.name, files, links,Some(tx));
-                        let wake=crate::advertise::broadcast(crate::advertise::airdrop_wake(),600,100);
-                        tokio::pin!(transfer);tokio::pin!(wake);
-                        let mut wake_done=false;
-                        let mut interval=tokio::time::interval(Duration::from_millis(250));
-                        loop {tokio::select! {
-                            result=&mut transfer=>break result,
-                            result=&mut wake,if !wake_done=>{wake_done=true;if let Err(error)=result{tracing::warn!(%error,"Bluetooth wake failed");}},
-                            _=interval.tick()=>{let(sent,total)=*progress.borrow_and_update();if total>0{let _=ev.send(Event::Status(if sent==0 {format!("Waiting for {} to accept…",peer.name)}else if sent==total {format!("Upload sent to {}; waiting for confirmation…",peer.name)}else{format!("Sending to {}: {:.1} / {:.1} MiB ({}%)",peer.name,sent as f64/1048576.0,total as f64/1048576.0,sent*100/total)}));}}
-                        }}
+                let host = match peer.address {
+                    std::net::SocketAddr::V6(v6) if v6.scope_id() != 0 => {
+                        format!("{}%{}", v6.ip(), v6.scope_id())
                     }
-                    .await;
-                    let _ = ev.send(Event::Status(match result {
-                        Ok(()) => format!("Transfer delivered to {}", peer.name),
-                        Err(e) => format!("Transfer failed: {e:#}"),
-                    }));
+                    other => other.ip().to_string(),
+                };
+                let result = daemon::ctl(
+                    socket.clone(),
+                    daemon::Request {
+                        op: "send".into(),
+                        host: Some(host),
+                        port: Some(peer.address.port()),
+                        name: Some(p.name),
+                        files,
+                        links,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                let _ = events.send(Event::Status(match result {
+                    Ok(reply) if reply.ok => format!("Sending to {}…", peer.name),
+                    Ok(reply) => format!("Transfer failed: {}", reply.message),
+                    Err(e) => format!("Could not reach the ac-dc daemon: {e:#}"),
                 }));
             }
         }
     }
-    for h in transfers {
-        h.abort();
-    }
+    sub_task.abort();
     if let Some(h) = browsing {
         h.abort();
     }
@@ -949,9 +932,51 @@ pub fn run() -> Result<()> {
         .unwrap();
     });
 
-    // The window has closed. Tell the engine to tear down and join it so radio
-    // cleanup and pkexec stops complete before the runtime is dropped.
+    // The window has closed. Tell the engine to tear down local tasks and join it
+    // without stopping an active daemon receive window.
     let _ = final_shutdown.send(Action::Quit);
     runtime.block_on(worker)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::{PendingTransfer, RadioState, WindowState};
+
+    #[test]
+    fn apply_snapshot_emits_radio_and_pending_transitions() {
+        let (tx, rx) = mpsc::channel();
+        let mut last_pending = None;
+        let snap = DaemonSnapshot {
+            phase: "receiving".into(),
+            window: Some(WindowState {
+                mode: ReceiveMode::Timed,
+                remaining_seconds: Some(125),
+                expires_at_ms: None,
+            }),
+            radio: RadioState {
+                ready: true,
+                visible: Some(true),
+                reason: None,
+            },
+            pending: Some(PendingTransfer {
+                sender: "Test Mac".into(),
+                items: vec!["photo.jpg".into()],
+            }),
+            ..Default::default()
+        };
+        apply_snapshot(&snap, &mut last_pending, &tx);
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(matches!(&events[0], Event::Radio(s) if s == "Radio: 2:05 remaining · visible"));
+        assert!(
+            matches!(&events[1], Event::Incoming(s, items) if s == "Test Mac" && items == &vec!["photo.jpg".to_string()])
+        );
+
+        let cleared = DaemonSnapshot::default();
+        apply_snapshot(&cleared, &mut last_pending, &tx);
+        let events2: Vec<Event> = rx.try_iter().collect();
+        assert!(matches!(&events2[0], Event::Radio(s) if s == "Radio window closed"));
+        assert!(matches!(&events2[1], Event::IncomingAllCleared));
+    }
 }

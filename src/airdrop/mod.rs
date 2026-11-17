@@ -102,20 +102,6 @@ pub fn service_id(identity_dir: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     Ok(hex::encode(&Sha256::digest(cert.as_ref())[..6]))
 }
-pub fn radio_state() -> Option<serde_json::Value> {
-    let v: serde_json::Value =
-        serde_json::from_slice(&std::fs::read("/run/brcmfmac-awdl/discovery.json").ok()?).ok()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    (v["active"] == true
-        && v["expires_at"].as_u64().is_some_and(|t| t > now)
-        && v["updated_at"]
-            .as_u64()
-            .is_some_and(|t| t <= now && now - t < 15))
-    .then_some(v)
-}
 fn tls(dir: &Path) -> Result<TlsAcceptor> {
     let (cert, key) = identity(dir)?;
     let config = rustls::ServerConfig::builder()
