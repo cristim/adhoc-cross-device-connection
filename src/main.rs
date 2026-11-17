@@ -60,6 +60,10 @@ enum Cmd {
         seconds: Option<u64>,
         #[arg(long)]
         ble_wake: Option<bool>,
+        #[arg(long)]
+        once: bool,
+        #[arg(long)]
+        contacts_only: bool,
     },
     /// Open the native Airdrop-compatible send/receive window.
     Ui,
@@ -152,6 +156,9 @@ enum Cmd {
         /// Advertise a Bluetooth wake hint during receiving.
         #[arg(long)]
         ble_wake: bool,
+        /// Require Apple Contacts Only validation_record.cms (401 without SenderRecordData).
+        #[arg(long)]
+        contacts_only: bool,
     },
     /// Receive an exported `keys.json` from a Mac over Bluetooth LE.
     ///
@@ -263,6 +270,8 @@ async fn command(cmd: Cmd) -> Result<()> {
             link,
             seconds,
             ble_wake,
+            once,
+            contacts_only,
         } => {
             let reply = daemon::ctl(
                 daemon::default_socket(),
@@ -276,6 +285,8 @@ async fn command(cmd: Cmd) -> Result<()> {
                     links: link,
                     seconds,
                     ble_wake,
+                    once: once.then_some(true),
+                    contacts_only: contacts_only.then_some(true),
                 },
             )
             .await?;
@@ -317,10 +328,16 @@ async fn command(cmd: Cmd) -> Result<()> {
             once,
             notify,
             ble_wake,
+            contacts_only,
         } => {
             airdrop::run(airdrop::Config {
                 radio_managed: false,
                 ble_wake,
+                visibility: if contacts_only {
+                    airdrop::VisibilityMode::ContactsOnly
+                } else {
+                    airdrop::VisibilityMode::Everyone
+                },
                 approval: None,
                 iface,
                 directory,

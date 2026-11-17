@@ -4,7 +4,9 @@ use anyhow::{ensure, Context, Result};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::{body::Bytes, client::conn::http1::SendRequest, Request};
 use hyper_util::rt::TokioIo;
-use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
+use openssl::pkey::PKey;
+use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
+use openssl::x509::X509;
 use std::{io, net::SocketAddr, path::Path, pin::Pin, time::Duration};
 use tokio::net::TcpStream;
 
@@ -15,12 +17,15 @@ pub fn bytes(body: Vec<u8>) -> Body {
         .boxed_unsync()
 }
 pub fn connector(identity: &Path) -> Result<SslConnector> {
+    let bundle = super::identity_bundle(identity)?;
+    let cert = X509::from_der(&bundle.cert)?;
+    let key = PKey::private_key_from_pkcs8(bundle.key.secret_der())?;
     let mut tls = SslConnector::builder(SslMethod::tls_client())?;
     tls.set_min_proto_version(Some(SslVersion::TLS1_2))?;
-    // Everyone mode uses self-signed identities, not Apple account validation.
+    // AirDrop uses Apple/self-signed peer certs over AWDL, verified via CMS records in Contacts Only mode.
     tls.set_verify(SslVerifyMode::NONE);
-    tls.set_certificate_chain_file(identity.join("certificate.pem"))?;
-    tls.set_private_key_file(identity.join("key.pem"), SslFiletype::PEM)?;
+    tls.set_certificate(&cert)?;
+    tls.set_private_key(&key)?;
     tls.check_private_key()?;
     Ok(tls.build())
 }

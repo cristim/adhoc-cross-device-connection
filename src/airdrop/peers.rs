@@ -135,6 +135,9 @@ pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Pe
             candidates.retain(|address, _| address.ip() != own);
         }
     }
+    if let Ok(own_id) = super::service_id(identity) {
+        candidates.retain(|_, inst| !is_own_instance(inst, &own_id));
+    }
     let mut work = tokio::task::JoinSet::new();
     for (address, instance) in candidates.into_iter().take(32) {
         let id = identity.to_owned();
@@ -163,4 +166,25 @@ pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Pe
     }
     peers.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(peers)
+}
+
+fn is_own_instance(instance: &str, own_id: &str) -> bool {
+    instance == own_id || instance.starts_with(&format!("{own_id}."))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn filters_own_service_id_instances() {
+        let own = "aabbccddeeff";
+        assert!(super::is_own_instance(own, own));
+        assert!(super::is_own_instance(
+            "aabbccddeeff._airdrop._tcp.local.",
+            own
+        ));
+        assert!(!super::is_own_instance(
+            "112233445566._airdrop._tcp.local.",
+            own
+        ));
+    }
 }

@@ -15,19 +15,25 @@ pub struct Client {
     tls: openssl::ssl::SslConnector,
     address: SocketAddr,
     sender_id: String,
+    record: Option<Vec<u8>>,
 }
 impl Client {
     pub fn new(address: SocketAddr, identity_dir: &Path) -> Result<Self> {
-        super::identity(identity_dir)?;
+        let bundle = super::identity_bundle(identity_dir)?;
         Ok(Self {
             tls: super::client_http::connector(identity_dir)?,
             address,
             sender_id: super::service_id(identity_dir)?,
+            record: bundle.record,
         })
     }
     pub async fn discover(&self) -> Result<String> {
         let mut session = super::client_http::Session::connect(self.address, &self.tls).await?;
-        let payload = plist(Dictionary::new())?;
+        let mut dict = Dictionary::new();
+        if let Some(rec) = &self.record {
+            dict.insert("SenderRecordData".into(), Value::Data(rec.clone()));
+        }
+        let payload = plist(dict)?;
         let size = payload.len() as u64;
         let bytes = session
             .post(
@@ -92,6 +98,9 @@ impl Client {
         ask.insert("SenderID".into(), self.sender_id.clone().into());
         ask.insert("BundleID".into(), "com.apple.finder".into());
         ask.insert("ConvertMediaFormats".into(), false.into());
+        if let Some(rec) = &self.record {
+            ask.insert("SenderRecordData".into(), Value::Data(rec.clone()));
+        }
         let mut transfer_id = Dictionary::new();
         transfer_id.insert("id".into(), upload.transfer_id.clone().into());
         ask.insert("TransferID".into(), Value::Dictionary(transfer_id));

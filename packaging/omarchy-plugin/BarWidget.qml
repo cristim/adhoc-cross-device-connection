@@ -22,6 +22,8 @@ BarWidget {
   property string errorText: ""
   property string transferName: String(setting("name", "Omarchy"))
   property string receivePath: String(setting("directory", "/home/cristi/Downloads/Adhoc"))
+  property bool contactsOnly: Boolean(setting("contactsOnly", false))
+  property bool receiveOnce: Boolean(setting("receiveOnce", false))
   property bool receiveActive: false
   property int remainingSeconds: 0
   property var pendingTransfer: null
@@ -180,6 +182,8 @@ BarWidget {
     if (op === "receive") {
       command.push("--name"); command.push(root.transferName.trim() || "Omarchy")
       command.push("--directory"); command.push(root.receivePath.trim() || "/home/cristi/Downloads/Adhoc")
+      if (root.receiveOnce) command.push("--once")
+      if (root.contactsOnly) command.push("--contacts-only")
     }
     actionProc.command = command
     actionProc.running = true
@@ -335,7 +339,7 @@ BarWidget {
         Text { text: "Receive"; color: Color.foreground; font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption; font.bold: true }
         Button {
           Layout.fillWidth: true
-          text: root.receiveActive ? ("Stop receive · " + root.formatRemaining()) : "Receive 10 min"
+          text: root.receiveActive ? ("Stop receive · " + root.formatRemaining()) : (root.receiveOnce ? "Receive 1 file" : "Receive 10 min")
           selected: root.receiveActive
           enabled: !root.busy
           onClicked: root.startAction(root.receiveActive ? "stop" : "receive")
@@ -349,7 +353,7 @@ BarWidget {
           if (root.configOpen) {
             var error = root.validateSettings()
             if (error.length > 0) { root.errorText = error; return }
-            root.persistSettings({ name: root.transferName.trim() || "Omarchy", directory: root.receivePath.trim() || "/home/cristi/Downloads/Adhoc" })
+            root.persistSettings({ name: root.transferName.trim() || "Omarchy", directory: root.receivePath.trim() || "/home/cristi/Downloads/Adhoc", contactsOnly: root.contactsOnly, receiveOnce: root.receiveOnce })
           }
           root.configOpen = !root.configOpen
         } }
@@ -360,6 +364,16 @@ BarWidget {
         Layout.fillWidth: true; spacing: Style.space(5)
         TextField { Layout.fillWidth: true; placeholderText: "Device name"; text: root.transferName; onTextChanged: root.transferName = text }
         TextField { Layout.fillWidth: true; placeholderText: "Receive folder"; text: root.receivePath; onTextChanged: root.receivePath = text }
+        RowLayout {
+          Layout.fillWidth: true; spacing: Style.space(4)
+          Button { Layout.fillWidth: true; text: "Everyone"; selected: !root.contactsOnly; onClicked: root.contactsOnly = false }
+          Button { Layout.fillWidth: true; text: "Contacts Only"; selected: root.contactsOnly; onClicked: root.contactsOnly = true }
+        }
+        RowLayout {
+          Layout.fillWidth: true; spacing: Style.space(4)
+          Button { Layout.fillWidth: true; text: "10 min"; selected: !root.receiveOnce; onClicked: root.receiveOnce = false }
+          Button { Layout.fillWidth: true; text: "1 file (Once)"; selected: root.receiveOnce; onClicked: root.receiveOnce = true }
+        }
         Text { text: "Defaults: Omarchy • ~/Downloads/Adhoc"; color: Qt.rgba(1,1,1,0.45); font.family: root.font(Style.font.caption); font.pixelSize: Style.font.caption }
       }
 

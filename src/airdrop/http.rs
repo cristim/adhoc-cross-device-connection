@@ -158,14 +158,19 @@ async fn read_inner<S: AsyncRead + AsyncWrite + Unpin>(
         upload,
     })
 }
-pub async fn respond<S: AsyncWrite + Unpin>(io: &mut S, status: u16, body: &[u8]) -> Result<()> {
-    let reason = match status {
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         415 => "Unsupported Media Type",
         _ => "Internal Server Error",
-    };
+    }
+}
+
+pub async fn respond<S: AsyncWrite + Unpin>(io: &mut S, status: u16, body: &[u8]) -> Result<()> {
+    let reason = reason_phrase(status);
     io.write_all(format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",body.len()).as_bytes()).await?;
     io.write_all(body).await?;
     io.flush().await?;
@@ -179,13 +184,7 @@ pub async fn respond_close<S: AsyncWrite + Unpin>(
     status: u16,
     body: &[u8],
 ) -> Result<()> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        415 => "Unsupported Media Type",
-        _ => "Internal Server Error",
-    };
+    let reason = reason_phrase(status);
     io.write_all(format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
