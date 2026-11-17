@@ -73,6 +73,10 @@ pub struct Request {
     pub seconds: Option<u64>,
     #[serde(default)]
     pub ble_wake: Option<bool>,
+    #[serde(default)]
+    pub once: Option<bool>,
+    #[serde(default)]
+    pub contacts_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -192,12 +196,27 @@ async fn handle(stream: UnixStream, state: Arc<Mutex<State>>) -> Result<()> {
 }
 
 async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
+    start_receive_with_identity(state, request, std::path::Path::new(IDENTITY)).await
+}
+
+async fn start_receive_with_identity(
+    state: Arc<Mutex<State>>,
+    request: Request,
+    identity_dir: &std::path::Path,
+) -> Reply {
     let directory = request
         .directory
         .unwrap_or_else(|| PathBuf::from(DIRECTORY));
     let name = request.name.unwrap_or_else(|| "Omarchy".into());
     let seconds = request.seconds.unwrap_or(600);
     let ble_wake = request.ble_wake.unwrap_or(true);
+    let once = request.once.unwrap_or(false);
+    let contacts_only = request.contacts_only.unwrap_or(false);
+    let visibility = if contacts_only {
+        airdrop::VisibilityMode::ContactsOnly
+    } else {
+        airdrop::VisibilityMode::Everyone
+    };
     let mut s = state.lock().await;
     if !airdrop::RECEIVE_SECONDS.contains(&seconds) {
         return Reply {
@@ -206,6 +225,29 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
             message: airdrop::receive_seconds_error(),
             data: None,
         };
+    }
+    if contacts_only {
+        match airdrop::has_apple_record(identity_dir) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Reply {
+                    ok: false,
+                    state: s.phase.clone(),
+                    message:
+                        "Contacts Only mode requires validation_record.cms in identity directory"
+                            .into(),
+                    data: None,
+                };
+            }
+            Err(e) => {
+                return Reply {
+                    ok: false,
+                    state: s.phase.clone(),
+                    message: format!("invalid identity for Contacts Only: {e:#}"),
+                    data: None,
+                };
+            }
+        }
     }
     if s.task.as_ref().is_some_and(|t| !t.is_finished()) {
         return Reply {
@@ -234,9 +276,10 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
                 name,
                 port: 8771,
                 seconds,
-                once: false,
+                once,
                 notify: true,
                 open_destination: false,
+                visibility,
             });
             tokio::pin!(receive);
             let result = loop {
@@ -458,6 +501,8 @@ pub fn request(op: impl Into<String>) -> Request {
         links: Vec::new(),
         seconds: None,
         ble_wake: None,
+        once: None,
+        contacts_only: None,
     }
 }
 
@@ -471,6 +516,24 @@ mod tests {
             task: None,
             pending: None,
         }))
+    }
+
+    #[tokio::test]
+    async fn start_receive_rejects_contacts_only_without_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = idle_state();
+        let mut req = request("receive");
+        req.contacts_only = Some(true);
+        let reply = start_receive_with_identity(state.clone(), req, dir.path()).await;
+        assert!(!reply.ok);
+        assert!(
+            reply.message.contains("validation_record.cms"),
+            "unexpected message: {}",
+            reply.message
+        );
+        let s = state.lock().await;
+        assert!(s.task.is_none());
+        assert_eq!(s.phase, "idle");
     }
 
     #[tokio::test]
