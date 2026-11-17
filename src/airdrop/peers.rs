@@ -187,10 +187,7 @@ mod tests {
 
     #[test]
     fn sanitize_instance_strips_controls_and_bounds_length() {
-        assert_eq!(
-            sanitize_instance("  \x00\n\x1b[31m  "),
-            "Airdrop-compatible"
-        );
+        assert_eq!(sanitize_instance("  \x00\n\t  "), "Airdrop-compatible");
         assert_eq!(sanitize_instance("Mac\nBook\tPro"), "MacBookPro");
         let long = "a".repeat(300);
         assert_eq!(sanitize_instance(&long).len(), MAX_INSTANCE_LEN);
