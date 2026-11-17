@@ -115,6 +115,15 @@ enum Cmd {
         #[arg(long)]
         identity: Option<PathBuf>,
     },
+    /// Collect a diagnostic report or toggle persistent daemon debug logging.
+    Debug {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+    },
     /// Report observed AWDL state; link readiness is not proof of transport.
     Status {
         #[arg(long)]
@@ -368,6 +377,26 @@ async fn command(cmd: Cmd) -> Result<()> {
                     serde_json::to_string_pretty(&report)?
                 }
             );
+        }
+        Cmd::Debug {
+            json,
+            enable,
+            disable,
+        } => {
+            if enable || disable {
+                health::set_daemon_debug(enable)?;
+                println!(
+                    "{}",
+                    if enable {
+                        "Debug logging enabled for ac-dc-daemon.service."
+                    } else {
+                        "Debug logging disabled for ac-dc-daemon.service."
+                    }
+                );
+            } else {
+                let report = health::debug_report(&daemon::default_socket()).await;
+                print!("{}", health::format_debug_report(&report, json)?);
+            }
         }
         Cmd::Status { json } => {
             let report = health::radio().await?;

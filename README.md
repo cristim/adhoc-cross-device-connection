@@ -151,16 +151,16 @@ Normal commands emit compact JSON responses on stdout; diagnostic logs go to
 stderr so the widget and scripts remain machine-readable. Increase logging for
 one invocation with `-v` (debug) or `-vv` (trace):
 
-The installed `ac-dc-debug` helper automates the service setup and prints a
-health report in one pass. It asks for authentication once through `pkexec`:
+The built-in `ac-dc debug` subcommand prints a health report (and `--enable` /
+`--disable` toggles persistent daemon debug logging via `pkexec`):
 
 ```sh
-ac-dc-debug
+ac-dc debug
 ```
 
-It checks the daemon, socket ownership, CLI status, recipient discovery, AWDL,
-and the last two minutes of daemon logs. Disable the persistent debug override
-later with `ac-dc-debug --disable`.
+It checks the daemon, socket ownership, CLI status, AWDL health, and the last
+two minutes of daemon logs (use `--json` for machine-readable output). Disable
+the persistent debug override later with `ac-dc debug --disable`.
 
 ```sh
 ac-dc -v ctl status

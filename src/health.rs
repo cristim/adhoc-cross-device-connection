@@ -63,3 +63,218 @@ pub async fn report(keys: Option<&std::path::Path>, identity: Option<&std::path:
     }
     json!({"ready":missing.is_empty(),"missing":missing,"radio":radio.ok(),"protocol_validated":false})
 }
+
+const DEBUG_DROPIN_DIR: &str = "/etc/systemd/system/ac-dc-daemon.service.d";
+const DEBUG_DROPIN_FILE: &str = "/etc/systemd/system/ac-dc-daemon.service.d/debug.conf";
+
+#[derive(Debug, serde::Serialize)]
+pub struct DebugReport {
+    pub daemon_active: String,
+    pub socket_present: bool,
+    pub socket_info: String,
+    pub ctl_status: Option<serde_json::Value>,
+    pub ctl_error: Option<String>,
+    pub radio: Option<Value>,
+    pub radio_error: Option<String>,
+    pub journal_tail: Vec<String>,
+}
+
+pub fn redact_sensitive(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("private_key")
+        || lower.contains("pasteboard")
+        || lower.contains("key_hex")
+        || lower.contains("secret")
+        || lower.contains("token")
+    {
+        "[redacted sensitive log line]".to_string()
+    } else {
+        line.to_string()
+    }
+}
+
+pub fn set_daemon_debug(enable: bool) -> Result<()> {
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } != 0 {
+        let exe = std::env::current_exe().context("resolve ac-dc binary path")?;
+        let flag = if enable { "--enable" } else { "--disable" };
+        let status = std::process::Command::new("pkexec")
+            .arg(exe)
+            .args(["debug", flag])
+            .status()
+            .context("invoke pkexec for ac-dc debug")?;
+        ensure!(status.success(), "pkexec exited with {status}");
+        return Ok(());
+    }
+
+    if enable {
+        std::fs::create_dir_all(DEBUG_DROPIN_DIR)
+            .with_context(|| format!("create {DEBUG_DROPIN_DIR}"))?;
+        std::fs::write(
+            DEBUG_DROPIN_FILE,
+            "[Service]\nEnvironment=RUST_LOG=ac_dc=debug\n",
+        )
+        .with_context(|| format!("write {DEBUG_DROPIN_FILE}"))?;
+    } else if std::path::Path::new(DEBUG_DROPIN_FILE).exists() {
+        std::fs::remove_file(DEBUG_DROPIN_FILE)
+            .with_context(|| format!("remove {DEBUG_DROPIN_FILE}"))?;
+    }
+
+    let reload = std::process::Command::new("systemctl")
+        .arg("daemon-reload")
+        .status()
+        .context("run systemctl daemon-reload")?;
+    ensure!(reload.success(), "systemctl daemon-reload failed: {reload}");
+    let restart = std::process::Command::new("systemctl")
+        .args(["restart", "ac-dc-daemon.service"])
+        .status()
+        .context("restart ac-dc-daemon.service")?;
+    ensure!(restart.success(), "systemctl restart failed: {restart}");
+    Ok(())
+}
+
+pub async fn debug_report(socket: &std::path::Path) -> DebugReport {
+    let daemon_active = tokio::process::Command::new("systemctl")
+        .args(["is-active", "ac-dc-daemon.service"])
+        .output()
+        .await
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|e| format!("unavailable ({e})"));
+
+    let (socket_present, socket_info) = match std::fs::metadata(socket) {
+        Ok(meta) => {
+            #[cfg(unix)]
+            let info = {
+                use std::os::unix::fs::MetadataExt;
+                format!(
+                    "uid={} gid={} mode={:o} path={}",
+                    meta.uid(),
+                    meta.gid(),
+                    meta.mode() & 0o777,
+                    socket.display()
+                )
+            };
+            #[cfg(not(unix))]
+            let info = format!("present path={}", socket.display());
+            (true, info)
+        }
+        Err(_) => (false, format!("MISSING: {}", socket.display())),
+    };
+
+    let (ctl_status, ctl_error) =
+        match crate::daemon::ctl(socket.to_path_buf(), crate::daemon::request("status")).await {
+            Ok(reply) => (serde_json::to_value(reply).ok(), None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        };
+
+    let (radio, radio_error) = match radio().await {
+        Ok(r) => (Some(r), None),
+        Err(e) => (None, Some(format!("{e:#}"))),
+    };
+
+    let journal_tail = tokio::process::Command::new("journalctl")
+        .args([
+            "-u",
+            "ac-dc-daemon.service",
+            "--since",
+            "2 minutes ago",
+            "--no-pager",
+            "-o",
+            "short-precise",
+            "-n",
+            "40",
+        ])
+        .output()
+        .await
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(redact_sensitive)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    DebugReport {
+        daemon_active,
+        socket_present,
+        socket_info,
+        ctl_status,
+        ctl_error,
+        radio,
+        radio_error,
+        journal_tail,
+    }
+}
+
+pub fn format_debug_report(report: &DebugReport, json: bool) -> Result<String> {
+    if json {
+        return Ok(serde_json::to_string_pretty(report)?);
+    }
+    let mut out = String::new();
+    out.push_str(&format!("== Daemon ==\n{}\n", report.daemon_active));
+    out.push_str(&format!("\n== Control socket ==\n{}\n", report.socket_info));
+    out.push_str("\n== CLI status ==\n");
+    if let Some(status) = &report.ctl_status {
+        out.push_str(&serde_json::to_string(status)?);
+        out.push('\n');
+    } else if let Some(err) = &report.ctl_error {
+        out.push_str(&format!("error: {err}\n"));
+    }
+    out.push_str("\n== AWDL health ==\n");
+    if let Some(radio) = &report.radio {
+        out.push_str(&serde_json::to_string(radio)?);
+        out.push('\n');
+    } else if let Some(err) = &report.radio_error {
+        out.push_str(&format!("error: {err}\n"));
+    }
+    if !report.journal_tail.is_empty() {
+        out.push_str("\n== Recent daemon journal ==\n");
+        for line in &report.journal_tail {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_sensitive_masks_secret_bearing_lines() {
+        assert_eq!(
+            redact_sensitive("loaded private_key=deadbeef"),
+            "[redacted sensitive log line]"
+        );
+        assert_eq!(
+            redact_sensitive("pasteboard item text=secret"),
+            "[redacted sensitive log line]"
+        );
+        assert_eq!(
+            redact_sensitive("ac-dc daemon listening"),
+            "ac-dc daemon listening"
+        );
+    }
+
+    #[test]
+    fn format_debug_report_supports_json_and_text() {
+        let report = DebugReport {
+            daemon_active: "active".into(),
+            socket_present: true,
+            socket_info: "uid=0 gid=998 mode=660 path=/run/ac-dc/control.sock".into(),
+            ctl_status: Some(json!({"ok": true, "state": "idle"})),
+            ctl_error: None,
+            radio: Some(json!({"ready": false, "reason": "no_awdl0"})),
+            radio_error: None,
+            journal_tail: vec!["line1".into()],
+        };
+        let text = format_debug_report(&report, false).unwrap();
+        assert!(text.contains("== Daemon ==\nactive"));
+        assert!(text.contains("== Control socket =="));
+        let json_str = format_debug_report(&report, true).unwrap();
+        let parsed: Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["daemon_active"], "active");
+        assert_eq!(parsed["socket_present"], true);
+    }
+}
