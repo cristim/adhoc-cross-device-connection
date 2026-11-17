@@ -2,17 +2,54 @@
   "schemaVersion": 1,
   "id": "org.omarchy.adhoccrossdeviceconnection",
   "name": "Adhoc Cross-Device Connection",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "ac-dc",
   "license": "MIT",
-  "description": "Airdrop-compatible file transfer with nearby Apple devices",
+  "description": "AirDrop-compatible file transfer and extensible cross-device sync for Omarchy.",
   "kinds": ["bar-widget"],
-  "entryPoints": {"barWidget": "BarWidget.qml"},
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
   "barWidget": {
     "displayName": "Adhoc Cross-Device Connection",
     "description": "Send and receive files with nearby Apple devices",
     "category": "Network",
     "allowMultiple": false,
-    "defaultSection": "right"
+    "defaultSection": "right",
+    "defaults": {
+      "name": "Omarchy",
+      "directory": "/home/cristi/Downloads/Adhoc",
+      "defaultWindowMinutes": 10,
+      "bleWake": true
+    },
+    "schema": [
+      {
+        "key": "name",
+        "type": "string",
+        "label": "Device name",
+        "defaultValue": "Omarchy"
+      },
+      {
+        "key": "directory",
+        "type": "string",
+        "label": "Save files to",
+        "defaultValue": "/home/cristi/Downloads/Adhoc"
+      },
+      {
+        "key": "defaultWindowMinutes",
+        "type": "integer",
+        "label": "Default receive window (minutes)",
+        "min": 1,
+        "max": 60,
+        "step": 5,
+        "defaultValue": 10
+      },
+      {
+        "key": "bleWake",
+        "type": "boolean",
+        "label": "Bluetooth wake advertisement",
+        "defaultValue": true
+      }
+    ]
   }
 }
