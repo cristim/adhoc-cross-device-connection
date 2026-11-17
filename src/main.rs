@@ -12,6 +12,7 @@ mod health;
 mod keystore;
 mod opack;
 mod orchestrate;
+mod pasteboard_archive;
 mod scan;
 mod tlv8;
 mod transfer;
@@ -482,6 +483,7 @@ async fn command(cmd: Cmd) -> Result<()> {
 
             tracing::info!(%host, port, "connecting companion-link (expected to fail without AWDL)");
             let mut session = companion_client::connect(&host, port, ident).await?;
+            tracing::info!(peer = ?session.peer_label(), "Pair-Verify authenticated");
             let peer = session
                 .system_info_exchange(&companion_client::SystemInfo {
                     name: "ac-dc (Linux)".into(),
