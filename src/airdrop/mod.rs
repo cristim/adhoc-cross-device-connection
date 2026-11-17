@@ -24,64 +24,21 @@ use tokio_rustls::{
     TlsAcceptor,
 };
 
-fn identity(dir: &Path) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
-    use openssl::{
-        asn1::Asn1Time,
-        bn::{BigNum, MsbOption},
-        hash::MessageDigest,
-        pkey::PKey,
-        rsa::Rsa,
-        x509::{X509NameBuilder, X509},
-    };
-    use std::{
-        fs::{self, OpenOptions},
-        io::Write,
-        os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    };
-    fs::create_dir_all(dir)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    let cert_path = dir.join("certificate.pem");
-    let key_path = dir.join("key.pem");
-    if !cert_path.exists() && !key_path.exists() {
-        let key = PKey::from_rsa(Rsa::generate(2048)?)?;
-        let mut name = X509NameBuilder::new()?;
-        name.append_entry_by_text("CN", "Adhoc Cross-Device Connection")?;
-        let name = name.build();
-        let mut x = X509::builder()?;
-        x.set_version(2)?;
-        let mut bn = BigNum::new()?;
-        bn.rand(128, MsbOption::MAYBE_ZERO, false)?;
-        let serial = bn.to_asn1_integer()?;
-        x.set_serial_number(&serial)?;
-        x.set_subject_name(&name)?;
-        x.set_issuer_name(&name)?;
-        x.set_pubkey(&key)?;
-        let start = Asn1Time::days_from_now(0)?;
-        let end = Asn1Time::days_from_now(365)?;
-        x.set_not_before(&start)?;
-        x.set_not_after(&end)?;
-        let san = openssl::x509::extension::SubjectAlternativeName::new()
-            .dns("ac-dc.local")
-            .build(&x.x509v3_context(None, None))?;
-        x.append_extension(san)?;
-        x.sign(&key, MessageDigest::sha256())?;
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&key_path)?;
-        f.write_all(&key.private_key_to_pem_pkcs8()?)?;
-        f.sync_all()?;
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&cert_path)?;
-        f.write_all(&x.build().to_pem()?)?;
-        f.sync_all()?;
-    }
-    let cert = X509::from_pem(&fs::read(cert_path)?)?;
-    let key = PKey::private_key_from_pem(&fs::read(key_path)?)?;
+const MAX_VALIDATION_RECORD_BYTES: usize = 64 * 1024;
+
+pub(super) struct IdentityBundle {
+    pub cert: CertificateDer<'static>,
+    pub key: PrivateKeyDer<'static>,
+    pub record: Option<Vec<u8>>,
+}
+
+fn load_and_verify_pair(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+    use openssl::{pkey::PKey, x509::X509};
+    let cert = X509::from_pem(&std::fs::read(cert_path)?)?;
+    let key = PKey::private_key_from_pem(&std::fs::read(key_path)?)?;
     ensure!(
         cert.public_key()?.public_eq(&key),
         "Airdrop-compatible certificate/key do not match"
@@ -90,6 +47,130 @@ fn identity(dir: &Path) -> Result<(CertificateDer<'static>, PrivateKeyDer<'stati
         CertificateDer::from(cert.to_der()?),
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.private_key_to_pkcs8()?)),
     ))
+}
+
+fn generate_self_signed(cert_path: &Path, key_path: &Path) -> Result<()> {
+    use openssl::{
+        asn1::Asn1Time,
+        bn::{BigNum, MsbOption},
+        hash::MessageDigest,
+        pkey::PKey,
+        rsa::Rsa,
+        x509::{X509NameBuilder, X509},
+    };
+    use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt};
+
+    let key = PKey::from_rsa(Rsa::generate(2048)?)?;
+    let mut name = X509NameBuilder::new()?;
+    name.append_entry_by_text("CN", "Adhoc Cross-Device Connection")?;
+    let name = name.build();
+    let mut x = X509::builder()?;
+    x.set_version(2)?;
+    let mut bn = BigNum::new()?;
+    bn.rand(128, MsbOption::MAYBE_ZERO, false)?;
+    let serial = bn.to_asn1_integer()?;
+    x.set_serial_number(&serial)?;
+    x.set_subject_name(&name)?;
+    x.set_issuer_name(&name)?;
+    x.set_pubkey(&key)?;
+    let start = Asn1Time::days_from_now(0)?;
+    let end = Asn1Time::days_from_now(365)?;
+    x.set_not_before(&start)?;
+    x.set_not_after(&end)?;
+    let san = openssl::x509::extension::SubjectAlternativeName::new()
+        .dns("ac-dc.local")
+        .build(&x.x509v3_context(None, None))?;
+    x.append_extension(san)?;
+    x.sign(&key, MessageDigest::sha256())?;
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(key_path)?;
+    f.write_all(&key.private_key_to_pem_pkcs8()?)?;
+    f.sync_all()?;
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(cert_path)?;
+    f.write_all(&x.build().to_pem()?)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+pub(super) fn identity_bundle(dir: &Path) -> Result<IdentityBundle> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    fs::create_dir_all(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+
+    let cert_path = dir.join("certificate.pem");
+    let key_path = dir.join("key.pem");
+    let record_path = dir.join("validation_record.cms");
+
+    if cert_path.exists() || key_path.exists() {
+        ensure!(
+            cert_path.exists() && key_path.exists(),
+            "incomplete identity: certificate.pem and key.pem must both exist"
+        );
+        let (cert, key) = load_and_verify_pair(&cert_path, &key_path)?;
+        let record = if record_path.exists() {
+            let meta = fs::metadata(&record_path)?;
+            ensure!(
+                meta.len() > 0 && meta.len() <= MAX_VALIDATION_RECORD_BYTES as u64,
+                "validation_record.cms must be 1..={MAX_VALIDATION_RECORD_BYTES} bytes"
+            );
+            Some(fs::read(&record_path)?)
+        } else {
+            None
+        };
+        return Ok(IdentityBundle { cert, key, record });
+    }
+
+    let ss_cert = dir.join("certificate.self-signed.pem");
+    let ss_key = dir.join("key.self-signed.pem");
+    if ss_cert.exists() || ss_key.exists() {
+        ensure!(
+            ss_cert.exists() && ss_key.exists(),
+            "incomplete self-signed identity: certificate.self-signed.pem and key.self-signed.pem must both exist"
+        );
+    } else {
+        generate_self_signed(&ss_cert, &ss_key)?;
+    }
+    let (cert, key) = load_and_verify_pair(&ss_cert, &ss_key)?;
+    Ok(IdentityBundle {
+        cert,
+        key,
+        record: None,
+    })
+}
+
+pub fn has_apple_record(dir: &Path) -> Result<bool> {
+    let cert_path = dir.join("certificate.pem");
+    let key_path = dir.join("key.pem");
+    let record_path = dir.join("validation_record.cms");
+    if !cert_path.exists() && !key_path.exists() {
+        return Ok(false);
+    }
+    ensure!(
+        cert_path.exists() && key_path.exists(),
+        "incomplete identity: certificate.pem and key.pem must both exist"
+    );
+    let _ = load_and_verify_pair(&cert_path, &key_path)?;
+    if !record_path.exists() {
+        return Ok(false);
+    }
+    let meta = std::fs::metadata(&record_path)?;
+    ensure!(
+        meta.len() > 0 && meta.len() <= MAX_VALIDATION_RECORD_BYTES as u64,
+        "validation_record.cms must be 1..={MAX_VALIDATION_RECORD_BYTES} bytes"
+    );
+    Ok(true)
+}
+
+fn identity(dir: &Path) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+    let bundle = identity_bundle(dir)?;
+    Ok((bundle.cert, bundle.key))
 }
 pub fn service_id(identity_dir: &Path) -> Result<String> {
     if let Ok(mac) = std::fs::read_to_string("/sys/class/net/awdl0/address") {
@@ -124,7 +205,7 @@ fn tls(dir: &Path) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-fn response(name: &str) -> Result<Vec<u8>> {
+fn response(name: &str, record: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut d = plist::Dictionary::new();
     d.insert("ReceiverComputerName".into(), name.into());
     d.insert("ReceiverModelName".into(), "MacBookPro18,3".into());
@@ -132,6 +213,12 @@ fn response(name: &str) -> Result<Vec<u8>> {
         "ReceiverMediaCapabilities".into(),
         plist::Value::Data(br#"{"Version":1}"#.to_vec()),
     );
+    if let Some(rec) = record {
+        d.insert(
+            "ReceiverRecordData".into(),
+            plist::Value::Data(rec.to_vec()),
+        );
+    }
     let mut bytes = Vec::new();
     plist::Value::Dictionary(d).to_writer_binary(&mut bytes)?;
     Ok(bytes)
@@ -233,6 +320,30 @@ struct Sessions {
         Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, std::time::Instant>>>,
     approval: Option<tokio::sync::mpsc::Sender<Incoming>>,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VisibilityMode {
+    #[default]
+    Everyone,
+    ContactsOnly,
+}
+
+#[derive(Debug)]
+struct Unauthorized;
+
+impl std::fmt::Display for Unauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Contacts Only requires valid SenderRecordData")
+    }
+}
+
+impl std::error::Error for Unauthorized {}
+
+fn has_valid_sender_record(dict: &plist::Dictionary) -> bool {
+    dict.get("SenderRecordData")
+        .and_then(plist::Value::as_data)
+        .is_some_and(|b| !b.is_empty() && b.len() <= MAX_VALIDATION_RECORD_BYTES)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connection(
     stream: tokio::net::TcpStream,
@@ -243,6 +354,8 @@ async fn connection(
     open_destination: bool,
     completed: tokio::sync::mpsc::Sender<()>,
     sessions: Sessions,
+    visibility: VisibilityMode,
+    record: Option<Arc<Vec<u8>>>,
 ) -> Result<()> {
     let peer = stream.peer_addr()?.ip();
     let started = std::time::Instant::now();
@@ -269,93 +382,107 @@ async fn connection(
         tracing::info!(%peer,endpoint=%req.path,"Airdrop-compatible incoming request");
         let result = match req.path.as_str() {
             "/Discover" => {
-                plist::Value::from_reader(Cursor::new(&req.body))
+                let value = plist::Value::from_reader(Cursor::new(&req.body))
                     .context("invalid Discover plist")?;
-                Ok((response(&name)?, false))
+                let dict = value
+                    .as_dictionary()
+                    .context("Discover must be a dictionary")?;
+                if visibility == VisibilityMode::ContactsOnly && !has_valid_sender_record(dict) {
+                    Err(Unauthorized.into())
+                } else {
+                    Ok((
+                        response(&name, record.as_deref().map(Vec::as_slice))?,
+                        false,
+                    ))
+                }
             }
             "/Ask" => {
                 let value = plist::Value::from_reader(Cursor::new(&req.body))?;
                 let dict = value.as_dictionary().context("Ask must be a dictionary")?;
-                let links = is_link_transfer(dict.get("TransferType"))
-                    || (dict.contains_key("Items") && !dict.contains_key("Files"));
-                if let Some(approval) = &sessions.approval {
-                    let sender = dict
-                        .get("SenderComputerName")
-                        .and_then(plist::Value::as_string)
-                        .unwrap_or("Nearby device")
-                        .chars()
-                        .filter(|c| !c.is_control())
-                        .take(128)
-                        .collect();
-                    let items = if links {
-                        dict.get("Items")
-                    } else {
-                        dict.get("Files")
-                    }
-                    .and_then(plist::Value::as_array)
-                    .context("Ask has no items")?
-                    .iter()
-                    .take(512)
-                    .map(|v| {
-                        if links {
-                            v.as_string()
+                if visibility == VisibilityMode::ContactsOnly && !has_valid_sender_record(dict) {
+                    Err(Unauthorized.into())
+                } else {
+                    let links = is_link_transfer(dict.get("TransferType"))
+                        || (dict.contains_key("Items") && !dict.contains_key("Files"));
+                    if let Some(approval) = &sessions.approval {
+                        let sender = dict
+                            .get("SenderComputerName")
+                            .and_then(plist::Value::as_string)
+                            .unwrap_or("Nearby device")
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .take(128)
+                            .collect();
+                        let items = if links {
+                            dict.get("Items")
                         } else {
-                            v.as_dictionary()
-                                .and_then(|d| d.get("FileName"))
-                                .and_then(plist::Value::as_string)
+                            dict.get("Files")
                         }
-                        .unwrap_or("File")
-                        .chars()
-                        .filter(|c| !c.is_control())
-                        .take(256)
-                        .collect()
-                    })
-                    .collect();
-                    let (decision, result) = tokio::sync::oneshot::channel();
-                    let accepted = match approval.try_send(Incoming {
-                        sender,
-                        items,
-                        decision,
-                    }) {
-                        Ok(()) => tokio::time::timeout(Duration::from_secs(90), result)
-                            .await
-                            .ok()
-                            .and_then(Result::ok)
-                            .unwrap_or(false),
-                        Err(_) => false,
-                    };
-                    if !accepted {
-                        http::respond(io.get_mut(), 403, b"").await?;
-                        continue;
-                    }
-                }
-                if links {
-                    let mut entries = Vec::new();
-                    for url in dict
-                        .get("Items")
                         .and_then(plist::Value::as_array)
-                        .context("link Items missing")?
-                    {
-                        let url = url.as_string().context("link is not text")?;
-                        ensure!(
-                            (url.starts_with("https://") || url.starts_with("http://"))
-                                && !url.chars().any(char::is_control),
-                            "unsupported link"
-                        );
-                        entries.push(archive::Entry {
-                            name: "shared-link.txt".into(),
-                            bytes: url.as_bytes().to_vec(),
-                        });
+                        .context("Ask has no items")?
+                        .iter()
+                        .take(512)
+                        .map(|v| {
+                            if links {
+                                v.as_string()
+                            } else {
+                                v.as_dictionary()
+                                    .and_then(|d| d.get("FileName"))
+                                    .and_then(plist::Value::as_string)
+                            }
+                            .unwrap_or("File")
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .take(256)
+                            .collect()
+                        })
+                        .collect();
+                        let (decision, result) = tokio::sync::oneshot::channel();
+                        let accepted = match approval.try_send(Incoming {
+                            sender,
+                            items,
+                            decision,
+                        }) {
+                            Ok(()) => tokio::time::timeout(Duration::from_secs(90), result)
+                                .await
+                                .ok()
+                                .and_then(Result::ok)
+                                .unwrap_or(false),
+                            Err(_) => false,
+                        };
+                        if !accepted {
+                            http::respond(io.get_mut(), 403, b"").await?;
+                            continue;
+                        }
                     }
-                    deliver(entries, dest.clone(), notify).await?;
+                    if links {
+                        let mut entries = Vec::new();
+                        for url in dict
+                            .get("Items")
+                            .and_then(plist::Value::as_array)
+                            .context("link Items missing")?
+                        {
+                            let url = url.as_string().context("link is not text")?;
+                            ensure!(
+                                (url.starts_with("https://") || url.starts_with("http://"))
+                                    && !url.chars().any(char::is_control),
+                                "unsupported link"
+                            );
+                            entries.push(archive::Entry {
+                                name: "shared-link.txt".into(),
+                                bytes: url.as_bytes().to_vec(),
+                            });
+                        }
+                        deliver(entries, dest.clone(), notify).await?;
+                    }
+                    if !links {
+                        let mut grants = sessions.approved.lock().unwrap();
+                        grants.retain(|_, t| t.elapsed() < Duration::from_secs(120));
+                        ensure!(grants.len() < 128, "too many pending transfers");
+                        grants.insert(peer, std::time::Instant::now());
+                    }
+                    Ok((response(&name, None)?, links))
                 }
-                if !links {
-                    let mut grants = sessions.approved.lock().unwrap();
-                    grants.retain(|_, t| t.elapsed() < Duration::from_secs(120));
-                    ensure!(grants.len() < 128, "too many pending transfers");
-                    grants.insert(peer, std::time::Instant::now());
-                }
-                Ok((response(&name)?, links))
             }
             "/Upload" => {
                 let ty = req
@@ -431,6 +558,14 @@ async fn connection(
                     }
                 }
             }
+            Err(e) if e.is::<Unauthorized>() => {
+                if req.path == "/Discover" {
+                    http::respond_close(io.get_mut(), 401, b"").await?;
+                } else {
+                    http::respond(io.get_mut(), 401, b"").await?;
+                }
+                return Err(e);
+            }
             Err(e) => {
                 http::respond(io.get_mut(), 400, b"").await?;
                 return Err(e);
@@ -464,6 +599,7 @@ pub struct Config {
     pub open_destination: bool,
     pub radio_managed: bool,
     pub ble_wake: bool,
+    pub visibility: VisibilityMode,
     pub approval: Option<tokio::sync::mpsc::Sender<Incoming>>,
 }
 pub async fn run(c: Config) -> Result<()> {
@@ -477,6 +613,14 @@ pub async fn run(c: Config) -> Result<()> {
         !c.name.is_empty() && c.name.len() <= 63 && !c.name.chars().any(char::is_control),
         "invalid receiver name"
     );
+    let bundle = identity_bundle(&c.identity)?;
+    if c.visibility == VisibilityMode::ContactsOnly {
+        ensure!(
+            bundle.record.is_some(),
+            "Contacts Only mode requires validation_record.cms in identity directory"
+        );
+    }
+    let record = bundle.record.map(Arc::new);
     let r = crate::health::radio().await?;
     ensure!(
         r["ready"] == true && r["interface"] == c.iface,
@@ -518,7 +662,7 @@ pub async fn run(c: Config) -> Result<()> {
     let fullname = info.get_fullname().to_string();
     daemon.register(info)?;
     let _announce = Announce(daemon, fullname);
-    tracing::info!(address=%addr,seconds=c.seconds,radio_managed=c.radio_managed,"Airdrop-compatible receive window open (Everyone; experimental)");
+    tracing::info!(address=%addr,seconds=c.seconds,radio_managed=c.radio_managed,visibility=?c.visibility,"Airdrop-compatible receive window open (experimental)");
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let end = tokio::time::sleep(Duration::from_secs(c.seconds));
     tokio::pin!(end);
@@ -543,7 +687,7 @@ pub async fn run(c: Config) -> Result<()> {
             _=&mut shutdown=>break,
             Some(())=rx.recv()=>{if c.once{break;}},
             Some(result)=tasks.join_next(),if !tasks.is_empty()=>{if let Ok(Err(e))=result{tracing::info!(error=%format!("{e:#}"),"Airdrop-compatible connection ended");}},
-            result=listener.accept()=>{let (s,_)=result?;if tasks.len()>=4{drop(s);continue;}tasks.spawn(connection(s,acceptor.clone(),c.name.clone(),dest.clone(),c.notify,c.open_destination,tx.clone(),sessions.clone()));}
+            result=listener.accept()=>{let (s,_)=result?;if tasks.len()>=4{drop(s);continue;}tasks.spawn(connection(s,acceptor.clone(),c.name.clone(),dest.clone(),c.notify,c.open_destination,tx.clone(),sessions.clone(),c.visibility,record.clone()));}
         }
     }
     tasks.abort_all();
@@ -587,16 +731,14 @@ mod tests {
                 false,
                 tx,
                 Sessions::default(),
+                VisibilityMode::Everyone,
+                None,
             )
             .await
         });
-        let cert =
-            openssl::x509::X509::from_pem(&std::fs::read(id.join("certificate.pem")).unwrap())
-                .unwrap();
+        let bundle = identity_bundle(&id).unwrap();
         let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(CertificateDer::from(cert.to_der().unwrap()))
-            .unwrap();
+        roots.add(bundle.cert).unwrap();
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -781,6 +923,8 @@ mod sender_tests {
                     false,
                     done.clone(),
                     sessions.clone(),
+                    VisibilityMode::Everyone,
+                    None,
                 ));
             }
         });
@@ -852,9 +996,13 @@ mod upload_wire_tests {
             let req = http::read(&mut discovery).await.unwrap();
             assert_eq!(req.path, "/Discover");
             assert_eq!(req.headers["connection"], "keep-alive");
-            http::respond(discovery.get_mut(), 200, &response("Wire Mac").unwrap())
-                .await
-                .unwrap();
+            http::respond(
+                discovery.get_mut(),
+                200,
+                &response("Wire Mac", None).unwrap(),
+            )
+            .await
+            .unwrap();
             drop(discovery);
             let (stream, _) = listener.accept().await.unwrap();
             let tls = acceptor.accept(stream).await.unwrap();
@@ -905,7 +1053,7 @@ mod upload_wire_tests {
                     let tls = acceptor.accept(stream).await.unwrap();
                     io = tokio::io::BufReader::new(tls);
                 } else {
-                    http::respond(io.get_mut(), 200, &response("Wire Mac").unwrap())
+                    http::respond(io.get_mut(), 200, &response("Wire Mac", None).unwrap())
                         .await
                         .unwrap();
                 }
@@ -928,5 +1076,174 @@ mod upload_wire_tests {
         tokio::time::timeout(Duration::from_secs(10), sender_fixture(true))
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn identity_bundle_separates_apple_and_self_signed_and_rejects_half_pairs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let b = identity_bundle(dir).unwrap();
+        assert!(b.record.is_none());
+        assert!(dir.join("certificate.self-signed.pem").exists());
+        assert!(dir.join("key.self-signed.pem").exists());
+
+        let half = dir.join("half-ss");
+        std::fs::create_dir_all(&half).unwrap();
+        std::fs::copy(
+            dir.join("certificate.self-signed.pem"),
+            half.join("certificate.self-signed.pem"),
+        )
+        .unwrap();
+        assert!(identity_bundle(&half).is_err());
+
+        let apple = dir.join("apple");
+        std::fs::create_dir_all(&apple).unwrap();
+        std::fs::copy(
+            dir.join("certificate.self-signed.pem"),
+            apple.join("certificate.pem"),
+        )
+        .unwrap();
+        std::fs::copy(dir.join("key.self-signed.pem"), apple.join("key.pem")).unwrap();
+        std::fs::write(apple.join("validation_record.cms"), b"cms-der-stub").unwrap();
+        let b2 = identity_bundle(&apple).unwrap();
+        assert_eq!(b2.record.as_deref(), Some(&b"cms-der-stub"[..]));
+
+        std::fs::write(apple.join("validation_record.cms"), b"").unwrap();
+        assert!(identity_bundle(&apple).is_err());
+
+        std::fs::write(
+            apple.join("validation_record.cms"),
+            vec![0xAA; MAX_VALIDATION_RECORD_BYTES + 1],
+        )
+        .unwrap();
+        assert!(identity_bundle(&apple).is_err());
+
+        let apple_half = dir.join("apple-half");
+        std::fs::create_dir_all(&apple_half).unwrap();
+        std::fs::copy(
+            dir.join("certificate.self-signed.pem"),
+            apple_half.join("certificate.pem"),
+        )
+        .unwrap();
+        assert!(identity_bundle(&apple_half).is_err());
+
+        let other = dir.join("other");
+        let _ = identity_bundle(&other).unwrap();
+        let mismatch = dir.join("mismatch");
+        std::fs::create_dir_all(&mismatch).unwrap();
+        std::fs::copy(
+            dir.join("certificate.self-signed.pem"),
+            mismatch.join("certificate.pem"),
+        )
+        .unwrap();
+        std::fs::copy(other.join("key.self-signed.pem"), mismatch.join("key.pem")).unwrap();
+        assert!(identity_bundle(&mismatch).is_err());
+    }
+
+    #[tokio::test]
+    async fn contacts_only_requires_sender_record_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let server_id = root.join("server-id");
+        let _ = identity_bundle(&server_id).unwrap();
+        std::fs::rename(
+            server_id.join("certificate.self-signed.pem"),
+            server_id.join("certificate.pem"),
+        )
+        .unwrap();
+        std::fs::rename(
+            server_id.join("key.self-signed.pem"),
+            server_id.join("key.pem"),
+        )
+        .unwrap();
+        std::fs::write(server_id.join("validation_record.cms"), b"srv-cms").unwrap();
+        let acceptor = tls(&server_id).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let (tx, _) = tokio::sync::mpsc::channel(4);
+
+        let srv = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (s, _) = listener.accept().await.unwrap();
+                let _ = connection(
+                    s,
+                    acceptor.clone(),
+                    "Mac".into(),
+                    dest.clone(),
+                    false,
+                    false,
+                    tx.clone(),
+                    Sessions::default(),
+                    VisibilityMode::ContactsOnly,
+                    Some(Arc::new(b"srv-cms".to_vec())),
+                )
+                .await;
+            }
+        });
+
+        let c1_id = root.join("c1");
+        let c1 = send::Client::new(addr, &c1_id).unwrap();
+        let err = format!("{:#}", c1.discover().await.unwrap_err());
+        assert!(
+            err.contains("401"),
+            "expected 401 without record, got: {err}"
+        );
+
+        let ask_err = format!(
+            "{:#}",
+            c1.transfer("C1", vec![], vec!["https://example.com".into()])
+                .await
+                .unwrap_err()
+        );
+        assert!(ask_err.contains("401"), "expected /Ask 401, got: {ask_err}");
+
+        let c2_id = root.join("c2");
+        let _ = identity_bundle(&c2_id).unwrap();
+        std::fs::rename(
+            c2_id.join("certificate.self-signed.pem"),
+            c2_id.join("certificate.pem"),
+        )
+        .unwrap();
+        std::fs::rename(c2_id.join("key.self-signed.pem"), c2_id.join("key.pem")).unwrap();
+        std::fs::write(c2_id.join("validation_record.cms"), b"cli-cms").unwrap();
+        let tls_conn = client_http::connector(&c2_id).unwrap();
+        let mut sess = client_http::Session::connect(addr, &tls_conn)
+            .await
+            .unwrap();
+        let mut disc = plist::Dictionary::new();
+        disc.insert(
+            "SenderRecordData".into(),
+            plist::Value::Data(b"cli-cms".to_vec()),
+        );
+        let mut disc_bytes = Vec::new();
+        plist::Value::Dictionary(disc)
+            .to_writer_binary(&mut disc_bytes)
+            .unwrap();
+        let sz = disc_bytes.len() as u64;
+        let resp_bytes = sess
+            .post(
+                "/Discover",
+                "application/octet-stream",
+                client_http::bytes(disc_bytes),
+                sz,
+            )
+            .await
+            .unwrap();
+        let resp_plist = plist::Value::from_reader(Cursor::new(resp_bytes)).unwrap();
+        assert_eq!(
+            resp_plist
+                .as_dictionary()
+                .and_then(|d| d.get("ReceiverRecordData"))
+                .and_then(plist::Value::as_data),
+            Some(&b"srv-cms"[..])
+        );
+
+        let c2 = send::Client::new(addr, &c2_id).unwrap();
+        c2.transfer("C2", vec![], vec!["https://example.com".into()])
+            .await
+            .unwrap();
+        srv.await.unwrap();
     }
 }
