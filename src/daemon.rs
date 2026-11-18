@@ -471,7 +471,6 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
             expires_at_ms: None,
         },
     });
-    s.publish();
 
     let ops = s.ops.clone();
     let task_state = state.clone();
@@ -532,6 +531,7 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
         st.publish();
     }));
 
+    s.publish();
     ok_reply(&s, "receive window starting", None)
 }
 
@@ -783,6 +783,7 @@ async fn start_send(state: Arc<Mutex<State>>, request: Request) -> Reply {
         st.publish();
     }));
 
+    s.publish();
     ok_reply(&s, "send started", None)
 }
 
