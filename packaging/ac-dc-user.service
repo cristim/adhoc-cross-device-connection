@@ -1,0 +1,16 @@
+[Unit]
+Description=Adhoc Cross-Device Connection user-scoped AirDrop protocol service
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/ac-dc daemon
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=full
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

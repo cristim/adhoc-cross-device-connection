@@ -28,10 +28,36 @@ const RADIO_STOP_GRACE: Duration = Duration::from_secs(1);
 const MAX_RADIO_WINDOW_SECONDS: u64 = 3600;
 
 const SOCKET: &str = "/run/ac-dc/control.sock";
-const DIRECTORY: &str = "/home/cristi/Downloads/Adhoc";
-// The daemon is root-owned and sandboxed; keep its TLS identity in its own
-// writable state directory instead of trying to chmod a user's home tree.
-const IDENTITY: &str = "/var/lib/ac-dc/airdrop";
+const ROOT_IDENTITY: &str = "/var/lib/ac-dc/airdrop";
+
+fn default_directory() -> PathBuf {
+    if let Some(dl) = std::env::var_os("XDG_DOWNLOAD_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dl).join("Adhoc");
+    }
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("Downloads/Adhoc")
+}
+
+fn default_identity() -> PathBuf {
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        return PathBuf::from(ROOT_IDENTITY);
+    }
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".local/share")
+        });
+    data_home.join("ac-dc/airdrop")
+}
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -102,11 +128,33 @@ impl RadioHandle for ChildRadioHandle {
     }
 }
 
+struct RemoteRadioHandle {
+    client: crate::radio_daemon::RemoteRadioClient,
+}
+
+impl RadioHandle for RemoteRadioHandle {
+    fn renew(&mut self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(self.client.renew())
+    }
+    fn stop(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(self.client.stop())
+    }
+}
+
 struct ProdServiceOps;
 
 impl ServiceOps for ProdServiceOps {
     fn start_radio(&self, seconds: u64) -> BoxFuture<'_, Result<Box<dyn RadioHandle>>> {
         Box::pin(async move {
+            #[cfg(unix)]
+            if unsafe { libc::geteuid() } != 0 {
+                let client = crate::radio_daemon::RemoteRadioClient::connect_and_start(
+                    Path::new(crate::radio_daemon::DEFAULT_SOCKET),
+                    seconds,
+                )
+                .await?;
+                return Ok(Box::new(RemoteRadioHandle { client }) as Box<dyn RadioHandle>);
+            }
             let mut child = tokio::process::Command::new("/usr/bin/awdlctl")
                 .args(["discoverable", "--seconds", &seconds.to_string()])
                 .stderr(std::process::Stdio::piped())
@@ -197,8 +245,8 @@ struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            default_directory: PathBuf::from(DIRECTORY),
-            identity: PathBuf::from(IDENTITY),
+            default_directory: default_directory(),
+            identity: default_identity(),
         }
     }
 }
@@ -303,18 +351,29 @@ async fn run_with_ops(socket: PathBuf, ops: Arc<dyn ServiceOps>, cfg: DaemonConf
         UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660))?;
-        if unsafe { libc::geteuid() } == 0 {
-            let raw = std::ffi::CString::new(socket.as_os_str().as_encoded_bytes())?;
-            // The desktop user is granted access through the local administrators
-            // group used by this installation; the daemon itself remains root.
-            let rc = unsafe { libc::chown(raw.as_ptr(), 0, 998) };
-            if rc != 0 {
-                anyhow::bail!(
-                    "set daemon socket group: {}",
-                    std::io::Error::last_os_error()
-                );
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let is_root = unsafe { libc::geteuid() } == 0;
+        if let Some(parent) = socket.parent() {
+            let dir_mode = if is_root { 0o750 } else { 0o700 };
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(dir_mode));
+        }
+        let sock_mode = if is_root { 0o660 } else { 0o600 };
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(sock_mode))?;
+        if is_root {
+            let grp = unsafe { libc::getgrnam(c"wheel".as_ptr()) };
+            if !grp.is_null() {
+                let gid = unsafe { (*grp).gr_gid };
+                let meta = std::fs::metadata(&socket)?;
+                if meta.gid() != gid {
+                    let raw = std::ffi::CString::new(socket.as_os_str().as_encoded_bytes())?;
+                    let rc = unsafe { libc::chown(raw.as_ptr(), 0, gid) };
+                    if rc != 0 {
+                        anyhow::bail!(
+                            "set daemon socket group: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                }
             }
         }
     }
@@ -437,6 +496,11 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
     let mode = resolve_receive_mode(&request);
     let seconds = request.seconds.unwrap_or(600);
     let ble_wake = request.ble_wake.unwrap_or(true);
+    let contacts_only = request.contacts_only.unwrap_or(false);
+    let max_disk_percent = request
+        .max_disk_percent
+        .unwrap_or(airdrop::DEFAULT_MAX_DISK_PERCENT);
+    let copy_to_clipboard = request.copy_to_clipboard.unwrap_or(true);
     let mut s = state.lock().await;
     let directory = request
         .directory
@@ -444,6 +508,31 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
     let identity = s.cfg.identity.clone();
     let name = request.name.unwrap_or_else(|| "Omarchy".into());
 
+    if let Err(e) = airdrop::validate_max_disk_percent(max_disk_percent) {
+        return err_reply(&s, format!("{e:#}"));
+    }
+    if contacts_only {
+        match airdrop::has_apple_record(&identity) {
+            Ok(true) => {}
+            Ok(false) => {
+                return err_reply(
+                    &s,
+                    "Contacts Only mode requires validation_record.cms in identity directory",
+                );
+            }
+            Err(e) => return err_reply(&s, format!("check Apple identity: {e:#}")),
+        }
+        match crate::contacts::TrustedSenders::load(&crate::contacts::default_path()) {
+            Ok(senders) if !senders.is_empty() => {}
+            Ok(_) => {
+                return err_reply(
+                    &s,
+                    "Contacts Only mode requires at least one trusted sender (ac-dc contacts add <email-or-phone>)",
+                );
+            }
+            Err(e) => return err_reply(&s, format!("load trusted contacts: {e:#}")),
+        }
+    }
     if mode != ReceiveMode::Always && !airdrop::RECEIVE_SECONDS.contains(&seconds) {
         return err_reply(&s, airdrop::receive_seconds_error());
     }
@@ -453,6 +542,7 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
 
     s.radio_starting = true;
     let _ = s.radio_ready_tx.send(false);
+    s.snapshot.contacts_only = contacts_only;
     s.snapshot.last_error = None;
     s.snapshot.radio = RadioState {
         ready: false,
@@ -501,6 +591,9 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
                 mode,
                 lease_seconds,
                 ble_wake,
+                contacts_only,
+                max_disk_percent,
+                copy_to_clipboard,
                 directory,
                 identity,
                 name,
@@ -517,6 +610,7 @@ async fn start_receive(state: Arc<Mutex<State>>, request: Request) -> Reply {
         let _ = st.radio_ready_tx.send(false);
         st.pending = None;
         st.receive_task = None;
+        st.snapshot.contacts_only = false;
         st.snapshot.window = None;
         st.snapshot.radio = RadioState {
             ready: false,
@@ -543,6 +637,9 @@ async fn run_receive_loop(
     mode: ReceiveMode,
     lease_seconds: u64,
     ble_wake: bool,
+    contacts_only: bool,
+    max_disk_percent: u8,
+    copy_to_clipboard: bool,
     directory: PathBuf,
     identity: PathBuf,
     name: String,
@@ -566,9 +663,13 @@ async fn run_receive_loop(
             once: mode == ReceiveMode::Once,
             notify: true,
             open_destination: false,
-            visibility: airdrop::VisibilityMode::Everyone,
-            max_disk_percent: airdrop::DEFAULT_MAX_DISK_PERCENT,
-            copy_to_clipboard: true,
+            visibility: if contacts_only {
+                airdrop::VisibilityMode::ContactsOnly
+            } else {
+                airdrop::VisibilityMode::Everyone
+            },
+            max_disk_percent,
+            copy_to_clipboard,
         });
         tokio::pin!(receive);
 
@@ -612,6 +713,7 @@ async fn stop(state: Arc<Mutex<State>>) -> Reply {
     s.radio_starting = false;
     let _ = s.radio_ready_tx.send(false);
     s.pending = None;
+    s.snapshot.contacts_only = false;
     s.snapshot.window = None;
     s.snapshot.last_error = None;
     s.snapshot.radio = RadioState {
@@ -878,6 +980,9 @@ pub async fn ctl_subscribe(socket: PathBuf) -> Result<()> {
 }
 
 pub fn default_socket() -> PathBuf {
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(runtime_dir).join("ac-dc/control.sock");
+    }
     PathBuf::from(SOCKET)
 }
 
@@ -1143,6 +1248,25 @@ mod tests {
         }
         assert!(ops.radio_renewed.load(Ordering::SeqCst) >= 1);
         let _ = stop(state.clone()).await;
+    }
+
+    #[tokio::test]
+    async fn start_receive_rejects_invalid_disk_percent_and_missing_contacts_identity() {
+        let state = test_state(Arc::new(MockOps::new()));
+        for pct in [0, 91] {
+            let mut req = request("receive");
+            req.max_disk_percent = Some(pct);
+            let reply = start_receive(state.clone(), req).await;
+            assert!(!reply.ok, "max_disk_percent={pct} was accepted");
+        }
+
+        let mut req = request("receive");
+        req.contacts_only = Some(true);
+        let reply = start_receive(state.clone(), req).await;
+        assert!(
+            !reply.ok,
+            "contacts_only without validation_record.cms was accepted"
+        );
     }
 
     #[tokio::test]

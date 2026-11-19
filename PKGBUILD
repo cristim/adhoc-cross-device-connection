@@ -12,6 +12,7 @@ package() {
   install -Dm755 "$startdir/target/release/ac-dc" "$pkgdir/usr/bin/ac-dc"
   install -Dm644 "$startdir/packaging/org.adhoccrossdeviceconnection.desktop" "$pkgdir/usr/share/applications/org.adhoccrossdeviceconnection.desktop"
   install -Dm644 "$startdir/packaging/ac-dc-receive.service" "$pkgdir/usr/lib/systemd/user/ac-dc-receive.service"
+  install -Dm644 "$startdir/packaging/ac-dc-user.service" "$pkgdir/usr/lib/systemd/user/ac-dc-user.service"
   install -Dm644 "$startdir/packaging/ac-dc-daemon.service" "$pkgdir/usr/lib/systemd/system/ac-dc-daemon.service"
   install -Dm644 "$startdir/packaging/INSTALL.md" "$pkgdir/usr/share/doc/adhoc-cross-device-connection/INSTALL.md"
   install -Dm644 "$startdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

@@ -89,59 +89,72 @@ pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Pe
     // even when a userspace mDNS socket does not receive the multicast packet.
     // Use those decoded SRV records as a fallback for Linux AWDL adapters.
     if candidates.is_empty() {
-        let output = tokio::process::Command::new("/usr/bin/awdlctl")
-            .args(["events", "--seconds", &seconds.to_string()])
-            .output()
-            .await
-            .context("capture AWDL discovery events")?;
-        if output.status.success() {
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
-                    continue;
-                };
-                let Some(host) = event["host"].as_str() else {
-                    continue;
-                };
-                let Ok(ip) = host
-                    .split('%')
-                    .next()
-                    .unwrap_or(host)
-                    .parse::<std::net::Ipv6Addr>()
-                else {
-                    continue;
-                };
-                if !ip.is_unicast_link_local() {
-                    continue;
-                }
-                for service in event["frame"]["services"].as_array().into_iter().flatten() {
-                    if service["name"]
-                        .as_str()
-                        .is_none_or(|name| !name.ends_with("._airdrop._tcp.local"))
-                    {
-                        continue;
-                    }
-                    let Some(port) = service["port"].as_u64().filter(|p| *p > 0 && *p <= 65535)
-                    else {
-                        continue;
-                    };
-                    let mut address = crate::discover::scope_address(ip.into(), iface)?;
-                    address.set_port(port as u16);
-                    candidates.insert(
-                        address,
-                        service["name"]
-                            .as_str()
-                            .unwrap_or("Airdrop-compatible")
-                            .into(),
-                    );
-                }
+        let lines = if unsafe { libc::geteuid() } == 0 {
+            let output = tokio::process::Command::new("/usr/bin/awdlctl")
+                .args(["events", "--seconds", &seconds.to_string()])
+                .output()
+                .await
+                .context("capture AWDL discovery events")?;
+            if output.status.success() {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(String::from)
+                    .collect()
+            } else {
+                tracing::debug!(status = ?output.status, "AWDL event fallback unavailable");
+                Vec::new()
             }
-            tracing::debug!(
-                count = candidates.len(),
-                "AWDL event fallback yielded candidates"
-            );
         } else {
-            tracing::debug!(status = ?output.status, "AWDL event fallback unavailable");
+            crate::radio_daemon::fetch_events(
+                Path::new(crate::radio_daemon::DEFAULT_SOCKET),
+                seconds,
+            )
+            .await
+            .unwrap_or_default()
+        };
+        for line in lines {
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(host) = event["host"].as_str() else {
+                continue;
+            };
+            let Ok(ip) = host
+                .split('%')
+                .next()
+                .unwrap_or(host)
+                .parse::<std::net::Ipv6Addr>()
+            else {
+                continue;
+            };
+            if !ip.is_unicast_link_local() {
+                continue;
+            }
+            for service in event["frame"]["services"].as_array().into_iter().flatten() {
+                if service["name"]
+                    .as_str()
+                    .is_none_or(|name| !name.ends_with("._airdrop._tcp.local"))
+                {
+                    continue;
+                }
+                let Some(port) = service["port"].as_u64().filter(|p| *p > 0 && *p <= 65535) else {
+                    continue;
+                };
+                let mut address = crate::discover::scope_address(ip.into(), iface)?;
+                address.set_port(port as u16);
+                candidates.insert(
+                    address,
+                    service["name"]
+                        .as_str()
+                        .unwrap_or("Airdrop-compatible")
+                        .into(),
+                );
+            }
         }
+        tracing::debug!(
+            count = candidates.len(),
+            "AWDL event fallback yielded candidates"
+        );
     }
     if let Ok(state) = crate::health::radio().await {
         if let Some(own) = state["link_local"]

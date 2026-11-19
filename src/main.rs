@@ -14,6 +14,7 @@ mod ipc;
 mod keystore;
 mod opack;
 mod orchestrate;
+mod radio_daemon;
 mod scan;
 mod tlv8;
 mod transfer;
@@ -47,8 +48,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Run the privileged local Airdrop-compatible protocol service.
+    /// Run the user-scoped Airdrop-compatible protocol service.
     Daemon {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Run the root-only AWDL radio broker (`/run/ac-dc/radio.sock`).
+    RadioDaemon {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -297,6 +303,10 @@ async fn command(cmd: Cmd) -> Result<()> {
         Cmd::Daemon { socket } => {
             daemon::run(socket.unwrap_or_else(daemon::default_socket)).await?
         }
+        Cmd::RadioDaemon { socket } => {
+            radio_daemon::run(socket.unwrap_or_else(|| PathBuf::from(radio_daemon::DEFAULT_SOCKET)))
+                .await?
+        }
         Cmd::Ctl {
             op,
             host,
@@ -309,9 +319,9 @@ async fn command(cmd: Cmd) -> Result<()> {
             ble_wake,
             mode,
             once,
-            contacts_only: _,
-            max_disk_percent: _,
-            copy_clipboard: _,
+            contacts_only,
+            max_disk_percent,
+            copy_clipboard,
         } => {
             if op == "subscribe" {
                 daemon::ctl_subscribe(daemon::default_socket()).await?;
@@ -337,6 +347,9 @@ async fn command(cmd: Cmd) -> Result<()> {
                         ble_wake,
                         mode: parsed_mode,
                         once: once.then_some(true),
+                        contacts_only: contacts_only.then_some(true),
+                        max_disk_percent: Some(max_disk_percent),
+                        copy_to_clipboard: copy_clipboard,
                         clipboard: None,
                     },
                 )

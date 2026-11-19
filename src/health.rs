@@ -70,6 +70,8 @@ const DEBUG_DROPIN_FILE: &str = "/etc/systemd/system/ac-dc-daemon.service.d/debu
 #[derive(Debug, serde::Serialize)]
 pub struct DebugReport {
     pub daemon_active: String,
+    pub user_daemon_active: String,
+    pub radio_socket_present: bool,
     pub socket_present: bool,
     pub socket_info: String,
     pub ctl_status: Option<serde_json::Value>,
@@ -141,6 +143,15 @@ pub async fn debug_report(socket: &std::path::Path) -> DebugReport {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|e| format!("unavailable ({e})"));
 
+    let user_daemon_active = tokio::process::Command::new("systemctl")
+        .args(["--user", "is-active", "ac-dc-user.service"])
+        .output()
+        .await
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|e| format!("unavailable ({e})"));
+
+    let radio_socket_present = std::path::Path::new(crate::radio_daemon::DEFAULT_SOCKET).exists();
+
     let (socket_present, socket_info) = match std::fs::metadata(socket) {
         Ok(meta) => {
             #[cfg(unix)]
@@ -196,6 +207,8 @@ pub async fn debug_report(socket: &std::path::Path) -> DebugReport {
 
     DebugReport {
         daemon_active,
+        user_daemon_active,
+        radio_socket_present,
         socket_present,
         socket_info,
         ctl_status,
@@ -211,7 +224,16 @@ pub fn format_debug_report(report: &DebugReport, json: bool) -> Result<String> {
         return Ok(serde_json::to_string_pretty(report)?);
     }
     let mut out = String::new();
-    out.push_str(&format!("== Daemon ==\n{}\n", report.daemon_active));
+    out.push_str(&format!(
+        "== Daemons ==\nradio (system): {}\nuser (session): {}\nradio socket: {}\n",
+        report.daemon_active,
+        report.user_daemon_active,
+        if report.radio_socket_present {
+            crate::radio_daemon::DEFAULT_SOCKET
+        } else {
+            "MISSING"
+        }
+    ));
     out.push_str(&format!("\n== Control socket ==\n{}\n", report.socket_info));
     out.push_str("\n== CLI status ==\n");
     if let Some(status) = &report.ctl_status {
@@ -261,8 +283,10 @@ mod tests {
     fn format_debug_report_supports_json_and_text() {
         let report = DebugReport {
             daemon_active: "active".into(),
+            user_daemon_active: "active".into(),
+            radio_socket_present: true,
             socket_present: true,
-            socket_info: "uid=0 gid=998 mode=660 path=/run/ac-dc/control.sock".into(),
+            socket_info: "uid=1000 gid=1000 mode=600 path=/run/user/1000/ac-dc/control.sock".into(),
             ctl_status: Some(json!({"ok": true, "state": "idle"})),
             ctl_error: None,
             radio: Some(json!({"ready": false, "reason": "no_awdl0"})),
@@ -270,11 +294,13 @@ mod tests {
             journal_tail: vec!["line1".into()],
         };
         let text = format_debug_report(&report, false).unwrap();
-        assert!(text.contains("== Daemon ==\nactive"));
+        assert!(text.contains("radio (system): active"));
+        assert!(text.contains("user (session): active"));
         assert!(text.contains("== Control socket =="));
         let json_str = format_debug_report(&report, true).unwrap();
         let parsed: Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed["daemon_active"], "active");
+        assert_eq!(parsed["user_daemon_active"], "active");
         assert_eq!(parsed["socket_present"], true);
     }
 }

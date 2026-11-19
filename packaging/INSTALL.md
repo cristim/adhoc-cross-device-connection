@@ -5,6 +5,7 @@ brcmfmac-awdl-local >= 0.2.1. Enable the service, then launch `ac-dc ui` from
 the terminal or app launcher:
 
     sudo systemctl enable --now ac-dc-daemon.service
+    systemctl --user enable --now ac-dc-user.service
     ac-dc ui
 The Omarchy widget discovers recipients automatically when opened, refreshes
 them every second, and exposes Receive/Stop with a ten-minute countdown. Set the

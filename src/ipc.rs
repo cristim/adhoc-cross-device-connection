@@ -83,6 +83,8 @@ pub struct DaemonSnapshot {
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clipboard: Option<ClipboardStatus>,
+    #[serde(default)]
+    pub contacts_only: bool,
 }
 
 impl Default for DaemonSnapshot {
@@ -96,6 +98,7 @@ impl Default for DaemonSnapshot {
             peers: Vec::new(),
             last_error: None,
             clipboard: None,
+            contacts_only: false,
         }
     }
 }
@@ -123,6 +126,12 @@ pub struct Request {
     pub mode: Option<ReceiveMode>,
     #[serde(default)]
     pub once: Option<bool>,
+    #[serde(default)]
+    pub contacts_only: Option<bool>,
+    #[serde(default)]
+    pub max_disk_percent: Option<u8>,
+    #[serde(default)]
+    pub copy_to_clipboard: Option<bool>,
     #[serde(default)]
     pub clipboard: Option<ClipboardStatus>,
 }
