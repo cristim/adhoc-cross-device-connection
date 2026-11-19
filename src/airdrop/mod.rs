@@ -16,7 +16,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-#[allow(unused_imports)]
 pub use storage::{validate_max_disk_percent, DEFAULT_MAX_DISK_PERCENT};
 use tokio_rustls::{
     rustls::{
@@ -147,7 +146,6 @@ pub(super) fn identity_bundle(dir: &Path) -> Result<IdentityBundle> {
     })
 }
 
-#[allow(dead_code)]
 pub fn has_apple_record(dir: &Path) -> Result<bool> {
     let cert_path = dir.join("certificate.pem");
     let key_path = dir.join("key.pem");
