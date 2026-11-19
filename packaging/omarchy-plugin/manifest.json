@@ -18,9 +18,12 @@
     "defaultSection": "right",
     "defaults": {
       "name": "Omarchy",
-      "directory": "/home/cristi/Downloads/Adhoc",
+      "directory": "",
       "defaultWindowMinutes": 10,
-      "bleWake": true
+      "bleWake": true,
+      "contactsOnly": false,
+      "copyToClipboard": true,
+      "maxDiskPercent": 30
     },
     "schema": [
       {
@@ -32,8 +35,8 @@
       {
         "key": "directory",
         "type": "string",
-        "label": "Save files to",
-        "defaultValue": "/home/cristi/Downloads/Adhoc"
+        "label": "Save files to (empty = ~/Downloads/Adhoc)",
+        "defaultValue": ""
       },
       {
         "key": "defaultWindowMinutes",
@@ -49,6 +52,27 @@
         "type": "boolean",
         "label": "Bluetooth wake advertisement",
         "defaultValue": true
+      },
+      {
+        "key": "contactsOnly",
+        "type": "boolean",
+        "label": "Contacts Only mode",
+        "defaultValue": false
+      },
+      {
+        "key": "copyToClipboard",
+        "type": "boolean",
+        "label": "Copy received items to clipboard",
+        "defaultValue": true
+      },
+      {
+        "key": "maxDiskPercent",
+        "type": "integer",
+        "label": "Max transfer size (% of free disk space)",
+        "min": 1,
+        "max": 90,
+        "step": 5,
+        "defaultValue": 30
       }
     ]
   }
