@@ -30,6 +30,10 @@ pub struct CopyEvent {
     pub address: String,
     pub key_id: String,
     pub activity: String,
+    pub raw_adv: Vec<u8>,
+    pub flags: u8,
+    pub iv: [u8; 2],
+    pub timestamp_ms: u64,
 }
 
 pub struct Scanner {
@@ -171,8 +175,7 @@ impl Worker {
                 }
             };
             if let Some(payload) = HandoffPayload::parse(&plain) {
-                let counter = u16::from_le_bytes(ble.counter_iv);
-                self.report(addr, &k.id, counter, &payload).await;
+                self.report(addr, &k.id, &ble, &payload).await;
                 return;
             }
         }
@@ -202,12 +205,19 @@ impl Worker {
         );
     }
 
-    async fn report(&self, addr: bluer::Address, key_id: &str, counter: u16, p: &HandoffPayload) {
+    async fn report(
+        &self,
+        addr: bluer::Address,
+        key_id: &str,
+        ble: &HandoffBle,
+        p: &HandoffPayload,
+    ) {
         if !p.flags.clipboard_available() {
             tracing::debug!(%addr, key = key_id, "handoff advert without clipboard flag");
             return;
         }
 
+        let counter = u16::from_le_bytes(ble.counter_iv);
         // Collapse address rotation + re-broadcasts: one line per (device, copy).
         {
             let sig = (counter, p.activity_hash);
@@ -228,11 +238,27 @@ impl Worker {
             "CLIPBOARD AVAILABLE"
         );
         if let Some(events) = &self.events {
+            let mut raw_adv = Vec::with_capacity(6 + ble.ciphertext.len());
+            let len = (4 + ble.ciphertext.len()) as u8;
+            raw_adv.push(0x0c);
+            raw_adv.push(len);
+            raw_adv.push(ble.status);
+            raw_adv.extend_from_slice(&ble.counter_iv);
+            raw_adv.extend_from_slice(&ble.tag);
+            raw_adv.extend_from_slice(&ble.ciphertext);
+            let timestamp_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
             if let Err(e) = events.try_send(CopyEvent {
                 device: who.clone(),
                 address: addr.to_string(),
                 key_id: key_id.into(),
                 activity: activity.to_string(),
+                raw_adv,
+                flags: p.flags.raw,
+                iv: ble.counter_iv,
+                timestamp_ms,
             }) {
                 tracing::warn!(error = %e, "copy event queue full or closed");
             }

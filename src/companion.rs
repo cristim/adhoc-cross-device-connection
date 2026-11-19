@@ -234,14 +234,21 @@ mod tlv_type {
 ///
 /// Export instructions and the JSON schema live in macos/RPIDENTITY.md.
 pub struct PairingIdentity {
+    /// Optional client pairing UUID (from PairSetup M5 TLV 0x01 / IDS device UUID).
+    pub pairing_id: Option<String>,
     pub signing: SigningKey,
     pub device_irk: [u8; 16],
     /// Known peer devices' Ed25519 verifying keys (edPK), by label.
     pub peers: Vec<(String, VerifyingKey)>,
+    /// Optional per-peer IRKs (16 bytes) by label, for future `rpAD` correlation.
+    pub peer_irks: Vec<(String, [u8; 16])>,
 }
 
 #[derive(Deserialize)]
 struct IdentityFile {
+    /// Optional client pairing UUID / IDS device UUID.
+    #[serde(default)]
+    pairing_id: Option<String>,
     /// 32-byte Ed25519 seed (hex).
     ed_sk: String,
     /// 16-byte device IRK (hex).
@@ -257,6 +264,9 @@ struct PeerFile {
     label: String,
     /// 32-byte Ed25519 public key (hex).
     edpk: String,
+    /// Optional 16-byte peer IRK (hex).
+    #[serde(default)]
+    irk: Option<String>,
 }
 
 impl PairingIdentity {
@@ -274,16 +284,25 @@ impl PairingIdentity {
                 .map_err(|_| anyhow::anyhow!("dirk must be 16 bytes"))?
         };
         let mut peers = Vec::new();
+        let mut peer_irks = Vec::new();
         for p in f.peers {
             let pk: [u8; 32] = hex::decode(p.edpk.trim())?
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("peer edpk must be 32 bytes"))?;
+            if let Some(irk_hex) = p.irk.filter(|s| !s.trim().is_empty()) {
+                let irk: [u8; 16] = hex::decode(irk_hex.trim())?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("peer irk must be 16 bytes"))?;
+                peer_irks.push((p.label.clone(), irk));
+            }
             peers.push((p.label, VerifyingKey::from_bytes(&pk)?));
         }
         Ok(PairingIdentity {
+            pairing_id: f.pairing_id.filter(|s| !s.trim().is_empty()),
             signing: SigningKey::from_bytes(&sk_bytes),
             device_irk,
             peers,
+            peer_irks,
         })
     }
 }
@@ -319,6 +338,7 @@ pub struct PairVerifyClient {
     public: PublicKey,
     identity: PairingIdentity,
     shared: Option<[u8; 32]>,
+    verified_peer: Option<String>,
 }
 
 impl PairVerifyClient {
@@ -330,7 +350,12 @@ impl PairVerifyClient {
             public,
             identity,
             shared: None,
+            verified_peer: None,
         }
+    }
+
+    pub fn peer_label(&self) -> Option<&str> {
+        self.verified_peer.as_deref()
     }
 
     /// M1: our public key + state=1 + appFlags=1, wrapped OPACK("_pd": TLV).
@@ -392,6 +417,7 @@ impl PairVerifyClient {
         } else {
             bail!("Pair-Verify rejected an unknown peer signature");
         }
+        self.verified_peer = verified;
 
         // M3: sign our_pub || peer_pub, encrypt, send with state=3.
         let mut our_signed = Vec::with_capacity(64);
@@ -399,6 +425,9 @@ impl PairVerifyClient {
         our_signed.extend_from_slice(&peer_pub_bytes);
         let our_sig = self.identity.signing.sign(&our_signed);
         let mut inner_tlv = Tlv8::new();
+        if let Some(id) = &self.identity.pairing_id {
+            inner_tlv.push(tlv_type::IDENTITY_ID, id.as_bytes().to_vec());
+        }
         inner_tlv.push(tlv_type::SIGNATURE, our_sig.to_bytes().to_vec());
         let sealed = cipher
             .encrypt(&pv_nonce(b"PV-Msg03"), inner_tlv.encode().as_slice())
@@ -559,6 +588,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn identity_loads_with_and_without_peer_irk() {
+        let dir = tempfile::tempdir().unwrap();
+        let sk = hex::encode([0x11u8; 32]);
+        let pk = hex::encode([0x22u8; 32]);
+        let irk = hex::encode([0x33u8; 16]);
+        let p1 = dir.path().join("no_irk.json");
+        std::fs::write(
+            &p1,
+            format!(r#"{{"ed_sk":"{sk}","peers":[{{"label":"Mac","edpk":"{pk}"}}]}}"#),
+        )
+        .unwrap();
+        let id1 = PairingIdentity::load(&p1).unwrap();
+        assert!(id1.peer_irks.is_empty());
+
+        let p2 = dir.path().join("with_irk.json");
+        std::fs::write(
+            &p2,
+            format!(
+                r#"{{"ed_sk":"{sk}","peers":[{{"label":"Mac","edpk":"{pk}","irk":"{irk}"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let id2 = PairingIdentity::load(&p2).unwrap();
+        assert_eq!(id2.peer_irks, vec![("Mac".to_string(), [0x33u8; 16])]);
+    }
+
+    #[test]
     fn hkdf_is_deterministic_and_sized() {
         let a = hkdf_sha512(b"secret", b"salt", b"info", 32);
         let b = hkdf_sha512(b"secret", b"salt", b"info", 32);
@@ -644,9 +700,11 @@ mod tests {
         // Our identity knows the peer's edPK.
         let our_sk = SigningKey::generate(&mut OsRng);
         let identity = PairingIdentity {
+            pairing_id: None,
             signing: our_sk,
             device_irk: [0u8; 16],
             peers: vec![("peer".into(), peer_vk)],
+            peer_irks: vec![],
         };
 
         let mut client = PairVerifyClient::new(identity);

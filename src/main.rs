@@ -14,6 +14,8 @@ mod ipc;
 mod keystore;
 mod opack;
 mod orchestrate;
+mod pair_setup;
+mod pasteboard_archive;
 mod radio_daemon;
 mod scan;
 mod tlv8;
@@ -247,11 +249,31 @@ enum Cmd {
         /// Run against an in-process loopback mock peer (no network, no keys).
         #[arg(long)]
         loopback: bool,
+        /// Use Transient Pair-Setup M1..M4 (`Flags=0x10`, `fixedPIN="public"`),
+        /// which requires no exported `RPIdentity` keypair.
+        #[arg(long)]
+        transient: bool,
         /// Fresh JSONL from awdlctl events, used if mDNS resolution fails.
         #[arg(long, requires = "peer_mac")]
         events: Option<PathBuf>,
         #[arg(long)]
         peer_mac: Option<String>,
+    },
+    /// Pair with a companion-link peer via PairSetup (`_auTy=8 SessionPaired`, `pin="public"`)
+    /// and save `rpidentity.json`.
+    Pair {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        #[arg(long, default_value = "rpidentity.json")]
+        out: PathBuf,
+        #[arg(long)]
+        pin_file: Option<PathBuf>,
+        /// Client pairing UUID / IDS device UUID (e.g. an existing account IDS device UUID
+        /// so `sharingd` recognizes the sender in `IDSService.devices`).
+        #[arg(long)]
+        pairing_id: Option<String>,
     },
     /// Watch real BLE copy events and pull from the matching companion-link peer.
     Auto {
@@ -261,9 +283,13 @@ enum Cmd {
         #[arg(long)]
         instance: Option<String>,
         #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
         notify: bool,
-        /// RPIdentity keys for Pair-Verify (real flow only).
-        #[arg(long, default_value = "keys.json")]
+        /// RPIdentity keys for Pair-Verify (saved by `ac-dc pair`).
+        #[arg(long, default_value = "rpidentity.json")]
         identity: PathBuf,
         /// Drive the wiring against the in-process loopback mock (no AWDL).
         #[arg(long)]
@@ -576,6 +602,7 @@ async fn command(cmd: Cmd) -> Result<()> {
             keys,
             identity,
             loopback,
+            transient,
             events,
             peer_mac,
         } => {
@@ -587,9 +614,6 @@ async fn command(cmd: Cmd) -> Result<()> {
                 return Ok(());
             }
 
-            // Once awdl0 is up, `companion_link_target` resolves
-            // `_companion-link._tcp` scoped to it (a non-zero --port is still a
-            // manual override). See src/discover.rs and docs/architecture.md §4.
             let (host, port) = match discover::companion_link_target(&host, port).await {
                 Ok(target) => target,
                 Err(e) => {
@@ -610,12 +634,23 @@ async fn command(cmd: Cmd) -> Result<()> {
                 }
             };
 
-            // Pair-Verify uses a separate RPIdentity export, not the BLE key schema.
-            let identity_path = identity.unwrap_or(keys);
-            let ident = companion::PairingIdentity::load(&identity_path)?;
-
-            tracing::info!(%host, port, "connecting companion-link (expected to fail without AWDL)");
-            let mut session = companion_client::connect(&host, port, ident).await?;
+            let mut session = if transient {
+                tracing::info!(%host, port, "connecting companion-link with Transient Pair-Setup (fixedPIN=\"public\")");
+                companion_client::connect_transient(&host, port, "public").await?
+            } else {
+                let identity_path = identity.unwrap_or(keys);
+                match companion::PairingIdentity::load(&identity_path) {
+                    Ok(ident) => {
+                        tracing::info!(%host, port, "connecting companion-link with Pair-Verify");
+                        companion_client::connect(&host, port, ident).await?
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no RPIdentity found; falling back to Transient Pair-Setup (fixedPIN=\"public\")");
+                        companion_client::connect_transient(&host, port, "public").await?
+                    }
+                }
+            };
+            tracing::info!(peer = ?session.peer_label(), "Pair-Verify authenticated");
             let peer = session
                 .system_info_exchange(&companion_client::SystemInfo {
                     name: "ac-dc (Linux)".into(),
@@ -627,10 +662,54 @@ async fn command(cmd: Cmd) -> Result<()> {
             print_pasteboard(&peer, &board);
             land_on_clipboard(&board);
         }
+        Cmd::Pair {
+            host,
+            port,
+            out,
+            pin_file,
+            pairing_id,
+        } => {
+            let (host, port) = discover::companion_link_target(&host, port).await?;
+            let addr = discover::socket_target(&host, port).await?;
+            let stream = tokio::net::TcpStream::connect(addr).await?;
+            stream.set_nodelay(true).ok();
+            let paired =
+                pair_setup::run_pair_setup(stream, pairing_id.as_deref(), || async move {
+                    if let Some(pf) = pin_file {
+                        tracing::info!(path = %pf.display(), "PairSetup M2 received; waiting for PIN file");
+                        let deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                        loop {
+                            if let Ok(text) = tokio::fs::read_to_string(&pf).await {
+                                let t = text.trim().to_string();
+                                if !t.is_empty() {
+                                    return Ok(t);
+                                }
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                anyhow::bail!("timed out waiting for PIN file {}", pf.display());
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                    } else {
+                        Ok("public".to_string())
+                    }
+                })
+                .await?;
+            pair_setup::write_identity_json(&out, &paired)?;
+            println!(
+                "Paired with '{}' (pairing_id={}) and saved {}",
+                paired.label,
+                paired.pairing_id,
+                out.display()
+            );
+        }
         Cmd::Auto {
             keys,
             identity,
             instance,
+            host,
+            port,
             loopback,
             notify,
         } => {
@@ -638,6 +717,8 @@ async fn command(cmd: Cmd) -> Result<()> {
                 keys,
                 identity_path: identity,
                 instance,
+                host,
+                port,
                 loopback,
                 notify,
             })

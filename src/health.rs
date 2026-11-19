@@ -24,6 +24,7 @@ pub async fn radio() -> Result<Value> {
     );
     Ok(serde_json::from_slice(&output.stdout)?)
 }
+#[allow(dead_code)]
 pub async fn require_radio() -> Result<()> {
     let r = radio().await?;
     ensure!(

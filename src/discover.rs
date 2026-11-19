@@ -53,7 +53,7 @@ pub async fn companion_link_target(host: &str, port: u16) -> Result<(String, u16
     if port != 0 {
         return Ok((host.into(), port));
     }
-    resolve("awdl0", None, None, Duration::from_secs(10)).await
+    resolve_preferred(None, None, Duration::from_secs(10)).await
 }
 fn normalized_address(s: &str) -> String {
     s.chars()
@@ -61,19 +61,42 @@ fn normalized_address(s: &str) -> String {
         .flat_map(char::to_lowercase)
         .collect()
 }
-pub async fn resolve(
-    iface: &str,
+/// Try LAN mDNS first (works without `awdl0`), then fall back to `awdl0` if present.
+pub async fn resolve_preferred(
     instance: Option<&str>,
     ble: Option<&str>,
     timeout: Duration,
 ) -> Result<(String, u16)> {
-    ensure!(
-        std::path::Path::new("/sys/class/net").join(iface).exists(),
-        "AWDL interface {iface} is absent; run awdlctl doctor"
-    );
+    let lan_budget = timeout.min(Duration::from_secs(4));
+    match resolve_on(None, instance, ble, lan_budget).await {
+        Ok(target) => Ok(target),
+        Err(lan_err) => {
+            if std::path::Path::new("/sys/class/net/awdl0").exists() {
+                resolve_on(Some("awdl0"), instance, ble, timeout).await
+            } else {
+                Err(lan_err)
+            }
+        }
+    }
+}
+
+pub async fn resolve_on(
+    iface: Option<&str>,
+    instance: Option<&str>,
+    ble: Option<&str>,
+    timeout: Duration,
+) -> Result<(String, u16)> {
+    if let Some(i) = iface {
+        ensure!(
+            std::path::Path::new("/sys/class/net").join(i).exists(),
+            "AWDL interface {i} is absent; run awdlctl doctor"
+        );
+    }
     let daemon = Daemon(ServiceDaemon::new()?);
-    daemon.0.disable_interface(IfKind::All)?;
-    daemon.0.enable_interface(iface)?;
+    if let Some(i) = iface {
+        daemon.0.disable_interface(IfKind::All)?;
+        daemon.0.enable_interface(i)?;
+    }
     let receiver = daemon.0.browse(SERVICE)?;
     let end = tokio::time::Instant::now() + timeout;
     loop {
@@ -87,14 +110,19 @@ pub async fn resolve(
                 }
             } else if let Some(addr) = ble {
                 let observed = info.get_property_val_str("rpBA").unwrap_or("");
-                if normalized_address(observed) != normalized_address(addr) {
+                if !observed.is_empty() && normalized_address(observed) != normalized_address(addr)
+                {
                     continue;
                 }
             }
             let mut addrs: Vec<_> = info.get_addresses().iter().copied().collect();
             addrs.sort();
             if let Some(addr) = addrs.first() {
-                return Ok((host_string(scope_address(*addr, iface)?), info.get_port()));
+                let scoped = match iface {
+                    Some(i) => scope_address(*addr, i)?,
+                    None => SocketAddr::new(*addr, 0),
+                };
+                return Ok((host_string(scoped), info.get_port()));
             }
         }
     }
