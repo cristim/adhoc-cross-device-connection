@@ -21,16 +21,30 @@ pub struct AutoConfig {
     pub notify: bool,
 }
 
-async fn report_daemon(status: ClipboardStatus) {
-    let req = Request {
-        op: "clipboard_report".into(),
-        clipboard: Some(status),
-        ..Default::default()
-    };
-    let _ = daemon::ctl(daemon::default_socket(), req).await;
+async fn report_status(
+    tx: Option<&tokio::sync::mpsc::UnboundedSender<ClipboardStatus>>,
+    status: ClipboardStatus,
+) {
+    if let Some(ch) = tx {
+        let _ = ch.send(status);
+    } else {
+        let req = Request {
+            op: "clipboard_report".into(),
+            clipboard: Some(status),
+            ..Default::default()
+        };
+        let _ = daemon::ctl(daemon::default_socket(), req).await;
+    }
 }
 
 pub async fn run(cfg: AutoConfig) -> Result<()> {
+    run_with_reporter(cfg, None).await
+}
+
+pub async fn run_with_reporter(
+    cfg: AutoConfig,
+    status_tx: Option<tokio::sync::mpsc::UnboundedSender<ClipboardStatus>>,
+) -> Result<()> {
     if cfg.loopback {
         let (_, board) = companion_client::loopback_demo().await?;
         clipboard_out::copy_pasteboard(&board)?;
@@ -42,12 +56,15 @@ pub async fn run(cfg: AutoConfig) -> Result<()> {
     let scanner = Scanner::new(KeyStore::load(&cfg.keys)?)
         .await?
         .with_events(tx);
-    report_daemon(ClipboardStatus {
-        available: true,
-        state: "watching".into(),
-        last_item_kind: None,
-        last_error: None,
-    })
+    report_status(
+        status_tx.as_ref(),
+        ClipboardStatus {
+            available: true,
+            state: "watching".into(),
+            last_item_kind: None,
+            last_error: None,
+        },
+    )
     .await;
 
     let process = async {
@@ -95,12 +112,15 @@ pub async fn run(cfg: AutoConfig) -> Result<()> {
                         copied = out.spawned,
                         "clipboard transfer complete"
                     );
-                    report_daemon(ClipboardStatus {
-                        available: true,
-                        state: "synced".into(),
-                        last_item_kind: Some(format!("{} ({} B)", out.uti, out.bytes)),
-                        last_error: None,
-                    })
+                    report_status(
+                        status_tx.as_ref(),
+                        ClipboardStatus {
+                            available: true,
+                            state: "synced".into(),
+                            last_item_kind: Some(format!("{} ({} B)", out.uti, out.bytes)),
+                            last_error: None,
+                        },
+                    )
                     .await;
                     if cfg.notify && out.spawned {
                         let _ = tokio::process::Command::new("notify-send")
@@ -118,12 +138,15 @@ pub async fn run(cfg: AutoConfig) -> Result<()> {
             if let Err(e) = result {
                 let msg = format!("{e:#}");
                 tracing::warn!(error=%msg, "clipboard pull failed; waiting for next copy");
-                report_daemon(ClipboardStatus {
-                    available: true,
-                    state: "error".into(),
-                    last_item_kind: None,
-                    last_error: Some(msg),
-                })
+                report_status(
+                    status_tx.as_ref(),
+                    ClipboardStatus {
+                        available: true,
+                        state: "error".into(),
+                        last_item_kind: None,
+                        last_error: Some(msg),
+                    },
+                )
                 .await;
             }
         }

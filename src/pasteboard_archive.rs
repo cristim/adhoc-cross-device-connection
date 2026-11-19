@@ -438,9 +438,9 @@ fn decode_pbinfo<'a>(
     Ok(Pasteboard { items: out_items })
 }
 
-/// Encode a [`Pasteboard`] as a synthetic binary `NSKeyedArchiver`
-/// `UASharedPasteboardInfoWrapper` plist for loopback testing.
-pub fn encode_wrapper_for_test(pb: &Pasteboard) -> Result<Vec<u8>> {
+/// Encode a [`Pasteboard`] as a binary `NSKeyedArchiver`
+/// `UASharedPasteboardInfoWrapper` plist matching `macOS 26.1`'s schema.
+pub fn encode_wrapper(pb: &Pasteboard) -> Result<Vec<u8>> {
     let mut objects: Vec<Value> = vec![Value::String("$null".into())];
     fn push_obj(objects: &mut Vec<Value>, v: Value) -> Uid {
         let idx = objects.len() as u64;
@@ -459,21 +459,51 @@ pub fn encode_wrapper_for_test(pb: &Pasteboard) -> Result<Vec<u8>> {
     let cls_type = push_class(&mut objects, "UASharedPasteboardTypeInfo");
     let cls_array = push_class(&mut objects, "NSArray");
     let cls_dict = push_class(&mut objects, "NSDictionary");
+    let cls_uuid = push_class(&mut objects, "NSUUID");
+
+    let mut uuid_dict = Dictionary::new();
+    uuid_dict.insert("$class".into(), Value::Uid(cls_uuid));
+    uuid_dict.insert(
+        "NS.uuidbytes".into(),
+        Value::Data(uuid::Uuid::new_v4().as_bytes().to_vec()),
+    );
+    let uuid_uid = push_obj(&mut objects, Value::Dictionary(uuid_dict));
 
     let mut blob = Vec::new();
     let mut type_dict_keys = Vec::new();
     let mut type_dict_objs = Vec::new();
 
-    for it in &pb.items {
+    for (idx, it) in pb.items.iter().enumerate() {
         let offset = blob.len() as u64;
         blob.extend_from_slice(&it.data);
         let size = it.data.len() as u64;
         let uti_uid = push_obj(&mut objects, Value::String(it.uti.clone()));
         let mut t_info = Dictionary::new();
         t_info.insert("$class".into(), Value::Uid(cls_type));
-        t_info.insert("type".into(), Value::Uid(uti_uid));
-        t_info.insert("offset".into(), Value::Integer(offset.into()));
-        t_info.insert("dataSize".into(), Value::Integer(size.into()));
+        t_info.insert(
+            "UASharedPasteboardTypeInfoTypeKey".into(),
+            Value::Uid(uti_uid),
+        );
+        t_info.insert(
+            "UASharedPasteboardTypeInfoOffsetKey".into(),
+            Value::Integer(offset.into()),
+        );
+        t_info.insert(
+            "UASharedPasteboardTypeInfoSizeKey".into(),
+            Value::Integer(size.into()),
+        );
+        t_info.insert(
+            "UASharedPasteboardTypeInfoIndex".into(),
+            Value::Integer((idx as u64).into()),
+        );
+        t_info.insert(
+            "UASharedPasteboardTypeInfoPrefRepKey".into(),
+            Value::Boolean(idx == 0),
+        );
+        t_info.insert(
+            "UASharedPasteboardTypeInfoUUIDKey".into(),
+            Value::Uid(uuid_uid),
+        );
         let t_uid = push_obj(&mut objects, Value::Dictionary(t_info));
         type_dict_keys.push(Value::Uid(uti_uid));
         type_dict_objs.push(Value::Uid(t_uid));
@@ -487,7 +517,10 @@ pub fn encode_wrapper_for_test(pb: &Pasteboard) -> Result<Vec<u8>> {
 
     let mut item_dict = Dictionary::new();
     item_dict.insert("$class".into(), Value::Uid(cls_item));
-    item_dict.insert("types".into(), Value::Uid(types_uid));
+    item_dict.insert(
+        "UASharedPasteboardItemInfoTypesKey".into(),
+        Value::Uid(types_uid),
+    );
     let item_uid = push_obj(&mut objects, Value::Dictionary(item_dict));
 
     let mut items_nsarray = Dictionary::new();
@@ -498,16 +531,38 @@ pub fn encode_wrapper_for_test(pb: &Pasteboard) -> Result<Vec<u8>> {
     );
     let items_uid = push_obj(&mut objects, Value::Dictionary(items_nsarray));
 
+    let total_size = blob.len() as u64;
     let mut pbinfo = Dictionary::new();
     pbinfo.insert("$class".into(), Value::Uid(cls_info));
-    pbinfo.insert("items".into(), Value::Uid(items_uid));
+    pbinfo.insert(
+        "UASharedPasteboardInfoItemsKey".into(),
+        Value::Uid(items_uid),
+    );
+    pbinfo.insert(
+        "UASharedPasteboardInfoDataSizeKey".into(),
+        Value::Integer(total_size.into()),
+    );
     let pbinfo_uid = push_obj(&mut objects, Value::Dictionary(pbinfo));
 
     let data_uid = push_obj(&mut objects, Value::Data(blob));
     let mut wrapper = Dictionary::new();
     wrapper.insert("$class".into(), Value::Uid(cls_wrapper));
-    wrapper.insert("pbinfo".into(), Value::Uid(pbinfo_uid));
-    wrapper.insert("dataFile".into(), Value::Uid(data_uid));
+    wrapper.insert(
+        "UASharedPasteboardInfoWrapperPBInfoKey".into(),
+        Value::Uid(pbinfo_uid),
+    );
+    wrapper.insert(
+        "UASharedPasteboardInfoWrapperExtraDataKey".into(),
+        Value::Uid(data_uid),
+    );
+    wrapper.insert(
+        "UASharedPasteboardInfoWrapperExtraTypeKey".into(),
+        Value::Integer(2.into()),
+    );
+    wrapper.insert(
+        "UASharedPasteboardInfoWrapperProtocolVersionKey".into(),
+        Value::Integer(0.into()),
+    );
     let root_uid = push_obj(&mut objects, Value::Dictionary(wrapper));
 
     let mut top = Dictionary::new();
@@ -524,6 +579,12 @@ pub fn encode_wrapper_for_test(pb: &Pasteboard) -> Result<Vec<u8>> {
         .to_writer_binary(&mut out)
         .context("encoding binary NSKeyedArchiver plist")?;
     Ok(out)
+}
+
+/// Encode a [`Pasteboard`] as a synthetic binary `NSKeyedArchiver`
+/// `UASharedPasteboardInfoWrapper` plist for loopback testing.
+pub fn encode_wrapper_for_test(pb: &Pasteboard) -> Result<Vec<u8>> {
+    encode_wrapper(pb)
 }
 
 #[cfg(test)]

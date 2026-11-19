@@ -66,6 +66,27 @@ impl HandoffBle {
         }
         None
     }
+
+    /// Encrypt a 10-byte [`HandoffPayload`] into a 16-byte `0x0c` Continuity TLV
+    /// (`0c 0e 08 iv0 iv1 tag0 ct[10]`) ready for `advertise::broadcast`.
+    #[allow(dead_code)]
+    pub fn seal(
+        key: &[u8],
+        counter_iv: [u8; 2],
+        payload: &HandoffPayload,
+    ) -> anyhow::Result<Vec<u8>> {
+        let status = 0x08u8;
+        let plain = payload.encode();
+        let (ct, tag) = crate::gcm::seal_truncated(key, &counter_iv, &[status], &plain, 1)?;
+        let mut out = Vec::with_capacity(16);
+        out.push(TYPE_HANDOFF);
+        out.push(14);
+        out.push(status);
+        out.extend_from_slice(&counter_iv);
+        out.push(tag[0]);
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
 }
 
 /// Helper for callers that hold BlueZ `ManufacturerData` (a map of company id
@@ -85,6 +106,16 @@ pub struct HandoffPayload {
 }
 
 impl HandoffPayload {
+    #[allow(dead_code)]
+    pub fn encode(&self) -> [u8; 10] {
+        let mut out = [0u8; 10];
+        out[0] = self.status;
+        out[1..8].copy_from_slice(&self.activity_hash);
+        out[8] = self.flags.raw;
+        out[9] = 0x20;
+        out
+    }
+
     pub fn parse(plain: &[u8]) -> Option<Self> {
         if plain.len() < 10 {
             return None;
@@ -206,5 +237,30 @@ mod tests {
     fn flags_clipboard_bit() {
         assert!(HandoffFlags::from_byte(0x08).clipboard_available());
         assert!(!HandoffFlags::from_byte(0x01).clipboard_available());
+    }
+
+    #[test]
+    fn seal_and_parse_roundtrip() {
+        let key = [0x42u8; 16];
+        let payload = HandoffPayload {
+            status: 0x00,
+            activity_hash: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77],
+            flags: HandoffFlags::from_byte(0x08),
+        };
+        let tlv = HandoffBle::seal(&key, [0x34, 0x12], &payload).unwrap();
+        assert_eq!(tlv.len(), 16);
+        let parsed = HandoffBle::parse(&tlv).unwrap();
+        let plain = crate::gcm::open_truncated(
+            &key,
+            &parsed.counter_iv,
+            &[parsed.status],
+            &parsed.ciphertext,
+            &parsed.tag,
+        )
+        .unwrap()
+        .unwrap();
+        let back = HandoffPayload::parse(&plain).unwrap();
+        assert_eq!(back.activity_hash, payload.activity_hash);
+        assert!(back.flags.clipboard_available());
     }
 }

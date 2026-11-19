@@ -244,9 +244,14 @@ async fn confirm_match() -> Result<bool> {
     .context("reading confirmation")?
 }
 
-/// Write `data` to `path`, creating it with mode 0600 (and tightening an
-/// existing file to 0600 as well).
+/// Write `data` to `path`, creating parent dirs and mode 0600 (and tightening
+/// an existing file to 0600 as well).
 fn write_0600(path: &Path, data: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     std::fs::write(path, data)?;
     let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_mode(0o600);

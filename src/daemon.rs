@@ -240,6 +240,7 @@ struct Pending {
 struct DaemonConfig {
     default_directory: PathBuf,
     identity: PathBuf,
+    auto_clipboard: bool,
 }
 
 impl Default for DaemonConfig {
@@ -247,6 +248,7 @@ impl Default for DaemonConfig {
         Self {
             default_directory: default_directory(),
             identity: default_identity(),
+            auto_clipboard: false,
         }
     }
 }
@@ -254,6 +256,7 @@ impl Default for DaemonConfig {
 struct State {
     receive_task: Option<tokio::task::JoinHandle<()>>,
     send_task: Option<tokio::task::JoinHandle<()>>,
+    clipboard_task: Option<tokio::task::JoinHandle<()>>,
     radio_starting: bool,
     pending: Option<Pending>,
     snapshot: DaemonSnapshot,
@@ -273,6 +276,7 @@ impl State {
         Arc::new(Mutex::new(Self {
             receive_task: None,
             send_task: None,
+            clipboard_task: None,
             radio_starting: false,
             pending: None,
             snapshot,
@@ -339,7 +343,11 @@ fn err_reply(state: &State, message: impl Into<String>) -> Reply {
 }
 
 pub async fn run(socket: PathBuf) -> Result<()> {
-    run_with_ops(socket, Arc::new(ProdServiceOps), DaemonConfig::default()).await
+    let cfg = DaemonConfig {
+        auto_clipboard: true,
+        ..DaemonConfig::default()
+    };
+    run_with_ops(socket, Arc::new(ProdServiceOps), cfg).await
 }
 
 async fn run_with_ops(socket: PathBuf, ops: Arc<dyn ServiceOps>, cfg: DaemonConfig) -> Result<()> {
@@ -377,7 +385,11 @@ async fn run_with_ops(socket: PathBuf, ops: Arc<dyn ServiceOps>, cfg: DaemonConf
             }
         }
     }
+    let auto_clip = cfg.auto_clipboard;
     let state = State::new(ops, cfg);
+    if auto_clip {
+        let _ = start_clipboard_sync(state.clone()).await;
+    }
     tracing::info!(path=%socket.display(), "ac-dc daemon listening");
     loop {
         let (stream, _) = listener.accept().await?;
@@ -429,6 +441,8 @@ async fn handle(stream: UnixStream, state: Arc<Mutex<State>>) -> Result<()> {
         "send" => start_send(state.clone(), request).await,
         "peers" => discover(state.clone()).await,
         "clipboard_report" => report_clipboard(state.clone(), request).await,
+        "clipboard_start" => start_clipboard_sync(state.clone()).await,
+        "clipboard_stop" => stop_clipboard_sync(state.clone()).await,
         _ => {
             let s = state.lock().await;
             err_reply(&s, "unknown operation")
@@ -899,6 +913,85 @@ async fn report_clipboard(state: Arc<Mutex<State>>, request: Request) -> Reply {
     ok_reply(&s, "clipboard status updated", None)
 }
 
+async fn start_clipboard_sync(state: Arc<Mutex<State>>) -> Reply {
+    let keys =
+        crate::keystore::resolve_path(None, crate::keystore::default_keys_path(), "keys.json");
+    let identity = crate::keystore::resolve_path(
+        None,
+        crate::keystore::default_rpidentity_path(),
+        "rpidentity.json",
+    );
+    if !keys.exists() || !identity.exists() {
+        let mut s = state.lock().await;
+        s.snapshot.clipboard = Some(crate::ipc::ClipboardStatus {
+            available: false,
+            state: "unpaired".into(),
+            last_item_kind: None,
+            last_error: Some("Run ac-dc receive-key & ac-dc pair".into()),
+        });
+        s.publish();
+        return err_reply(&s, "clipboard sync requires keys.json and rpidentity.json");
+    }
+
+    let mut s = state.lock().await;
+    if s.clipboard_task.as_ref().is_some_and(|t| !t.is_finished()) {
+        return ok_reply(&s, "clipboard sync already running", None);
+    }
+
+    let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel();
+    let reporter_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(status) = status_rx.recv().await {
+            let mut st = reporter_state.lock().await;
+            st.snapshot.clipboard = Some(status);
+            st.publish();
+        }
+    });
+
+    let task_state = state.clone();
+    s.clipboard_task = Some(tokio::spawn(async move {
+        let res = crate::orchestrate::run_with_reporter(
+            crate::orchestrate::AutoConfig {
+                keys,
+                identity_path: identity,
+                instance: None,
+                host: None,
+                port: None,
+                loopback: false,
+                notify: true,
+            },
+            Some(status_tx),
+        )
+        .await;
+        let mut st = task_state.lock().await;
+        st.clipboard_task = None;
+        if let Err(e) = res {
+            let msg = format!("{e:#}");
+            tracing::warn!(error=%msg, "clipboard auto-sync stopped");
+            st.snapshot.clipboard = Some(crate::ipc::ClipboardStatus {
+                available: false,
+                state: "error".into(),
+                last_item_kind: None,
+                last_error: Some(msg),
+            });
+            st.publish();
+        }
+    }));
+    ok_reply(&s, "clipboard sync started", None)
+}
+
+async fn stop_clipboard_sync(state: Arc<Mutex<State>>) -> Reply {
+    let mut s = state.lock().await;
+    if let Some(task) = s.clipboard_task.take() {
+        task.abort();
+    }
+    if let Some(c) = s.snapshot.clipboard.as_mut() {
+        c.state = "paused".into();
+    }
+    s.publish();
+    ok_reply(&s, "clipboard sync paused", None)
+}
+
 /// Most handlers answer from state they already hold, so a request still
 /// outstanding after this long is one the daemon will never answer. The UI awaits
 /// `ctl` in its single engine loop, where an indefinite wait also blocks stop,
@@ -1113,6 +1206,7 @@ mod tests {
             DaemonConfig {
                 default_directory: PathBuf::from("/tmp"),
                 identity: PathBuf::from("/tmp"),
+                auto_clipboard: false,
             },
         )
     }

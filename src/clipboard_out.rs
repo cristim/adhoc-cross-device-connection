@@ -17,7 +17,7 @@
 use anyhow::{bail, Context, Result};
 
 // Reuse the M2 pull client's pasteboard types — do NOT duplicate them.
-use crate::companion_client::Pasteboard;
+use crate::companion_client::{Pasteboard, PasteboardItem};
 
 /// The category of representation we picked, in preference order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +186,71 @@ pub fn copy_pasteboard(pb: &Pasteboard) -> Result<Option<CopyOutcome>> {
         kind: plan.kind,
         spawned,
     }))
+}
+
+/// Read the current Wayland clipboard via `wl-paste` into a [`Pasteboard`]
+/// suitable for serving to a macOS Universal Clipboard peer.
+#[allow(dead_code)]
+pub fn read_clipboard() -> Result<Pasteboard> {
+    use std::process::Command;
+    if !wayland_available() {
+        bail!("WAYLAND_DISPLAY is not set");
+    }
+    let types_out = Command::new("wl-paste")
+        .arg("--list-types")
+        .output()
+        .context("running wl-paste --list-types")?;
+    if !types_out.status.success() {
+        return Ok(Pasteboard::default());
+    }
+    let list = String::from_utf8_lossy(&types_out.stdout);
+    let mimes: Vec<&str> = list
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if let Some(mime) = mimes
+        .iter()
+        .copied()
+        .find(|m| *m == "text/plain;charset=utf-8" || *m == "UTF8_STRING" || *m == "text/plain")
+    {
+        let out = Command::new("wl-paste")
+            .args(["--no-newline", "--type", mime])
+            .output()
+            .context("reading Wayland text clipboard")?;
+        if out.status.success() && !out.stdout.is_empty() {
+            return Ok(Pasteboard {
+                items: vec![
+                    PasteboardItem {
+                        uti: "public.utf8-plain-text".into(),
+                        data: out.stdout.clone(),
+                    },
+                    PasteboardItem {
+                        uti: "public.text".into(),
+                        data: out.stdout,
+                    },
+                ],
+            });
+        }
+    }
+
+    if mimes.contains(&"image/png") {
+        let out = Command::new("wl-paste")
+            .args(["--type", "image/png"])
+            .output()
+            .context("reading Wayland image/png clipboard")?;
+        if out.status.success() && !out.stdout.is_empty() {
+            return Ok(Pasteboard {
+                items: vec![PasteboardItem {
+                    uti: "public.png".into(),
+                    data: out.stdout,
+                }],
+            });
+        }
+    }
+
+    Ok(Pasteboard::default())
 }
 
 /// Thin, side-effecting wrapper around the `wl-copy` process: spawn it (with an

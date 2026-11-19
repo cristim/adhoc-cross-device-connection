@@ -19,7 +19,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::gcm;
 
@@ -31,6 +31,8 @@ pub struct HandoffKey {
 
 #[derive(Debug, Deserialize)]
 struct JsonKeyFile {
+    #[serde(default)]
+    ids_device_id: Option<String>,
     keys: Vec<JsonKey>,
 }
 
@@ -51,7 +53,46 @@ struct PlistKeyItem {
 }
 
 pub struct KeyStore {
+    pub ids_device_id: Option<String>,
     pub keys: Vec<HandoffKey>,
+}
+
+pub fn default_data_dir() -> PathBuf {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".local/share")
+        });
+    data_home.join("ac-dc")
+}
+
+pub fn default_keys_path() -> PathBuf {
+    default_data_dir().join("keys.json")
+}
+
+pub fn default_rpidentity_path() -> PathBuf {
+    default_data_dir().join("rpidentity.json")
+}
+
+/// Resolve an optional CLI path: explicit arg -> XDG data path (if present) ->
+/// legacy CWD path (if present) -> XDG data path.
+pub fn resolve_path(explicit: Option<PathBuf>, xdg_default: PathBuf, legacy_cwd: &str) -> PathBuf {
+    if let Some(p) = explicit {
+        return p;
+    }
+    if xdg_default.exists() {
+        return xdg_default;
+    }
+    let legacy = Path::new(legacy_cwd);
+    if legacy.exists() {
+        return legacy.to_path_buf();
+    }
+    xdg_default
 }
 
 impl KeyStore {
@@ -71,7 +112,7 @@ impl KeyStore {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            return Self::validated(keys);
+            return Self::validated(jf.ids_device_id.filter(|s| !s.trim().is_empty()), keys);
         }
 
         // Fall back to a single raw binary plist keychain item.
@@ -80,10 +121,13 @@ impl KeyStore {
                 plist::Value::Data(d) => d,
                 other => anyhow::bail!("keyData was not binary data: {other:?}"),
             };
-            return Self::validated(vec![HandoffKey {
-                id: item.key_identifier.unwrap_or_default(),
-                key,
-            }]);
+            return Self::validated(
+                None,
+                vec![HandoffKey {
+                    id: item.key_identifier.unwrap_or_default(),
+                    key,
+                }],
+            );
         }
 
         anyhow::bail!(
@@ -92,11 +136,14 @@ impl KeyStore {
         )
     }
 
-    fn validated(keys: Vec<HandoffKey>) -> Result<Self> {
+    fn validated(ids_device_id: Option<String>, keys: Vec<HandoffKey>) -> Result<Self> {
         for k in &keys {
             gcm::validate_key(&k.key).with_context(|| format!("key {:?}", k.id))?;
         }
-        Ok(KeyStore { keys })
+        Ok(KeyStore {
+            ids_device_id,
+            keys,
+        })
     }
 
     pub fn is_empty(&self) -> bool {

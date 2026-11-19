@@ -115,9 +115,9 @@ enum Cmd {
     },
     /// Scan for and decrypt Handoff / Universal Clipboard BLE adverts.
     Scan {
-        /// Path to the key file exported from macOS (see macos/export-keys.sh).
-        #[arg(short, long, default_value = "keys.json")]
-        keys: PathBuf,
+        /// Path to the key file exported from macOS (defaults to ~/.local/share/ac-dc/keys.json).
+        #[arg(short, long)]
+        keys: Option<PathBuf>,
     },
     /// Capture raw Handoff adverts as hex (no keys needed), to grab a packet
     /// for validating the decrypt against your own devices.
@@ -212,38 +212,33 @@ enum Cmd {
     /// code (SAS) that you must compare before confirming. keys.json is written
     /// (mode 0600) only after you confirm the codes matched.
     ReceiveKey {
-        /// Where to write the received key file.
-        #[arg(short, long, default_value = "keys.json")]
-        out: PathBuf,
+        /// Where to write the received key file (defaults to ~/.local/share/ac-dc/keys.json).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Also auto-pair over Companion-Link LAN mDNS if `ids_device_id` is included.
+        #[arg(long, default_value_t = true)]
+        auto_pair: bool,
     },
     /// Decrypt a single advertisement supplied as a hex string (offline test).
     Decrypt {
         #[arg(short, long)]
-        keys: PathBuf,
+        keys: Option<PathBuf>,
         /// Manufacturer data hex, e.g. "0c0e082a0099dead...".
         #[arg(short, long)]
         data: String,
     },
     /// Milestone 2: pull Universal Clipboard content over companion-link.
-    ///
-    /// Runs the transport-independent client: TCP connect, Pair-Verify M1-M4,
-    /// then the system-info and pasteboard-fetch exchanges. Until AWDL is up
-    /// (see docs/architecture.md) this will fail at `connect` against a real
-    /// device — that is expected. Use `--loopback` to exercise the full flow
-    /// against an in-process mock peer with no network.
     Pull {
-        /// Peer address. Normally supplied later by `discover` over awdl0.
+        /// Peer address. Normally auto-discovered via mDNS.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        /// Peer companion-link TCP port.
+        /// Peer companion-link TCP port (0 = auto-discover via LAN/AWDL mDNS).
         #[arg(long, default_value_t = 0)]
         port: u16,
-        /// BLE keystore path (kept for CLI parity; used as the identity source
-        /// if --identity is not given). See macos/export-keys.sh.
-        #[arg(short, long, default_value = "keys.json")]
-        keys: PathBuf,
-        /// RPIdentity keys (Ed25519 signing key + known peers) for Pair-Verify.
-        /// See macos/RPIDENTITY.md for the exporter and expected schema.
+        /// BLE keystore path (fallback if --identity is not given).
+        #[arg(short, long)]
+        keys: Option<PathBuf>,
+        /// RPIdentity keys (saved by `ac-dc pair`, defaults to ~/.local/share/ac-dc/rpidentity.json).
         #[arg(long)]
         identity: Option<PathBuf>,
         /// Run against an in-process loopback mock peer (no network, no keys).
@@ -266,19 +261,18 @@ enum Cmd {
         host: String,
         #[arg(long, default_value_t = 0)]
         port: u16,
-        #[arg(long, default_value = "rpidentity.json")]
-        out: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
         #[arg(long)]
         pin_file: Option<PathBuf>,
-        /// Client pairing UUID / IDS device UUID (e.g. an existing account IDS device UUID
-        /// so `sharingd` recognizes the sender in `IDSService.devices`).
+        /// Client pairing UUID / IDS device UUID (defaults to `ids_device_id` from keys.json if present).
         #[arg(long)]
         pairing_id: Option<String>,
     },
     /// Watch real BLE copy events and pull from the matching companion-link peer.
     Auto {
-        #[arg(long, default_value = "keys.json")]
-        keys: PathBuf,
+        #[arg(long)]
+        keys: Option<PathBuf>,
         /// Explicit mDNS instance; otherwise match the triggering BLE address to rpBA.
         #[arg(long)]
         instance: Option<String>,
@@ -288,9 +282,9 @@ enum Cmd {
         port: Option<u16>,
         #[arg(long)]
         notify: bool,
-        /// RPIdentity keys for Pair-Verify (saved by `ac-dc pair`).
-        #[arg(long, default_value = "rpidentity.json")]
-        identity: PathBuf,
+        /// RPIdentity keys for Pair-Verify (defaults to ~/.local/share/ac-dc/rpidentity.json).
+        #[arg(long)]
+        identity: Option<PathBuf>,
         /// Drive the wiring against the in-process loopback mock (no AWDL).
         #[arg(long)]
         loopback: bool,
@@ -533,6 +527,7 @@ async fn command(cmd: Cmd) -> Result<()> {
             advertise::broadcast(data, seconds, interval_ms).await?;
         }
         Cmd::Scan { keys } => {
+            let keys = keystore::resolve_path(keys, keystore::default_keys_path(), "keys.json");
             let store = keystore::KeyStore::load(&keys)?;
             if store.is_empty() {
                 tracing::warn!("no keys loaded; adverts will be detected but not decrypted");
@@ -558,13 +553,44 @@ async fn command(cmd: Cmd) -> Result<()> {
                 _ = shutdown() => tracing::info!("stopping"),
             }
         }
-        Cmd::ReceiveKey { out } => {
+        Cmd::ReceiveKey { out, auto_pair } => {
+            let out = out.unwrap_or_else(keystore::default_keys_path);
             tokio::select! {
                 r = transfer_ble::receive_key(&out) => r?,
-                _ = shutdown() => tracing::info!("stopping"),
+                _ = shutdown() => {
+                    tracing::info!("stopping");
+                    return Ok(());
+                }
+            }
+            if auto_pair {
+                if let Ok(store) = keystore::KeyStore::load(&out) {
+                    if let Some(ids_id) = store.ids_device_id {
+                        let rp_out = keystore::default_rpidentity_path();
+                        println!("Auto-pairing over Companion-Link using IDS device {ids_id}...");
+                        let (host, port) = discover::companion_link_target("127.0.0.1", 0).await?;
+                        let addr = discover::socket_target(&host, port).await?;
+                        let stream = tokio::net::TcpStream::connect(addr).await?;
+                        stream.set_nodelay(true).ok();
+                        let paired = pair_setup::run_pair_setup(stream, Some(&ids_id), || async {
+                            Ok("public".to_string())
+                        })
+                        .await?;
+                        pair_setup::write_identity_json(&rp_out, &paired)?;
+                        println!(
+                            "Paired with '{}' and saved {}",
+                            paired.label,
+                            rp_out.display()
+                        );
+                    } else {
+                        println!(
+                            "Next step: run `ac-dc pair --pairing-id <Mac-or-iPhone-IDS-UUID>`"
+                        );
+                    }
+                }
             }
         }
         Cmd::Decrypt { keys, data } => {
+            let keys = keystore::resolve_path(keys, keystore::default_keys_path(), "keys.json");
             let store = keystore::KeyStore::load(&keys)?;
             let bytes = hex::decode(data.trim())?;
             let ble = advert::HandoffBle::parse(&bytes)
@@ -638,7 +664,18 @@ async fn command(cmd: Cmd) -> Result<()> {
                 tracing::info!(%host, port, "connecting companion-link with Transient Pair-Setup (fixedPIN=\"public\")");
                 companion_client::connect_transient(&host, port, "public").await?
             } else {
-                let identity_path = identity.unwrap_or(keys);
+                let identity_path = identity.unwrap_or_else(|| {
+                    let rp = keystore::resolve_path(
+                        None,
+                        keystore::default_rpidentity_path(),
+                        "rpidentity.json",
+                    );
+                    if rp.exists() {
+                        rp
+                    } else {
+                        keystore::resolve_path(keys, keystore::default_keys_path(), "keys.json")
+                    }
+                });
                 match companion::PairingIdentity::load(&identity_path) {
                     Ok(ident) => {
                         tracing::info!(%host, port, "connecting companion-link with Pair-Verify");
@@ -669,6 +706,19 @@ async fn command(cmd: Cmd) -> Result<()> {
             pin_file,
             pairing_id,
         } => {
+            let out = out.unwrap_or_else(keystore::default_rpidentity_path);
+            let pairing_id = pairing_id.or_else(|| {
+                let kp = keystore::resolve_path(None, keystore::default_keys_path(), "keys.json");
+                keystore::KeyStore::load(&kp)
+                    .ok()
+                    .and_then(|s| s.ids_device_id)
+            });
+            if pairing_id.is_none() {
+                tracing::warn!(
+                    "no --pairing-id supplied and keys.json has no ids_device_id; \
+                     Mac sharingd may reject clipboard pulls with -6708 unless the UUID is in IDSService.devices"
+                );
+            }
             let (host, port) = discover::companion_link_target(&host, port).await?;
             let addr = discover::socket_target(&host, port).await?;
             let stream = tokio::net::TcpStream::connect(addr).await?;
@@ -713,6 +763,12 @@ async fn command(cmd: Cmd) -> Result<()> {
             loopback,
             notify,
         } => {
+            let keys = keystore::resolve_path(keys, keystore::default_keys_path(), "keys.json");
+            let identity = keystore::resolve_path(
+                identity,
+                keystore::default_rpidentity_path(),
+                "rpidentity.json",
+            );
             orchestrate::run(orchestrate::AutoConfig {
                 keys,
                 identity_path: identity,

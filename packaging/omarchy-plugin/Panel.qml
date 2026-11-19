@@ -558,15 +558,32 @@ Panel {
             Layout.fillWidth: true
             textFormat: Text.PlainText
             elide: Text.ElideRight
-            color: Qt.rgba(1, 1, 1, 0.65)
+            color: (root.clipboardState && root.clipboardState.last_error)
+              ? Color.urgent
+              : Qt.rgba(1, 1, 1, 0.65)
             font.family: root.font(Style.font.caption)
             font.pixelSize: Style.font.caption
-            text: root.clipboardState
-              ? (root.sanitizeText(root.clipboardState.state || "idle", 32)
-                + (root.clipboardState.last_item_kind
-                  ? (" · " + root.sanitizeText(root.clipboardState.last_item_kind, 48))
-                  : ""))
-              : ""
+            text: {
+              if (!root.clipboardState) return ""
+              var s = root.sanitizeText(root.clipboardState.state || "idle", 32)
+              if (root.clipboardState.last_item_kind) {
+                return s + " · " + root.sanitizeText(root.clipboardState.last_item_kind, 48)
+              }
+              if (root.clipboardState.last_error) {
+                return s + " · " + root.sanitizeText(root.clipboardState.last_error, 64)
+              }
+              return s
+            }
+          }
+          Button {
+            visible: root.clipboardState !== null && root.clipboardState.state !== "unpaired"
+            text: (root.clipboardState && (root.clipboardState.state === "paused" || root.clipboardState.state === "error"))
+              ? "Start"
+              : "Pause"
+            onClicked: {
+              var paused = root.clipboardState && (root.clipboardState.state === "paused" || root.clipboardState.state === "error")
+              root.runCtl([paused ? "clipboard_start" : "clipboard_stop"])
+            }
           }
         }
 
