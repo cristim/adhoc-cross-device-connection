@@ -566,6 +566,7 @@ async fn run_receive_loop(
             once: mode == ReceiveMode::Once,
             notify: true,
             open_destination: false,
+            visibility: airdrop::VisibilityMode::Everyone,
         });
         tokio::pin!(receive);
 

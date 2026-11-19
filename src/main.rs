@@ -5,6 +5,7 @@ mod airdrop;
 mod clipboard_out;
 mod companion;
 mod companion_client;
+mod contacts;
 mod daemon;
 mod discover;
 mod gcm;
@@ -23,6 +24,16 @@ mod ui_widgets;
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
+
+#[derive(Debug, Subcommand)]
+enum ContactsAction {
+    /// Add a trusted Apple ID email or phone number.
+    Add { identifier: String },
+    /// Remove a trusted Apple ID email or phone number.
+    Remove { identifier: String },
+    /// List configured trusted senders.
+    List,
+}
 
 #[derive(Parser)]
 #[command(name = "ac-dc", version, about)]
@@ -64,6 +75,8 @@ enum Cmd {
         mode: Option<String>,
         #[arg(long)]
         once: bool,
+        #[arg(long)]
+        contacts_only: bool,
     },
     /// Open the native Airdrop-compatible send/receive window.
     Ui,
@@ -124,6 +137,11 @@ enum Cmd {
         #[arg(long, conflicts_with = "enable")]
         disable: bool,
     },
+    /// Manage trusted Apple IDs / phone numbers for Contacts Only mode.
+    Contacts {
+        #[command(subcommand)]
+        action: ContactsAction,
+    },
     /// Report observed AWDL state; link readiness is not proof of transport.
     Status {
         #[arg(long)]
@@ -165,6 +183,9 @@ enum Cmd {
         /// Advertise a Bluetooth wake hint during receiving.
         #[arg(long)]
         ble_wake: bool,
+        /// Require Apple Contacts Only SenderRecordData.
+        #[arg(long)]
+        contacts_only: bool,
     },
     /// Receive an exported `keys.json` from a Mac over Bluetooth LE.
     ///
@@ -278,6 +299,7 @@ async fn command(cmd: Cmd) -> Result<()> {
             ble_wake,
             mode,
             once,
+            contacts_only: _,
         } => {
             if op == "subscribe" {
                 daemon::ctl_subscribe(daemon::default_socket()).await?;
@@ -346,6 +368,7 @@ async fn command(cmd: Cmd) -> Result<()> {
             once,
             notify,
             ble_wake,
+            contacts_only,
         } => {
             airdrop::run(airdrop::Config {
                 radio_managed: false,
@@ -360,8 +383,40 @@ async fn command(cmd: Cmd) -> Result<()> {
                 once,
                 notify,
                 open_destination: true,
+                visibility: if contacts_only {
+                    airdrop::VisibilityMode::ContactsOnly
+                } else {
+                    airdrop::VisibilityMode::Everyone
+                },
             })
             .await?;
+        }
+        Cmd::Contacts { action } => {
+            let path = contacts::default_path();
+            let mut store = contacts::TrustedSenders::load(&path)?;
+            match action {
+                ContactsAction::Add { identifier } => {
+                    if store.add(&identifier)? {
+                        store.save(&path)?;
+                        println!("Added trusted sender.");
+                    } else {
+                        println!("Sender already in trusted list.");
+                    }
+                }
+                ContactsAction::Remove { identifier } => {
+                    if store.remove(&identifier)? {
+                        store.save(&path)?;
+                        println!("Removed trusted sender.");
+                    } else {
+                        println!("Sender not found in trusted list.");
+                    }
+                }
+                ContactsAction::List => {
+                    for entry in store.list() {
+                        println!("{entry}");
+                    }
+                }
+            }
         }
         Cmd::Doctor {
             json,
