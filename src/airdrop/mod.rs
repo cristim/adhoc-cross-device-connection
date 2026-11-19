@@ -16,6 +16,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+#[allow(unused_imports)]
+pub use storage::{validate_max_disk_percent, DEFAULT_MAX_DISK_PERCENT};
 use tokio_rustls::{
     rustls::{
         self,
@@ -235,19 +237,48 @@ fn board(entries: &[archive::Entry]) -> Pasteboard {
             .collect(),
     }
 }
-async fn deliver(entries: Vec<archive::Entry>, dest: PathBuf, notify: bool) -> Result<()> {
+pub fn validate_http_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    ensure!(
+        !trimmed.is_empty()
+            && trimmed.len() <= 4096
+            && !trimmed.chars().any(|c| c.is_control() || c.is_whitespace()),
+        "unsupported link"
+    );
+    let rest = if trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("https://") {
+        &trimmed[8..]
+    } else if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("http://") {
+        &trimmed[7..]
+    } else {
+        anyhow::bail!("unsupported link scheme");
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    ensure!(!host.is_empty(), "link missing host");
+    Ok(trimmed.to_string())
+}
+
+async fn deliver(
+    entries: Vec<archive::Entry>,
+    dest: PathBuf,
+    notify: bool,
+    copy_to_clipboard: bool,
+) -> Result<()> {
     ensure!(
         !entries.is_empty(),
         "transfer contains no supported regular files"
     );
     let paths = archive::store(&dest, &entries)?;
-    let pb = board(&entries);
-    let copied = match crate::clipboard_out::copy_pasteboard(&pb) {
-        Ok(out) => out.is_some_and(|o| o.spawned),
-        Err(e) => {
-            tracing::warn!(error=%e,"files saved but clipboard unavailable");
-            false
+    let copied = if copy_to_clipboard {
+        let pb = board(&entries);
+        match crate::clipboard_out::copy_pasteboard(&pb) {
+            Ok(out) => out.is_some_and(|o| o.spawned),
+            Err(e) => {
+                tracing::warn!(error=%e,"files saved but clipboard unavailable");
+                false
+            }
         }
+    } else {
+        false
     };
     tracing::info!(
         files = paths.len(),
@@ -343,6 +374,8 @@ async fn connection(
     sessions: Sessions,
     visibility: VisibilityMode,
     record: Option<Arc<Vec<u8>>>,
+    max_disk_percent: u8,
+    copy_to_clipboard: bool,
 ) -> Result<()> {
     let peer = stream.peer_addr()?.ip();
     let started = std::time::Instant::now();
@@ -450,17 +483,13 @@ async fn connection(
                             .context("link Items missing")?
                         {
                             let url = url.as_string().context("link is not text")?;
-                            ensure!(
-                                (url.starts_with("https://") || url.starts_with("http://"))
-                                    && !url.chars().any(char::is_control),
-                                "unsupported link"
-                            );
+                            let url = validate_http_url(url)?;
                             entries.push(archive::Entry {
                                 name: "shared-link.txt".into(),
-                                bytes: url.as_bytes().to_vec(),
+                                bytes: url.into_bytes(),
                             });
                         }
-                        deliver(entries, dest.clone(), notify).await?;
+                        deliver(entries, dest.clone(), notify, copy_to_clipboard).await?;
                     }
                     if !links {
                         let mut grants = sessions.approved.lock().unwrap();
@@ -484,18 +513,41 @@ async fn connection(
                 let upload = req.upload.context("upload spool missing")?;
                 let ty = ty.to_owned();
                 let directory = dest.clone();
+                let limit = storage::max_allowed_bytes(&directory, max_disk_percent)?;
+                if let Some(declared) = req
+                    .headers
+                    .get("totalbytes")
+                    .or_else(|| req.headers.get("content-length"))
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    ensure!(declared <= limit, "transfer exceeds disk space quota");
+                }
                 let cancellation = cancel::Guard(cancel::Token::default());
                 let token = cancellation.0.clone();
                 let saved = tokio::task::spawn_blocking(move || {
                     use std::io::Seek;
                     let mut file = upload.reopen()?;
                     file.rewind()?;
-                    storage::receive_cancel(file, &ty, &directory, token)
+                    storage::receive_cancel_with_limit(file, &ty, &directory, token, limit)
                 })
                 .await??;
-                let copied = crate::clipboard_out::copy_pasteboard(&board(&saved.clipboard))
-                    .ok()
-                    .is_some_and(|v| v.is_some_and(|v| v.spawned));
+                let copied = if copy_to_clipboard {
+                    let pb = if saved.clipboard.is_empty() {
+                        crate::companion_client::Pasteboard {
+                            items: vec![crate::companion_client::PasteboardItem {
+                                uti: "public.utf8-plain-text".into(),
+                                data: saved.directory.display().to_string().into_bytes(),
+                            }],
+                        }
+                    } else {
+                        board(&saved.clipboard)
+                    };
+                    crate::clipboard_out::copy_pasteboard(&pb)
+                        .ok()
+                        .is_some_and(|v| v.is_some_and(|v| v.spawned))
+                } else {
+                    false
+                };
                 tracing::info!(
                     files = saved.files,
                     bytes = saved.bytes,
@@ -587,9 +639,12 @@ pub struct Config {
     pub radio_managed: bool,
     pub ble_wake: bool,
     pub visibility: VisibilityMode,
+    pub max_disk_percent: u8,
+    pub copy_to_clipboard: bool,
     pub approval: Option<tokio::sync::mpsc::Sender<Incoming>>,
 }
 pub async fn run(c: Config) -> Result<()> {
+    storage::validate_max_disk_percent(c.max_disk_percent)?;
     ensure!(
         RECEIVE_SECONDS.contains(&c.seconds),
         "{}",
@@ -679,7 +734,7 @@ pub async fn run(c: Config) -> Result<()> {
             _=&mut shutdown=>break,
             Some(())=rx.recv()=>{if c.once{break;}},
             Some(result)=tasks.join_next(),if !tasks.is_empty()=>{if let Ok(Err(e))=result{tracing::info!(error=%format!("{e:#}"),"Airdrop-compatible connection ended");}},
-            result=listener.accept()=>{let (s,_)=result?;if tasks.len()>=4{drop(s);continue;}tasks.spawn(connection(s,acceptor.clone(),c.name.clone(),dest.clone(),c.notify,c.open_destination,tx.clone(),sessions.clone(),c.visibility,record.clone()));}
+            result=listener.accept()=>{let (s,_)=result?;if tasks.len()>=4{drop(s);continue;}tasks.spawn(connection(s,acceptor.clone(),c.name.clone(),dest.clone(),c.notify,c.open_destination,tx.clone(),sessions.clone(),c.visibility,record.clone(),c.max_disk_percent,c.copy_to_clipboard));}
         }
     }
     tasks.abort_all();
@@ -725,6 +780,8 @@ mod tests {
                 Sessions::default(),
                 VisibilityMode::Everyone,
                 None,
+                storage::DEFAULT_MAX_DISK_PERCENT,
+                false,
             )
             .await
         });
@@ -917,6 +974,8 @@ mod sender_tests {
                     sessions.clone(),
                     VisibilityMode::Everyone,
                     None,
+                    storage::DEFAULT_MAX_DISK_PERCENT,
+                    false,
                 ));
             }
         });
@@ -1170,6 +1229,8 @@ mod upload_wire_tests {
                     Sessions::default(),
                     VisibilityMode::ContactsOnly,
                     Some(Arc::new(b"srv-cms".to_vec())),
+                    storage::DEFAULT_MAX_DISK_PERCENT,
+                    false,
                 )
                 .await;
             }
@@ -1237,5 +1298,18 @@ mod upload_wire_tests {
             .await
             .unwrap();
         srv.await.unwrap();
+    }
+
+    #[test]
+    fn validate_http_url_allows_only_http_and_https_with_host() {
+        assert_eq!(
+            validate_http_url("HTTPS://example.com/path?a=1").unwrap(),
+            "HTTPS://example.com/path?a=1"
+        );
+        assert!(validate_http_url("file:///etc/passwd").is_err());
+        assert!(validate_http_url("smb://host/share").is_err());
+        assert!(validate_http_url("javascript:alert(1)").is_err());
+        assert!(validate_http_url("https:///no-host").is_err());
+        assert!(validate_http_url("https://example.com/bad url").is_err());
     }
 }

@@ -567,6 +567,8 @@ async fn run_receive_loop(
             notify: true,
             open_destination: false,
             visibility: airdrop::VisibilityMode::Everyone,
+            max_disk_percent: airdrop::DEFAULT_MAX_DISK_PERCENT,
+            copy_to_clipboard: true,
         });
         tokio::pin!(receive);
 

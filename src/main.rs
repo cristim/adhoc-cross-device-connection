@@ -77,6 +77,10 @@ enum Cmd {
         once: bool,
         #[arg(long)]
         contacts_only: bool,
+        #[arg(long, default_value_t = 30)]
+        max_disk_percent: u8,
+        #[arg(long)]
+        copy_clipboard: Option<bool>,
     },
     /// Open the native Airdrop-compatible send/receive window.
     Ui,
@@ -186,6 +190,12 @@ enum Cmd {
         /// Require Apple Contacts Only SenderRecordData.
         #[arg(long)]
         contacts_only: bool,
+        /// Maximum transfer size as percentage of free disk space (1..=90).
+        #[arg(long, default_value_t = 30)]
+        max_disk_percent: u8,
+        /// Copy received text, images, links, or saved paths to Wayland clipboard.
+        #[arg(long)]
+        copy_clipboard: Option<bool>,
     },
     /// Receive an exported `keys.json` from a Mac over Bluetooth LE.
     ///
@@ -300,6 +310,8 @@ async fn command(cmd: Cmd) -> Result<()> {
             mode,
             once,
             contacts_only: _,
+            max_disk_percent: _,
+            copy_clipboard: _,
         } => {
             if op == "subscribe" {
                 daemon::ctl_subscribe(daemon::default_socket()).await?;
@@ -369,6 +381,8 @@ async fn command(cmd: Cmd) -> Result<()> {
             notify,
             ble_wake,
             contacts_only,
+            max_disk_percent,
+            copy_clipboard,
         } => {
             airdrop::run(airdrop::Config {
                 radio_managed: false,
@@ -388,6 +402,8 @@ async fn command(cmd: Cmd) -> Result<()> {
                 } else {
                     airdrop::VisibilityMode::Everyone
                 },
+                max_disk_percent,
+                copy_to_clipboard: copy_clipboard.unwrap_or(true),
             })
             .await?;
         }
