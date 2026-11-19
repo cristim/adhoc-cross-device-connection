@@ -3,13 +3,14 @@ use crate::{
     clipboard_out,
     companion::PairingIdentity,
     companion_client::{self, SystemInfo},
-    daemon, discover,
+    companion_server, daemon, discover,
     ipc::{ClipboardStatus, Request},
     keystore::KeyStore,
     scan::Scanner,
 };
 use anyhow::{Context, Result};
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::Mutex;
 
 pub struct AutoConfig {
     pub keys: PathBuf,
@@ -51,11 +52,13 @@ pub async fn run_with_reporter(
         return Ok(());
     }
     // Fail at startup on bad credentials; do not retry malformed key exports forever.
-    PairingIdentity::load(&cfg.identity_path)?;
+    let server_identity = PairingIdentity::load(&cfg.identity_path)?;
+    let store = KeyStore::load(&cfg.keys)?;
+    let adv_keys = store.keys.clone();
+    let echo_guard: companion_server::EchoGuard = Arc::new(Mutex::new(None));
+
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    let scanner = Scanner::new(KeyStore::load(&cfg.keys)?)
-        .await?
-        .with_events(tx);
+    let scanner = Scanner::new(store).await?.with_events(tx);
     report_status(
         status_tx.as_ref(),
         ClipboardStatus {
@@ -67,6 +70,7 @@ pub async fn run_with_reporter(
     )
     .await;
 
+    let pull_echo = echo_guard.clone();
     let process = async {
         while let Some(event) = rx.recv().await {
             tracing::info!(
@@ -105,6 +109,7 @@ pub async fn run_with_reporter(
                     })
                     .await?;
                 let board = session.fetch_pasteboard().await?;
+                *pull_echo.lock().await = Some(companion_server::hash_pasteboard(&board));
                 let outcome = clipboard_out::copy_pasteboard(&board)?;
                 if let Some(out) = outcome {
                     tracing::info!(
@@ -152,5 +157,13 @@ pub async fn run_with_reporter(
         }
         anyhow::Ok(())
     };
-    tokio::select! {r=scanner.run()=>r, r=process=>r, _=crate::shutdown()=>Ok(())}
+    let server_fut = companion_server::run_server(server_identity, 0, None);
+    let broadcaster_fut = companion_server::run_clipboard_broadcaster(adv_keys, echo_guard);
+    tokio::select! {
+        r = scanner.run() => r,
+        r = process => r,
+        r = server_fut => r,
+        r = broadcaster_fut => r,
+        _ = crate::shutdown() => Ok(()),
+    }
 }

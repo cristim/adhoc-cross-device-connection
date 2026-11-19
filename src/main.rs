@@ -5,6 +5,7 @@ mod airdrop;
 mod clipboard_out;
 mod companion;
 mod companion_client;
+mod companion_server;
 mod contacts;
 mod daemon;
 mod discover;

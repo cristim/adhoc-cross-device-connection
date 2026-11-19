@@ -233,6 +233,7 @@ mod tlv_type {
 /// keychain material; they arrive from an export like keys.json.
 ///
 /// Export instructions and the JSON schema live in macos/RPIDENTITY.md.
+#[derive(Clone)]
 pub struct PairingIdentity {
     /// Optional client pairing UUID (from PairSetup M5 TLV 0x01 / IDS device UUID).
     pub pairing_id: Option<String>,
@@ -519,6 +520,9 @@ impl PairVerifyServer {
         signed.extend_from_slice(&client_pub_bytes);
         let our_sig = self.identity.signing.sign(&signed);
         let mut inner = Tlv8::new();
+        if let Some(id) = &self.identity.pairing_id {
+            inner.push(tlv_type::IDENTITY_ID, id.as_bytes().to_vec());
+        }
         inner.push(tlv_type::SIGNATURE, our_sig.to_bytes().to_vec());
         let sealed = cipher
             .encrypt(&pv_nonce(b"PV-Msg02"), inner.encode().as_slice())

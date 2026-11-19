@@ -293,7 +293,7 @@ pub use uc::{Pasteboard, PasteboardItem, SystemInfo};
 // ContentChannel and framed as EncryptedData ContinuityPackets. The exact
 // four-byte wire header is authenticated as AAD, as in the reference protocol.
 
-async fn send_opack<S: AsyncWrite + Unpin>(
+pub(crate) async fn send_opack<S: AsyncWrite + Unpin>(
     stream: &mut S,
     channel: &mut ContentChannel,
     value: &Value,
@@ -308,7 +308,7 @@ async fn send_opack<S: AsyncWrite + Unpin>(
     .await
 }
 
-async fn recv_opack<S: AsyncRead + Unpin>(
+pub(crate) async fn recv_opack<S: AsyncRead + Unpin>(
     stream: &mut S,
     channel: &mut ContentChannel,
 ) -> Result<Value> {
