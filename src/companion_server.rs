@@ -20,6 +20,18 @@ use crate::pasteboard_archive;
 const SERVICE_TYPE: &str = "_companion-link._tcp.local.";
 /// Largest archive we serve inline; the peer rejects frames over 4 MiB.
 const MAX_ARCHIVE_PAYLOAD: usize = 3 * 1024 * 1024;
+/// Caps concurrently-authenticating connections so a busy or untrusted LAN
+/// cannot exhaust sockets/memory by opening many Pair-Verify sessions at once.
+const MAX_ACTIVE_CONNECTIONS: usize = 16;
+
+/// Admit one connection against `limiter`, or `None` if the server is already
+/// serving `MAX_ACTIVE_CONNECTIONS` peers. The returned permit must be held
+/// for the connection's whole lifetime and dropped when it ends.
+fn admit_connection(
+    limiter: &Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    limiter.clone().try_acquire_owned().ok()
+}
 
 /// Tracks the digest of the representation last written from a Mac pull
 /// (`clipboard_out::written_digest`) so Linux -> Mac does not re-broadcast it.
@@ -184,27 +196,48 @@ pub async fn run_server(
     mdns.register(svc_info)
         .context("registering _companion-link._tcp.local.")?;
     tracing::info!(port = local_port, instance = %fullname, "companion-link server listening");
+    // Cleans up on every exit path (an accept error's `?`, pause dropping this
+    // future, or the normal shutdown break below), not only the one below:
+    // mdns-sd's worker keeps advertising until explicitly told to stop, so
+    // just letting `mdns` go out of scope would leave a closed port advertised.
+    let _mdns_registration = MdnsRegistration { mdns, fullname };
 
-    let res = loop {
+    let active_connections = Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_CONNECTIONS));
+    loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (sock, peer_addr) = accepted?;
+                let Some(permit) = admit_connection(&active_connections) else {
+                    tracing::debug!(%peer_addr, "rejecting companion-link connection: too many active connections");
+                    continue;
+                };
                 sock.set_nodelay(true).ok();
                 tracing::debug!(%peer_addr, "accepted companion-link connection");
                 let id = identity.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = serve_connection(sock, id, clipboard_out::read_clipboard).await {
                         tracing::debug!(%peer_addr, error = %format!("{e:#}"), "companion-link client ended");
                     }
                 });
             }
-            _ = crate::shutdown() => break Ok(()),
+            _ = crate::shutdown() => return Ok(()),
         }
-    };
+    }
+}
 
-    let _ = mdns.unregister(&fullname);
-    let _ = mdns.shutdown();
-    res
+/// Unregisters and shuts down the mDNS worker on drop, so the service cannot
+/// outlive `run_server` no matter which path it exits through.
+struct MdnsRegistration {
+    mdns: ServiceDaemon,
+    fullname: String,
+}
+
+impl Drop for MdnsRegistration {
+    fn drop(&mut self) {
+        let _ = self.mdns.unregister(&self.fullname);
+        let _ = self.mdns.shutdown();
+    }
 }
 
 /// TXT keys a real Apple device publishes; `absent=` lists the ones we omit so
@@ -238,6 +271,20 @@ impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// Checks `digest` against the digest recorded for the last successful Mac
+/// pull, consuming that record once its suppression window has passed: a
+/// non-matching digest proves the local clipboard moved on, so a later
+/// coincidental repeat of the old digest (e.g. the user re-copying the same
+/// item later) must broadcast normally instead of staying suppressed.
+async fn is_echo_of_last_pull(echo_guard: &EchoGuard, digest: &[u8; 32]) -> bool {
+    let mut guard = echo_guard.lock().await;
+    if guard.as_ref() == Some(digest) {
+        return true;
+    }
+    *guard = None;
+    false
 }
 
 /// Watch Wayland clipboard changes via `wl-paste --watch` and broadcast
@@ -277,7 +324,7 @@ pub async fn run_clipboard_broadcaster(keys: Vec<HandoffKey>, echo_guard: EchoGu
         let Some(digest) = clipboard_out::read_digest(&pb) else {
             continue;
         };
-        if echo_guard.lock().await.as_ref() == Some(&digest) {
+        if is_echo_of_last_pull(&echo_guard, &digest).await {
             tracing::debug!("skipping BLE broadcast for clipboard just pulled from Mac");
             continue;
         }
@@ -342,6 +389,70 @@ mod tests {
         assert!(line.contains("rpBA=<len 17>"));
         assert!(!line.contains("AA:BB"));
         assert!(line.ends_with("absent=[rpAD,rpHA,rpHI,rpMac]"));
+    }
+
+    #[test]
+    fn admit_connection_rejects_once_the_limit_is_held_and_admits_again_after_release() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(2));
+        let a = admit_connection(&limiter).expect("first connection admitted");
+        let b = admit_connection(&limiter).expect("second connection admitted");
+        assert!(
+            admit_connection(&limiter).is_none(),
+            "a third concurrent connection must be rejected at the limit"
+        );
+        drop(a);
+        assert!(
+            admit_connection(&limiter).is_some(),
+            "releasing a permit must free a slot for the next connection"
+        );
+        drop(b);
+    }
+
+    #[test]
+    fn dropping_mdns_registration_stops_the_daemon_worker() {
+        let mdns = ServiceDaemon::new().unwrap();
+        let make_svc = |instance: &str, port: u16| {
+            ServiceInfo::new(
+                "_acdc-test._tcp.local.",
+                instance,
+                "acdc-test.local.",
+                (),
+                port,
+                None,
+            )
+            .unwrap()
+            .enable_addr_auto()
+        };
+        mdns.register(make_svc("first", 12345)).unwrap();
+        let probe = mdns.clone();
+        drop(MdnsRegistration {
+            mdns,
+            fullname: "first._acdc-test._tcp.local.".to_string(),
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // The worker thread has exited on drop, so its command channel is
+        // disconnected: a further command on the same handle must fail
+        // instead of silently being accepted by a still-running worker.
+        assert!(
+            probe.register(make_svc("second", 12346)).is_err(),
+            "the mDNS worker must be stopped once MdnsRegistration is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn echo_suppression_does_not_outlive_an_intervening_local_copy() {
+        let digest_a = [1u8; 32];
+        let digest_b = [2u8; 32];
+        let echo_guard: EchoGuard = Arc::new(Mutex::new(Some(digest_a)));
+
+        // The Mac's own write of A echoes back to the watcher: suppressed.
+        assert!(is_echo_of_last_pull(&echo_guard, &digest_a).await);
+        // A real local copy of B does not match: not suppressed, and this
+        // closes A's suppression window.
+        assert!(!is_echo_of_last_pull(&echo_guard, &digest_b).await);
+        // Re-copying A later is a fresh user action, not an echo of the pull
+        // that happened before B: the stale digest must not suppress it.
+        assert!(!is_echo_of_last_pull(&echo_guard, &digest_a).await);
     }
 
     #[tokio::test]

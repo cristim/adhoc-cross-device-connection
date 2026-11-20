@@ -120,8 +120,11 @@ pub async fn run_with_reporter(
                     })
                     .await?;
                 let board = session.fetch_pasteboard().await?;
-                *pull_echo.lock().await = clipboard_out::written_digest(&board);
                 let outcome = clipboard_out::copy_pasteboard(&board)?;
+                // Only a write that actually reached the clipboard can echo
+                // back to the Mac; a failed write (the `?` above) must not
+                // leave a stale digest suppressing a later, genuine local copy.
+                *pull_echo.lock().await = clipboard_out::written_digest(&board);
                 if let Some(out) = outcome {
                     tracing::info!(
                         bytes = out.bytes,
