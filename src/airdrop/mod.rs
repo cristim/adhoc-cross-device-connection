@@ -31,6 +31,11 @@ pub(super) struct IdentityBundle {
     pub cert: CertificateDer<'static>,
     pub key: PrivateKeyDer<'static>,
     pub record: Option<Vec<u8>>,
+    /// The certificate PEM actually loaded: `certificate.pem` once an Apple
+    /// identity is paired, `certificate.self-signed.pem` otherwise. Callers
+    /// that need the raw file (e.g. to preserve a chain) must use this path,
+    /// not guess the Apple-paired name.
+    pub cert_path: PathBuf,
 }
 
 fn load_and_verify_pair(
@@ -131,7 +136,12 @@ pub(super) fn identity_bundle(dir: &Path) -> Result<IdentityBundle> {
         } else {
             None
         };
-        return Ok(IdentityBundle { cert, key, record });
+        return Ok(IdentityBundle {
+            cert,
+            key,
+            record,
+            cert_path,
+        });
     }
 
     let ss_cert = dir.join("certificate.self-signed.pem");
@@ -149,6 +159,7 @@ pub(super) fn identity_bundle(dir: &Path) -> Result<IdentityBundle> {
         cert,
         key,
         record: None,
+        cert_path: ss_cert,
     })
 }
 
