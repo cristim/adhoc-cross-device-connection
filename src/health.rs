@@ -80,6 +80,7 @@ pub struct DebugReport {
     pub radio: Option<Value>,
     pub radio_error: Option<String>,
     pub journal_tail: Vec<String>,
+    pub user_journal_tail: Vec<String>,
 }
 
 pub fn redact_sensitive(line: &str) -> String {
@@ -206,6 +207,31 @@ pub async fn debug_report(socket: &std::path::Path) -> DebugReport {
         })
         .unwrap_or_default();
 
+    // The clipboard and transfer paths run in the user session, not the
+    // privileged daemon, so their logs live in a separate unit.
+    let user_journal_tail = tokio::process::Command::new("journalctl")
+        .args([
+            "--user",
+            "-u",
+            "ac-dc-user.service",
+            "--since",
+            "2 minutes ago",
+            "--no-pager",
+            "-o",
+            "short-precise",
+            "-n",
+            "40",
+        ])
+        .output()
+        .await
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(redact_sensitive)
+                .collect()
+        })
+        .unwrap_or_default();
+
     DebugReport {
         daemon_active,
         user_daemon_active,
@@ -217,6 +243,7 @@ pub async fn debug_report(socket: &std::path::Path) -> DebugReport {
         radio,
         radio_error,
         journal_tail,
+        user_journal_tail,
     }
 }
 
@@ -257,6 +284,13 @@ pub fn format_debug_report(report: &DebugReport, json: bool) -> Result<String> {
             out.push('\n');
         }
     }
+    if !report.user_journal_tail.is_empty() {
+        out.push_str("\n== Recent user-service journal ==\n");
+        for line in &report.user_journal_tail {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
     Ok(out)
 }
 
@@ -293,6 +327,7 @@ mod tests {
             radio: Some(json!({"ready": false, "reason": "no_awdl0"})),
             radio_error: None,
             journal_tail: vec!["line1".into()],
+            user_journal_tail: vec![],
         };
         let text = format_debug_report(&report, false).unwrap();
         assert!(text.contains("radio (system): active"));
@@ -303,5 +338,26 @@ mod tests {
         assert_eq!(parsed["daemon_active"], "active");
         assert_eq!(parsed["user_daemon_active"], "active");
         assert_eq!(parsed["socket_present"], true);
+    }
+
+    #[test]
+    fn format_debug_report_includes_the_user_service_journal() {
+        let report = DebugReport {
+            daemon_active: "active".into(),
+            user_daemon_active: "active".into(),
+            radio_socket_present: true,
+            socket_present: true,
+            socket_info: "uid=1000 gid=1000 mode=600 path=/run/user/1000/ac-dc/control.sock".into(),
+            ctl_status: None,
+            ctl_error: None,
+            radio: None,
+            radio_error: None,
+            journal_tail: vec![],
+            user_journal_tail: vec!["clipboard watcher stopped".into()],
+        };
+        let text = format_debug_report(&report, false).unwrap();
+        assert!(text.contains("== Recent user-service journal =="));
+        assert!(text.contains("clipboard watcher stopped"));
+        assert!(!text.contains("== Recent daemon journal =="));
     }
 }
