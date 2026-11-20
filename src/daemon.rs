@@ -260,6 +260,11 @@ struct State {
     send_progress_task: Option<tokio::task::AbortHandle>,
     clipboard_task: Option<tokio::task::JoinHandle<()>>,
     clipboard_reporter: Option<tokio::task::JoinHandle<()>>,
+    /// Identifies the current clipboard-sync run. `abort()` only requests
+    /// cancellation and can race a task already queued on this state's lock,
+    /// so a stale run's update is rejected by comparing against this under
+    /// the same lock, instead of relying on abort alone.
+    clipboard_run: u64,
     radio_starting: bool,
     pending: Option<Pending>,
     next_pending_id: u64,
@@ -283,6 +288,7 @@ impl State {
             send_progress_task: None,
             clipboard_task: None,
             clipboard_reporter: None,
+            clipboard_run: 0,
             radio_starting: false,
             pending: None,
             next_pending_id: 0,
@@ -978,6 +984,25 @@ async fn report_clipboard(state: Arc<Mutex<State>>, request: Request) -> Reply {
     ok_reply(&s, "clipboard status updated", None)
 }
 
+/// Publishes `status` for the clipboard-sync run identified by `run_id`, or
+/// drops it and reports `false` if a stop or a later run has already moved
+/// `State::clipboard_run` past it. Used by the reporter task so a status that
+/// was already dequeued cannot overwrite a newer run's or a stop's state just
+/// because it wins the race to acquire the lock after `abort()` is requested.
+async fn apply_clipboard_status(
+    state: &Arc<Mutex<State>>,
+    run_id: u64,
+    status: crate::ipc::ClipboardStatus,
+) -> bool {
+    let mut st = state.lock().await;
+    if st.clipboard_run != run_id {
+        return false;
+    }
+    st.snapshot.clipboard = Some(status);
+    st.publish();
+    true
+}
+
 async fn start_clipboard_sync(state: Arc<Mutex<State>>) -> Reply {
     let keys =
         crate::keystore::resolve_path(None, crate::keystore::default_keys_path(), "keys.json");
@@ -1003,13 +1028,19 @@ async fn start_clipboard_sync(state: Arc<Mutex<State>>) -> Reply {
         return ok_reply(&s, "clipboard sync already running", None);
     }
 
+    s.clipboard_run += 1;
+    let my_run = s.clipboard_run;
+
     let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel();
     let reporter_state = state.clone();
     let reporter_task = tokio::spawn(async move {
         while let Some(status) = status_rx.recv().await {
-            let mut st = reporter_state.lock().await;
-            st.snapshot.clipboard = Some(status);
-            st.publish();
+            if !apply_clipboard_status(&reporter_state, my_run, status).await {
+                // A stop or a later run already invalidated this run; an
+                // abort() queued behind the state lock does not guarantee
+                // this update never lands, so the run id must gate it too.
+                break;
+            }
         }
     });
     s.clipboard_reporter = Some(reporter_task);
@@ -1029,7 +1060,7 @@ async fn start_clipboard_sync(state: Arc<Mutex<State>>) -> Reply {
             Some(status_tx),
         )
         .await;
-        finish_clipboard_sync(&task_state, res).await;
+        finish_clipboard_sync(&task_state, my_run, res).await;
     }));
     ok_reply(&s, "clipboard sync started", None)
 }
@@ -1037,8 +1068,14 @@ async fn start_clipboard_sync(state: Arc<Mutex<State>>) -> Reply {
 /// Reports the clipboard watcher's own exit, including a clean `Ok(())` (for
 /// example the broadcaster finishing without error), so the panel never keeps
 /// showing a stale "watching"/"listening" status after the task is gone.
-async fn finish_clipboard_sync(state: &Arc<Mutex<State>>, res: Result<()>) {
+/// Skips entirely if `run_id` is no longer the current run: a stop or a
+/// later run already owns `clipboard_task`/`snapshot.clipboard`, and this
+/// stale run must not clear or overwrite either.
+async fn finish_clipboard_sync(state: &Arc<Mutex<State>>, run_id: u64, res: Result<()>) {
     let mut st = state.lock().await;
+    if st.clipboard_run != run_id {
+        return;
+    }
     st.clipboard_task = None;
     st.snapshot.clipboard = Some(match res {
         Ok(()) => crate::ipc::ClipboardStatus {
@@ -1063,6 +1100,11 @@ async fn finish_clipboard_sync(state: &Arc<Mutex<State>>, res: Result<()>) {
 
 async fn stop_clipboard_sync(state: Arc<Mutex<State>>) -> Reply {
     let mut s = state.lock().await;
+    // Invalidate the run before publishing "paused": `abort()` only requests
+    // cancellation and can race a reporter update already queued on this
+    // same lock, so the run id (checked under the lock) is what actually
+    // stops a stale update from overwriting "paused" afterward.
+    s.clipboard_run += 1;
     if let Some(task) = s.clipboard_task.take() {
         task.abort();
     }
@@ -1496,13 +1538,69 @@ mod tests {
             s.clipboard_task = Some(tokio::spawn(async {}));
         }
 
-        finish_clipboard_sync(&state, Ok(())).await;
+        finish_clipboard_sync(&state, 0, Ok(())).await;
 
         let s = state.lock().await;
         let status = s.snapshot.clipboard.as_ref().expect("clipboard status");
         assert_eq!(status.state, "stopped");
         assert!(!status.available);
         assert!(s.clipboard_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_clipboard_status_drops_a_stale_run_without_overwriting_state() {
+        let state = test_state(Arc::new(MockOps::new()));
+        {
+            let mut s = state.lock().await;
+            s.clipboard_run = 1;
+            s.snapshot.clipboard = Some(crate::ipc::ClipboardStatus {
+                available: false,
+                state: "paused".into(),
+                last_item_kind: None,
+                last_error: None,
+            });
+        }
+
+        let stale = crate::ipc::ClipboardStatus {
+            available: true,
+            state: "watching".into(),
+            last_item_kind: None,
+            last_error: None,
+        };
+        let applied = apply_clipboard_status(&state, 0, stale).await;
+
+        assert!(!applied, "a status from a superseded run must be dropped");
+        let s = state.lock().await;
+        assert_eq!(
+            s.snapshot.clipboard.as_ref().unwrap().state,
+            "paused",
+            "a stale run must not overwrite the current run's state"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_clipboard_sync_ignores_a_stale_run() {
+        let state = test_state(Arc::new(MockOps::new()));
+        {
+            let mut s = state.lock().await;
+            s.clipboard_run = 2;
+            s.snapshot.clipboard = Some(crate::ipc::ClipboardStatus {
+                available: true,
+                state: "watching".into(),
+                last_item_kind: None,
+                last_error: None,
+            });
+            s.clipboard_task = Some(tokio::spawn(async {}));
+        }
+
+        // Models a task finishing (e.g. with an error) after it was already
+        // superseded by a newer run; it must not clear the new run's task
+        // handle or overwrite its status.
+        finish_clipboard_sync(&state, 1, Err(anyhow::anyhow!("stale failure"))).await;
+
+        let s = state.lock().await;
+        assert_eq!(s.snapshot.clipboard.as_ref().unwrap().state, "watching");
+        assert!(s.clipboard_task.is_some());
     }
 
     struct CapturingOps {
