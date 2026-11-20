@@ -47,14 +47,14 @@ enum Action {
     Send(Peer, Preferences, Vec<PathBuf>, Vec<String>),
     Quit,
     Cancel,
-    Approve(usize),
-    Decline(usize),
+    Approve(usize, u64),
+    Decline(usize, u64),
 }
 enum Event {
     Status(String),
     Radio(String),
     Peers(Vec<Peer>),
-    Incoming(String, Vec<String>, usize),
+    Incoming(String, Vec<String>, usize, u64),
     IncomingCleared(usize),
     IncomingAllCleared,
 }
@@ -111,7 +111,7 @@ fn format_radio_banner(snap: &DaemonSnapshot) -> String {
 
 fn apply_snapshot(
     snap: &DaemonSnapshot,
-    last_pending: &mut Option<(String, Vec<String>, usize)>,
+    last_pending: &mut Option<(String, Vec<String>, usize, u64)>,
     last_active_send: &mut bool,
     events: &mpsc::Sender<Event>,
     suppress_finished: &AtomicBool,
@@ -120,11 +120,16 @@ fn apply_snapshot(
     let pending = snap
         .pending
         .as_ref()
-        .map(|p| (p.sender.clone(), p.items.clone(), p.total_items));
+        .map(|p| (p.sender.clone(), p.items.clone(), p.total_items, p.id));
     if pending != *last_pending {
         match &pending {
-            Some((sender, items, total_items)) => {
-                let _ = events.send(Event::Incoming(sender.clone(), items.clone(), *total_items));
+            Some((sender, items, total_items, id)) => {
+                let _ = events.send(Event::Incoming(
+                    sender.clone(),
+                    items.clone(),
+                    *total_items,
+                    *id,
+                ));
             }
             None => {
                 let _ = events.send(Event::IncomingAllCleared);
@@ -162,7 +167,7 @@ async fn subscribe_loop(
     suppress_finished: Arc<AtomicBool>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let mut last_pending: Option<(String, Vec<String>, usize)> = None;
+    let mut last_pending: Option<(String, Vec<String>, usize, u64)> = None;
     let mut last_active_send = false;
     loop {
         if let Ok(mut stream) = tokio::net::UnixStream::connect(&socket).await {
@@ -285,14 +290,11 @@ async fn engine(
                 }
                 break;
             }
-            Action::Approve(id) | Action::Decline(id) => {
-                let accepted = matches!(action, Action::Approve(_));
-                match daemon::ctl(
-                    socket.clone(),
-                    daemon::request(if accepted { "approve" } else { "reject" }),
-                )
-                .await
-                {
+            Action::Approve(id, pending_id) | Action::Decline(id, pending_id) => {
+                let accepted = matches!(action, Action::Approve(..));
+                let mut req = daemon::request(if accepted { "approve" } else { "reject" });
+                req.id = Some(pending_id);
+                match daemon::ctl(socket.clone(), req).await {
                     Ok(reply) => {
                         let _ = events.send(Event::Status(reply.message));
                         let _ = events.send(Event::IncomingCleared(id));
@@ -375,6 +377,9 @@ async fn engine(
 
 struct IncomingCard {
     id: usize,
+    /// The daemon's pending-transfer id this card is showing, so approve/
+    /// reject can be bound to the transfer actually displayed.
+    pending_id: u64,
     label: String,
 }
 
@@ -454,7 +459,7 @@ impl AcDcApp {
                                         this.peer_selected = 0;
                                         this.peer_drop_open = false;
                                     }
-                                    Event::Incoming(sender, items, total_items) => {
+                                    Event::Incoming(sender, items, total_items, pending_id) => {
                                         this.incoming_counter += 1;
                                         let more = total_items.saturating_sub(items.len());
                                         let suffix = if more > 0 {
@@ -464,6 +469,7 @@ impl AcDcApp {
                                         };
                                         this.incoming.push(IncomingCard {
                                             id: this.incoming_counter,
+                                            pending_id,
                                             label: format!(
                                                 "{sender} wants to share:\n{}{suffix}",
                                                 items.join("\n")
@@ -669,7 +675,9 @@ impl Render for AcDcApp {
             Rc::new(move |id: usize, cx: &mut App| {
                 if let Some(view) = weak.upgrade() {
                     view.update(cx, |this, cx| {
-                        let _ = actions.send(Action::Approve(id));
+                        if let Some(card) = this.incoming.iter().find(|c| c.id == id) {
+                            let _ = actions.send(Action::Approve(id, card.pending_id));
+                        }
                         this.incoming.retain(|card| card.id != id);
                         cx.notify();
                     });
@@ -682,7 +690,9 @@ impl Render for AcDcApp {
             Rc::new(move |id: usize, cx: &mut App| {
                 if let Some(view) = weak.upgrade() {
                     view.update(cx, |this, cx| {
-                        let _ = actions.send(Action::Decline(id));
+                        if let Some(card) = this.incoming.iter().find(|c| c.id == id) {
+                            let _ = actions.send(Action::Decline(id, card.pending_id));
+                        }
                         this.incoming.retain(|card| card.id != id);
                         cx.notify();
                     });
@@ -1018,6 +1028,7 @@ mod tests {
                 reason: None,
             },
             pending: Some(PendingTransfer {
+                id: 1,
                 sender: "Test Mac".into(),
                 items: vec!["photo.jpg".into()],
                 total_items: 1,
@@ -1035,7 +1046,7 @@ mod tests {
         let events: Vec<Event> = rx.try_iter().collect();
         assert!(matches!(&events[0], Event::Radio(s) if s == "Radio: 2:05 remaining · visible"));
         assert!(
-            matches!(&events[1], Event::Incoming(s, items, total) if s == "Test Mac" && items == &vec!["photo.jpg".to_string()] && *total == 1)
+            matches!(&events[1], Event::Incoming(s, items, total, id) if s == "Test Mac" && items == &vec!["photo.jpg".to_string()] && *total == 1 && *id == 1)
         );
 
         let cleared = DaemonSnapshot::default();
@@ -1155,7 +1166,7 @@ mod tests {
         let (events_tx, events_rx) = mpsc::channel();
         let engine_task = tokio::spawn(engine(actions_rx, events_tx, socket));
 
-        actions_tx.send(Action::Decline(7)).unwrap();
+        actions_tx.send(Action::Decline(7, 42)).unwrap();
 
         let mut saw_cleared = false;
         let mut saw_transport_error = false;
@@ -1185,5 +1196,59 @@ mod tests {
 
         assert!(saw_transport_error, "expected a daemon-unreachable status");
         assert!(!saw_cleared, "card was cleared despite the ctl failure");
+    }
+
+    #[tokio::test]
+    async fn approve_sends_the_displayed_transfer_s_pending_id() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let req: daemon::Request = serde_json::from_str(line.trim()).unwrap();
+            let reply = daemon::Reply {
+                ok: true,
+                state: "idle".into(),
+                message: "transfer approved".into(),
+                data: None,
+                snapshot: None,
+            };
+            write
+                .write_all(serde_json::to_string(&reply).unwrap().as_bytes())
+                .await
+                .unwrap();
+            write.write_all(b"\n").await.unwrap();
+            req
+        });
+
+        let (actions_tx, actions_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::channel();
+        let engine_task = tokio::spawn(engine(actions_rx, events_tx, socket));
+
+        // The card being accepted shows pending id 99; a stale local card id
+        // (3) must not leak into the wire request in its place.
+        actions_tx.send(Action::Approve(3, 99)).unwrap();
+
+        for _ in 0..50 {
+            if let Ok(Event::Status(s)) = events_rx.try_recv() {
+                assert_eq!(s, "transfer approved");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let _ = actions_tx.send(Action::Quit);
+        let _ = engine_task.await;
+        let req = server.await.unwrap();
+
+        assert_eq!(req.op, "approve");
+        assert_eq!(req.id, Some(99));
     }
 }

@@ -231,6 +231,7 @@ impl ServiceOps for ProdServiceOps {
 }
 
 struct Pending {
+    id: u64,
     sender: String,
     items: Vec<String>,
     decision: tokio::sync::oneshot::Sender<bool>,
@@ -261,6 +262,7 @@ struct State {
     clipboard_reporter: Option<tokio::task::JoinHandle<()>>,
     radio_starting: bool,
     pending: Option<Pending>,
+    next_pending_id: u64,
     snapshot: DaemonSnapshot,
     tx: watch::Sender<DaemonSnapshot>,
     _tx_rx: watch::Receiver<DaemonSnapshot>,
@@ -283,6 +285,7 @@ impl State {
             clipboard_reporter: None,
             radio_starting: false,
             pending: None,
+            next_pending_id: 0,
             snapshot,
             tx,
             _tx_rx,
@@ -291,6 +294,11 @@ impl State {
             ops,
             cfg,
         }))
+    }
+
+    fn alloc_pending_id(&mut self) -> u64 {
+        self.next_pending_id += 1;
+        self.next_pending_id
     }
 
     fn recompute_phase(&mut self) {
@@ -313,6 +321,7 @@ impl State {
     fn publish(&mut self) {
         self.recompute_phase();
         self.snapshot.pending = self.pending.as_ref().map(|p| PendingTransfer {
+            id: p.id,
             sender: p.sender.clone(),
             items: truncate_pending_items(&p.items),
             total_items: p.items.len(),
@@ -455,8 +464,8 @@ async fn handle(stream: UnixStream, state: Arc<Mutex<State>>) -> Result<()> {
         "receive" => start_receive(state.clone(), request).await,
         "stop" => stop(state.clone()).await,
         "cancel" => cancel_send(state.clone()).await,
-        "approve" => decide(state.clone(), true).await,
-        "reject" => decide(state.clone(), false).await,
+        "approve" => decide(state.clone(), true, request.id).await,
+        "reject" => decide(state.clone(), false, request.id).await,
         "send" => start_send(state.clone(), request).await,
         "peers" => discover(state.clone()).await,
         "clipboard_report" => report_clipboard(state.clone(), request).await,
@@ -711,7 +720,9 @@ async fn run_receive_loop(
                 result = &mut receive => break result,
                 Some(incoming) = approval_rx.recv() => {
                     let mut st = task_state.lock().await;
+                    let id = st.alloc_pending_id();
                     st.pending = Some(Pending {
+                        id,
                         sender: incoming.sender,
                         items: incoming.items,
                         decision: incoming.decision,
@@ -771,11 +782,16 @@ async fn cancel_send(state: Arc<Mutex<State>>) -> Reply {
     ok_reply(&s, "send cancelled", None)
 }
 
-async fn decide(state: Arc<Mutex<State>>, accepted: bool) -> Reply {
+async fn decide(state: Arc<Mutex<State>>, accepted: bool, id: Option<u64>) -> Reply {
     let mut s = state.lock().await;
-    let Some(pending) = s.pending.take() else {
-        return err_reply(&s, "no transfer is waiting for approval");
-    };
+    match (&s.pending, id) {
+        (None, _) => return err_reply(&s, "no transfer is waiting for approval"),
+        (Some(p), Some(want)) if p.id != want => {
+            return err_reply(&s, "a different transfer is now pending");
+        }
+        _ => {}
+    }
+    let pending = s.pending.take().expect("checked above");
     if pending.decision.send(accepted).is_err() {
         s.publish();
         return err_reply(&s, "transfer request expired");
@@ -1266,6 +1282,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::oneshot::channel();
         let mut s = state.try_lock().unwrap();
         s.pending = Some(Pending {
+            id: 1,
             sender: "Test Mac".into(),
             items: (0..350).map(|i| "x".repeat(200) + &i.to_string()).collect(),
             decision: tx,
@@ -1294,13 +1311,14 @@ mod tests {
         {
             let mut s = state.lock().await;
             s.pending = Some(Pending {
+                id: 1,
                 sender: "Test Mac".into(),
                 items: vec!["photo.jpg".into()],
                 decision: tx,
             });
         }
 
-        let reply = decide(state.clone(), true).await;
+        let reply = decide(state.clone(), true, None).await;
 
         assert!(!reply.ok, "expired decision was reported as accepted");
         assert!(
@@ -1310,6 +1328,78 @@ mod tests {
         );
         let s = state.lock().await;
         assert!(s.pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn decide_rejects_a_stale_pending_id_without_touching_the_current_one() {
+        let state = test_state(Arc::new(MockOps::new()));
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel();
+        let stale_id = {
+            let mut s = state.lock().await;
+            let id1 = s.alloc_pending_id();
+            s.pending = Some(Pending {
+                id: id1,
+                sender: "Mac A".into(),
+                items: vec!["a.jpg".into()],
+                decision: tx1,
+            });
+            // A second Ask overwrites the first pending, dropping its oneshot,
+            // exactly as today's receive loop already does.
+            let id2 = s.alloc_pending_id();
+            s.pending = Some(Pending {
+                id: id2,
+                sender: "Mac B".into(),
+                items: vec!["b.jpg".into()],
+                decision: tx2,
+            });
+            id1
+        };
+        drop(rx1);
+
+        let reply = decide(state.clone(), true, Some(stale_id)).await;
+
+        assert!(!reply.ok, "stale id was accepted");
+        assert!(
+            reply.message.contains("different transfer"),
+            "unexpected message: {}",
+            reply.message
+        );
+        assert!(
+            rx2.try_recv().is_err(),
+            "the current pending's oneshot was resolved by a stale decision"
+        );
+        let s = state.lock().await;
+        assert!(
+            s.pending.is_some(),
+            "the current pending was cleared by a stale decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_accepts_the_current_id_or_no_id_at_all() {
+        for id_arg in [None, Some(1)] {
+            let state = test_state(Arc::new(MockOps::new()));
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            {
+                let mut s = state.lock().await;
+                let id = s.alloc_pending_id();
+                assert_eq!(id, 1, "fresh state did not start the id counter at 1");
+                s.pending = Some(Pending {
+                    id,
+                    sender: "Test Mac".into(),
+                    items: vec!["photo.jpg".into()],
+                    decision: tx,
+                });
+            }
+
+            let reply = decide(state.clone(), true, id_arg).await;
+
+            assert!(reply.ok, "{id_arg:?} was rejected: {}", reply.message);
+            assert_eq!(rx.await, Ok(true));
+            let s = state.lock().await;
+            assert!(s.pending.is_none());
+        }
     }
 
     #[tokio::test]

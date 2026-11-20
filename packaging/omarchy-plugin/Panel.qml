@@ -130,6 +130,7 @@ Panel {
       if (snap.pending && typeof snap.pending === "object") {
         var items = Array.isArray(snap.pending.items) ? snap.pending.items.slice(0, 16) : []
         root.pendingTransfer = {
+          id: Number(snap.pending.id) || 0,
           sender: root.sanitizeText(snap.pending.sender || "Unknown", 128),
           items: items.map(function(i) { return root.sanitizeText(i, 128) })
         }
@@ -564,12 +565,16 @@ Panel {
                 Layout.fillWidth: true
                 text: "Accept"
                 selected: true
-                onClicked: root.runCtl(["approve"])
+                onClicked: {
+                  if (root.pendingTransfer) root.runCtl(["approve", "--id", String(root.pendingTransfer.id)])
+                }
               }
               Button {
                 Layout.fillWidth: true
                 text: "Decline"
-                onClicked: root.runCtl(["reject"])
+                onClicked: {
+                  if (root.pendingTransfer) root.runCtl(["reject", "--id", String(root.pendingTransfer.id)])
+                }
               }
             }
           }

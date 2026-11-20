@@ -37,6 +37,10 @@ pub struct WindowState {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PendingTransfer {
+    /// Identifies the transfer this snapshot is showing, so a client can bind
+    /// an approve/reject decision to the transfer it actually displayed.
+    #[serde(default)]
+    pub id: u64,
     pub sender: String,
     pub items: Vec<String>,
     /// The sender's full item count, which can exceed `items` once it has
@@ -138,6 +142,11 @@ pub struct Request {
     pub copy_to_clipboard: Option<bool>,
     #[serde(default)]
     pub clipboard: Option<ClipboardStatus>,
+    /// The pending transfer id an approve/reject decision is bound to. `None`
+    /// keeps the old behavior of deciding whatever is currently pending, for
+    /// a caller that predates this field.
+    #[serde(default)]
+    pub id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

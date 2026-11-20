@@ -90,6 +90,10 @@ enum Cmd {
         max_disk_percent: u8,
         #[arg(long)]
         copy_clipboard: Option<bool>,
+        /// Binds an `approve`/`reject` decision to the transfer id the
+        /// caller is currently displaying.
+        #[arg(long)]
+        id: Option<u64>,
     },
     /// Open the native Airdrop-compatible send/receive window.
     Ui,
@@ -343,6 +347,7 @@ async fn command(cmd: Cmd) -> Result<()> {
             contacts_only,
             max_disk_percent,
             copy_clipboard,
+            id,
         } => {
             if op == "subscribe" {
                 daemon::ctl_subscribe(daemon::default_socket()).await?;
@@ -372,6 +377,7 @@ async fn command(cmd: Cmd) -> Result<()> {
                         max_disk_percent: Some(max_disk_percent),
                         copy_to_clipboard: copy_clipboard,
                         clipboard: None,
+                        id,
                     },
                 )
                 .await?;
