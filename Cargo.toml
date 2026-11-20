@@ -17,7 +17,12 @@ futures = "0.3"
 bluer = { version = "0.17", features = ["bluetoothd"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-plist = "1"
+# `enable_unstable_features_that_may_break_with_minor_version_bumps` exposes the
+# streaming `stream::BinaryReader`, which `pasteboard_archive` needs to enforce
+# node/depth limits while parsing instead of after an attacker-controlled plist
+# is already fully materialized. The crate's own docs ask callers of that
+# feature to pin with a tilde requirement since it can break on minor bumps.
+plist = { version = "~1.10.1", features = ["enable_unstable_features_that_may_break_with_minor_version_bumps"] }
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

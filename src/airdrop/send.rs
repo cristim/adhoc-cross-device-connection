@@ -15,19 +15,25 @@ pub struct Client {
     tls: openssl::ssl::SslConnector,
     address: SocketAddr,
     sender_id: String,
+    record: Option<Vec<u8>>,
 }
 impl Client {
     pub fn new(address: SocketAddr, identity_dir: &Path) -> Result<Self> {
-        super::identity(identity_dir)?;
+        let bundle = super::identity_bundle(identity_dir)?;
         Ok(Self {
             tls: super::client_http::connector(identity_dir)?,
             address,
             sender_id: super::service_id(identity_dir)?,
+            record: bundle.record,
         })
     }
     pub async fn discover(&self) -> Result<String> {
         let mut session = super::client_http::Session::connect(self.address, &self.tls).await?;
-        let payload = plist(Dictionary::new())?;
+        let mut dict = Dictionary::new();
+        if let Some(rec) = &self.record {
+            dict.insert("SenderRecordData".into(), Value::Data(rec.clone()));
+        }
+        let payload = plist(dict)?;
         let size = payload.len() as u64;
         let bytes = session
             .post(
@@ -92,19 +98,18 @@ impl Client {
         ask.insert("SenderID".into(), self.sender_id.clone().into());
         ask.insert("BundleID".into(), "com.apple.finder".into());
         ask.insert("ConvertMediaFormats".into(), false.into());
+        if let Some(rec) = &self.record {
+            ask.insert("SenderRecordData".into(), Value::Data(rec.clone()));
+        }
         let mut transfer_id = Dictionary::new();
         transfer_id.insert("id".into(), upload.transfer_id.clone().into());
         ask.insert("TransferID".into(), Value::Dictionary(transfer_id));
         if !links.is_empty() {
             ensure!(links.len() <= 128, "too many links");
-            for url in &links {
-                ensure!(
-                    url.len() <= 8192
-                        && (url.starts_with("https://") || url.starts_with("http://"))
-                        && !url.chars().any(char::is_control),
-                    "only HTTP(S) links are supported"
-                );
-            }
+            let links = links
+                .iter()
+                .map(|url| super::validate_http_url(url))
+                .collect::<Result<Vec<_>>>()?;
             ask.insert(
                 "Items".into(),
                 Value::Array(links.into_iter().map(Value::String).collect()),
@@ -251,5 +256,25 @@ mod tests {
         let result = super::super::archive::cpio(&b).unwrap();
         assert_eq!(result[0].bytes, b"hello");
         assert_eq!(result[0].name, "hello.txt");
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn links_the_receiver_would_refuse_are_rejected_before_connecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::new("127.0.0.1:9".parse().unwrap(), dir.path()).unwrap();
+        let long = format!("https://example.com/{}", "a".repeat(4097));
+        let error = client
+            .transfer("Sender", vec![], vec![long])
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unsupported link"),
+            "{error:#}"
+        );
     }
 }

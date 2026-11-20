@@ -6,6 +6,8 @@ use std::{
     time::Duration,
 };
 const SERVICE: &str = "_companion-link._tcp.local.";
+/// Instance name our own Companion-Link server registers (`companion_server`).
+pub const OWN_INSTANCE: &str = "ac-dc";
 struct Daemon(ServiceDaemon);
 impl Drop for Daemon {
     fn drop(&mut self) {
@@ -53,7 +55,8 @@ pub async fn companion_link_target(host: &str, port: u16) -> Result<(String, u16
     if port != 0 {
         return Ok((host.into(), port));
     }
-    resolve("awdl0", None, None, Duration::from_secs(10)).await
+    let (host, port, _fullname) = resolve_preferred(None, Duration::from_secs(10)).await?;
+    Ok((host, port))
 }
 fn normalized_address(s: &str) -> String {
     s.chars()
@@ -61,19 +64,71 @@ fn normalized_address(s: &str) -> String {
         .flat_map(char::to_lowercase)
         .collect()
 }
-pub async fn resolve(
-    iface: &str,
+/// Try LAN mDNS first (works without `awdl0`), then fall back to `awdl0` if present.
+/// Also returns the matched fullname, so a caller whose LAN-resolved endpoint
+/// refuses the connection can retry the exact same instance over `awdl0`
+/// instead of a different device (`resolve_on` with that fullname directly).
+pub async fn resolve_preferred(
     instance: Option<&str>,
-    ble: Option<&str>,
     timeout: Duration,
-) -> Result<(String, u16)> {
-    ensure!(
-        std::path::Path::new("/sys/class/net").join(iface).exists(),
-        "AWDL interface {iface} is absent; run awdlctl doctor"
-    );
+) -> Result<(String, u16, String)> {
+    let lan_budget = timeout.min(Duration::from_secs(4));
+    match resolve_on(None, instance, lan_budget).await {
+        Ok(target) => Ok(target),
+        Err(lan_err) => {
+            if std::path::Path::new("/sys/class/net/awdl0").exists() {
+                resolve_on(Some("awdl0"), instance, timeout).await
+            } else {
+                Err(lan_err)
+            }
+        }
+    }
+}
+
+/// Whether a resolved service is a pull target. An explicit `instance` wins;
+/// otherwise our own advertisement is never a target (another host's service
+/// named `ac-dc` is skipped too; select it with an explicit `instance`).
+///
+/// There is deliberately no BLE-address filter: the source address of a 0x0c
+/// advert does not reliably equal the `rpBA` the service publishes (it did not
+/// on a live Mac), so comparing them rejected the right device.
+/// Pair-Verify authenticates the peer.
+fn service_matches(fullname: &str, instance: Option<&str>) -> bool {
+    match instance {
+        Some(want) => fullname == want,
+        None => fullname.strip_suffix(&format!(".{SERVICE}")) != Some(OWN_INSTANCE),
+    }
+}
+
+/// Off AWDL there is no interface to scope an `fe80::` address with, and an
+/// unscoped one cannot be dialed, so such services are skipped.
+fn pick_address(mut addrs: Vec<IpAddr>, iface: Option<&str>) -> Result<Option<SocketAddr>> {
+    addrs.sort();
+    match iface {
+        Some(i) => addrs.first().map(|a| scope_address(*a, i)).transpose(),
+        None => Ok(addrs
+            .into_iter()
+            .find(|a| !matches!(a, IpAddr::V6(v) if v.is_unicast_link_local()))
+            .map(|a| SocketAddr::new(a, 0))),
+    }
+}
+
+pub async fn resolve_on(
+    iface: Option<&str>,
+    instance: Option<&str>,
+    timeout: Duration,
+) -> Result<(String, u16, String)> {
+    if let Some(i) = iface {
+        ensure!(
+            std::path::Path::new("/sys/class/net").join(i).exists(),
+            "AWDL interface {i} is absent; run awdlctl doctor"
+        );
+    }
     let daemon = Daemon(ServiceDaemon::new()?);
-    daemon.0.disable_interface(IfKind::All)?;
-    daemon.0.enable_interface(iface)?;
+    if let Some(i) = iface {
+        daemon.0.disable_interface(IfKind::All)?;
+        daemon.0.enable_interface(i)?;
+    }
     let receiver = daemon.0.browse(SERVICE)?;
     let end = tokio::time::Instant::now() + timeout;
     loop {
@@ -81,20 +136,16 @@ pub async fn resolve(
             .await
             .context("companion-link discovery timed out")??;
         if let ServiceEvent::ServiceResolved(info) = evt {
-            if let Some(want) = instance {
-                if info.get_fullname() != want {
-                    continue;
-                }
-            } else if let Some(addr) = ble {
-                let observed = info.get_property_val_str("rpBA").unwrap_or("");
-                if normalized_address(observed) != normalized_address(addr) {
-                    continue;
-                }
+            if !service_matches(info.get_fullname(), instance) {
+                continue;
             }
-            let mut addrs: Vec<_> = info.get_addresses().iter().copied().collect();
-            addrs.sort();
-            if let Some(addr) = addrs.first() {
-                return Ok((host_string(scope_address(*addr, iface)?), info.get_port()));
+            let addrs: Vec<_> = info.get_addresses().iter().copied().collect();
+            if let Some(scoped) = pick_address(addrs, iface)? {
+                return Ok((
+                    host_string(scoped),
+                    info.get_port(),
+                    info.get_fullname().to_string(),
+                ));
             }
         }
     }
@@ -196,6 +247,47 @@ mod tests {
     #[test]
     fn normalization() {
         assert_eq!(normalized_address("AA:BB:CC:DD:EE:FF"), "aabbccddeeff");
+    }
+
+    const OWN: &str = "ac-dc._companion-link._tcp.local.";
+    const MAC: &str = "phone._companion-link._tcp.local.";
+
+    #[test]
+    fn never_selects_our_own_advertisement() {
+        // Our server publishes no rpBA when it has no BLE address, which the
+        // old lenient filter accepted: the pull then dialed itself and failed
+        // Pair-Verify with "unknown peer signature".
+        assert!(!service_matches(OWN, None));
+        assert!(service_matches(MAC, None));
+    }
+
+    #[test]
+    fn lan_pass_never_returns_an_unscoped_link_local_address() {
+        let ll: IpAddr = "fe80::1".parse().unwrap();
+        let v4: IpAddr = "192.168.1.9".parse().unwrap();
+        assert_eq!(pick_address(vec![ll], None).unwrap(), None);
+        assert_eq!(
+            pick_address(vec![ll, v4], None).unwrap(),
+            Some(SocketAddr::new(v4, 0))
+        );
+        let scoped = pick_address(vec![ll], Some("lo")).unwrap().unwrap();
+        assert!(matches!(scoped, SocketAddr::V6(v) if v.scope_id() > 0));
+    }
+
+    #[test]
+    fn instance_selection() {
+        assert!(service_matches(MAC, Some(MAC)));
+        assert!(!service_matches(
+            MAC,
+            Some("other._companion-link._tcp.local.")
+        ));
+        // An explicit instance beats the self-exclusion.
+        assert!(service_matches(OWN, Some(OWN)));
+        // Only the exact instance label is ours, not one that merely starts with it.
+        assert!(service_matches(
+            "ac-dc.lab._companion-link._tcp.local.",
+            None
+        ));
     }
 }
 

@@ -4,7 +4,9 @@ use anyhow::{ensure, Context, Result};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::{body::Bytes, client::conn::http1::SendRequest, Request};
 use hyper_util::rt::TokioIo;
-use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
+use openssl::pkey::PKey;
+use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
+use openssl::x509::X509;
 use std::{io, net::SocketAddr, path::Path, pin::Pin, time::Duration};
 use tokio::net::TcpStream;
 
@@ -15,12 +17,35 @@ pub fn bytes(body: Vec<u8>) -> Body {
         .boxed_unsync()
 }
 pub fn connector(identity: &Path) -> Result<SslConnector> {
+    let bundle = super::identity_bundle(identity)?;
+    let key = PKey::private_key_from_pkcs8(bundle.key.secret_der())?;
+    // identity_bundle() only keeps the leaf (re-encoded from the first PEM
+    // block) to verify it matches the key; a chain file with an intermediate
+    // after the leaf needs the raw file re-read so that cert reaches the peer.
+    let mut chain = X509::stack_from_pem(
+        &std::fs::read(&bundle.cert_path)
+            .with_context(|| format!("reading {:?}", bundle.cert_path))?,
+    )?;
+    ensure!(
+        !chain.is_empty(),
+        "{:?} has no certificates",
+        bundle.cert_path
+    );
+    let leaf = chain.remove(0);
+    ensure!(
+        leaf.to_der()?.as_slice() == bundle.cert.as_ref(),
+        "{:?}'s first certificate no longer matches the verified identity",
+        bundle.cert_path
+    );
     let mut tls = SslConnector::builder(SslMethod::tls_client())?;
     tls.set_min_proto_version(Some(SslVersion::TLS1_2))?;
-    // Everyone mode uses self-signed identities, not Apple account validation.
+    // AirDrop peers present Apple/self-signed certs over AWDL, so TLS does not authenticate the peer.
     tls.set_verify(SslVerifyMode::NONE);
-    tls.set_certificate_chain_file(identity.join("certificate.pem"))?;
-    tls.set_private_key_file(identity.join("key.pem"), SslFiletype::PEM)?;
+    tls.set_certificate(&leaf)?;
+    for intermediate in chain {
+        tls.add_extra_chain_cert(intermediate)?;
+    }
+    tls.set_private_key(&key)?;
     tls.check_private_key()?;
     Ok(tls.build())
 }
@@ -228,5 +253,72 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    // A real Mac's AirDrop Discover handshake requests the client's certificate
+    // and, like OpenDrop, can require the full chain rather than just the leaf
+    // (`upload_wire_tests::sender_fixture` exercises that request-and-verify
+    // path with rustls). This test only checks what reaches the wire: that a
+    // chain file with an intermediate after the leaf still presents that
+    // intermediate, independent of whether a peer chooses to verify it.
+    #[tokio::test]
+    async fn presents_intermediate_certificates_from_the_chain_file() {
+        use openssl::pkey::PKey as OpenSslPKey;
+        use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode, SslVersion};
+        use openssl::x509::X509;
+        use std::pin::Pin;
+
+        let root = tempfile::tempdir().unwrap();
+        let client_dir = root.path().join("client");
+        // Resolve the actual on-disk cert path (self-signed identities use
+        // `certificate.self-signed.pem`, not `certificate.pem`) instead of
+        // guessing the filename.
+        let cert_path = crate::airdrop::identity_bundle(&client_dir)
+            .unwrap()
+            .cert_path;
+        // Simulate a chain file with an intermediate after the leaf by
+        // appending an unrelated self-signed cert; its chain validity does
+        // not matter here, only whether it is transmitted.
+        let intermediate_dir = root.path().join("intermediate");
+        let intermediate_pem = std::fs::read(
+            crate::airdrop::identity_bundle(&intermediate_dir)
+                .unwrap()
+                .cert_path,
+        )
+        .unwrap();
+        let mut combined = std::fs::read(&cert_path).unwrap();
+        combined.extend_from_slice(&intermediate_pem);
+        std::fs::write(&cert_path, combined).unwrap();
+
+        let tls = connector(&client_dir).unwrap();
+
+        let (server_cert, server_key) =
+            crate::airdrop::identity(&root.path().join("server")).unwrap();
+        let server_cert = X509::from_der(server_cert.as_ref()).unwrap();
+        let server_key = OpenSslPKey::private_key_from_pkcs8(server_key.secret_der()).unwrap();
+        let mut sctx = SslContext::builder(SslMethod::tls_server()).unwrap();
+        sctx.set_min_proto_version(Some(SslVersion::TLS1_2))
+            .unwrap();
+        sctx.set_certificate(&server_cert).unwrap();
+        sctx.set_private_key(&server_key).unwrap();
+        // Request the client certificate but accept it regardless of trust:
+        // this test checks what the client sends, not chain validity.
+        sctx.set_verify_callback(SslVerifyMode::PEER, |_, _| true);
+        let sctx = sctx.build();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ssl = Ssl::new(&sctx).unwrap();
+            let mut stream = tokio_openssl::SslStream::new(ssl, stream).unwrap();
+            Pin::new(&mut stream).accept().await.unwrap();
+            // peer_cert_chain(), seen from the server/acceptor side, excludes
+            // the peer's leaf and holds only the certs sent after it.
+            stream.ssl().peer_cert_chain().map(|c| c.len()).unwrap_or(0)
+        });
+
+        let _session = Session::connect(addr, &tls).await.unwrap();
+        assert_eq!(server.await.unwrap(), 1);
     }
 }

@@ -2,17 +2,78 @@
   "schemaVersion": 1,
   "id": "org.omarchy.adhoccrossdeviceconnection",
   "name": "Adhoc Cross-Device Connection",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "ac-dc",
   "license": "MIT",
-  "description": "Airdrop-compatible file transfer with nearby Apple devices",
+  "description": "AirDrop-compatible file transfer and extensible cross-device sync for Omarchy.",
   "kinds": ["bar-widget"],
-  "entryPoints": {"barWidget": "BarWidget.qml"},
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
   "barWidget": {
     "displayName": "Adhoc Cross-Device Connection",
     "description": "Send and receive files with nearby Apple devices",
     "category": "Network",
     "allowMultiple": false,
-    "defaultSection": "right"
+    "defaultSection": "right",
+    "defaults": {
+      "name": "Omarchy",
+      "directory": "",
+      "defaultWindowMinutes": 10,
+      "bleWake": true,
+      "contactsOnly": false,
+      "copyToClipboard": true,
+      "maxDiskPercent": 30
+    },
+    "schema": [
+      {
+        "key": "name",
+        "type": "string",
+        "label": "Device name",
+        "defaultValue": "Omarchy"
+      },
+      {
+        "key": "directory",
+        "type": "string",
+        "label": "Save files to (empty = ~/Downloads/Adhoc)",
+        "defaultValue": ""
+      },
+      {
+        "key": "defaultWindowMinutes",
+        "type": "integer",
+        "label": "Default receive window (minutes)",
+        "min": 1,
+        "max": 60,
+        "step": 5,
+        "defaultValue": 10
+      },
+      {
+        "key": "bleWake",
+        "type": "boolean",
+        "label": "Bluetooth wake advertisement",
+        "defaultValue": true
+      },
+      {
+        "key": "contactsOnly",
+        "type": "boolean",
+        "label": "Contacts Only mode",
+        "defaultValue": false
+      },
+      {
+        "key": "copyToClipboard",
+        "type": "boolean",
+        "label": "Copy received items to clipboard",
+        "defaultValue": true
+      },
+      {
+        "key": "maxDiskPercent",
+        "type": "integer",
+        "label": "Max transfer size (% of free disk space)",
+        "min": 1,
+        "max": 90,
+        "step": 5,
+        "defaultValue": 30
+      }
+    ]
   }
 }

@@ -192,12 +192,9 @@ pub fn open_truncated(
 }
 
 /// Encrypt-and-tag with a truncated tag — the inverse of [`open_truncated`],
-/// used by M3 to build our own Handoff advert. Returns `(ciphertext, tag)`
+/// used to build our own Handoff advert. Returns `(ciphertext, tag)`
 /// where `tag` is `tag_len` bytes (1 for a Handoff advert).
-///
-/// Like the open path, this is spec-derived and UNVALIDATED against real Apple
-/// traffic; a seal/open round-trip is the only guarantee so far.
-#[cfg(test)]
+#[allow(dead_code)]
 pub fn seal_truncated(
     key: &[u8],
     iv: &[u8],

@@ -111,17 +111,24 @@ async fn read_packet_inner<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Conti
 pub mod uc {
     use super::*;
 
-    // OPACK envelope keys. UNVALIDATED: exact UC pasteboard payload unconfirmed
-    // until tested against a device.
-    pub(super) const K_TYPE: &str = "_t"; // message type: 1=request, 2=response
+    // OPACK envelope keys (from seemoo-lab/handoff-authentication-swift & rapportd).
+    pub(super) const K_TYPE: &str = "_t"; // message type: 1=event, 2=request, 3=response
     pub(super) const K_ID: &str = "_i"; // request selector / name
     pub(super) const K_XID: &str = "_x"; // transaction id, echoed in the response
-    pub(super) const MSG_REQUEST: u64 = 1;
-    pub(super) const MSG_RESPONSE: u64 = 2;
+    pub(super) const K_CONTENT: &str = "_c"; // request/response content dictionary
+    pub(super) const K_ERR_MSG: &str = "_em"; // remote error message
+    pub(super) const K_ERR_CODE: &str = "_ec"; // remote error code
 
-    // Selectors (request names). UNVALIDATED.
-    pub(super) const SEL_SYSTEM_INFO: &str = "SystemInfo";
-    pub(super) const SEL_FETCH_PASTEBOARD: &str = "FetchPasteboard";
+    pub(super) const MSG_EVENT: u64 = 1;
+    pub(super) const MSG_REQUEST: u64 = 2;
+    pub(super) const MSG_RESPONSE: u64 = 3;
+
+    // Selectors (request names).
+    pub(super) const SEL_SYSTEM_INFO: &str = "_systemInfo";
+    pub(super) const SEL_PAYLOAD_REQUEST: &str = "com.apple.handoff.payload-request";
+
+    pub(super) const CMD_PBTYPES: &str = "pbtypes";
+    pub(super) const CMD_PBPASTE2: &str = "pbpaste2";
 
     /// A single pasteboard representation: a UTI type string plus its raw bytes.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,98 +164,122 @@ pub mod uc {
     }
 
     impl SystemInfo {
-        // UNVALIDATED field names.
         const K_NAME: &'static str = "name";
         const K_MODEL: &'static str = "model";
-        const K_OS: &'static str = "os";
+        const K_OS: &'static str = "osVersion";
 
-        pub(super) fn to_value(&self, msg_type: u64) -> Value {
-            Value::dict([
-                (K_TYPE, Value::Int(msg_type)),
-                (K_ID, Value::Str(SEL_SYSTEM_INFO.into())),
-                (Self::K_NAME, Value::Str(self.name.clone())),
-                (Self::K_MODEL, Value::Str(self.model.clone())),
-                (Self::K_OS, Value::Str(self.os_version.clone())),
-            ])
+        pub(super) fn to_value(&self, msg_type: u64, xid: u64) -> Value {
+            self.to_value_with_id(msg_type, xid, None)
+        }
+
+        pub(super) fn to_value_with_id(
+            &self,
+            msg_type: u64,
+            xid: u64,
+            pairing_id: Option<&str>,
+        ) -> Value {
+            let mut content_pairs = vec![
+                (
+                    Value::Str(Self::K_NAME.into()),
+                    Value::Str(self.name.clone()),
+                ),
+                (
+                    Value::Str(Self::K_MODEL.into()),
+                    Value::Str(self.model.clone()),
+                ),
+                (
+                    Value::Str(Self::K_OS.into()),
+                    Value::Str(self.os_version.clone()),
+                ),
+            ];
+            if let Some(id) = pairing_id {
+                content_pairs.push((Value::Str("_i".into()), Value::Str(id.into())));
+                content_pairs.push((Value::Str("_idsID".into()), Value::Str(id.into())));
+            }
+            let content = Value::Dict(content_pairs);
+            let mut pairs = vec![
+                (Value::Str(K_TYPE.into()), Value::Int(msg_type)),
+                (Value::Str(K_XID.into()), Value::Int(xid)),
+                (Value::Str(K_CONTENT.into()), content),
+            ];
+            if msg_type == MSG_REQUEST {
+                pairs.push((Value::Str(K_ID.into()), Value::Str(SEL_SYSTEM_INFO.into())));
+            }
+            Value::Dict(pairs)
         }
 
         pub(super) fn from_value(v: &Value) -> SystemInfo {
+            let src = v.get(K_CONTENT).unwrap_or(v);
             let s = |k: &str| {
-                v.get(k)
+                src.get(k)
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string()
             };
+            let os_version = src
+                .get(Self::K_OS)
+                .or_else(|| src.get("os"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             SystemInfo {
                 name: s(Self::K_NAME),
                 model: s(Self::K_MODEL),
-                os_version: s(Self::K_OS),
+                os_version,
             }
         }
     }
 
-    /// Build the P3 pasteboard-fetch request.
-    ///
-    /// UNVALIDATED: exact UC pasteboard payload unconfirmed until tested against
-    /// a device. This is a plausible companion-link request envelope: a typed
-    /// request naming a fetch selector, with a transaction id.
-    pub(super) fn build_pasteboard_request(xid: u64) -> Value {
+    /// Build a P3 `com.apple.handoff.payload-request` envelope (`pbtypes` or `pbpaste2`).
+    pub(super) fn build_pasteboard_request(
+        xid: u64,
+        cmd: &str,
+        identifier: &str,
+        adv_payload: Option<&[u8]>,
+    ) -> Value {
+        let mut content_pairs = vec![
+            (Value::Str("rClientCommand".into()), Value::Str(cmd.into())),
+            (
+                Value::Str("rIdentifier".into()),
+                Value::Str(identifier.into()),
+            ),
+        ];
+        if let Some(adv) = adv_payload {
+            content_pairs.push((Value::Str("rAdvPayload".into()), Value::Bytes(adv.to_vec())));
+        }
         Value::dict([
             (K_TYPE, Value::Int(MSG_REQUEST)),
-            (K_ID, Value::Str(SEL_FETCH_PASTEBOARD.into())),
+            (K_ID, Value::Str(SEL_PAYLOAD_REQUEST.into())),
             (K_XID, Value::Int(xid)),
+            (K_CONTENT, Value::Dict(content_pairs)),
         ])
     }
 
-    /// Build a P4 pasteboard-fetch response (used by the loopback mock server).
-    ///
-    /// UNVALIDATED: exact UC pasteboard payload unconfirmed until tested against
-    /// a device.
-    pub(super) fn build_pasteboard_response(xid: u64, pb: &Pasteboard) -> Value {
-        let items: Vec<Value> = pb
-            .items
-            .iter()
-            .map(|it| {
-                Value::dict([
-                    ("type", Value::Str(it.uti.clone())),
-                    ("data", Value::Bytes(it.data.clone())),
-                ])
-            })
-            .collect();
-        Value::dict([
+    /// Build a P4 pasteboard-fetch response using an `NSKeyedArchiver`
+    /// `UASharedPasteboardInfoWrapper` inside `_c.rActPayload` (for loopback mock).
+    pub(super) fn build_pasteboard_response(xid: u64, pb: &Pasteboard) -> Result<Value> {
+        let archive = crate::pasteboard_archive::encode_wrapper_for_test(pb)?;
+        Ok(Value::dict([
             (K_TYPE, Value::Int(MSG_RESPONSE)),
             (K_XID, Value::Int(xid)),
-            ("items", Value::Array(items)),
-        ])
+            (
+                K_CONTENT,
+                Value::dict([("rActPayload", Value::Bytes(archive))]),
+            ),
+        ]))
     }
 
-    /// Parse a P4 pasteboard-fetch response into typed items.
-    ///
-    /// UNVALIDATED: exact UC pasteboard payload unconfirmed until tested against
-    /// a device.
+    /// Parse a P4 pasteboard-fetch response (`_c.rActPayload`) into typed items.
     pub(super) fn parse_pasteboard_response(v: &Value) -> Result<Pasteboard> {
-        let items_val = v
-            .get("items")
-            .context("pasteboard response missing `items`")?;
-        let arr = match items_val {
-            Value::Array(a) => a,
-            _ => bail!("pasteboard response `items` is not an array"),
-        };
-        let mut items = Vec::with_capacity(arr.len());
-        for (i, it) in arr.iter().enumerate() {
-            let uti = it
-                .get("type")
-                .and_then(Value::as_str)
-                .with_context(|| format!("pasteboard item {i} missing string `type`"))?
-                .to_string();
-            let data = it
-                .get("data")
-                .and_then(Value::as_bytes)
-                .with_context(|| format!("pasteboard item {i} missing bytes `data`"))?
-                .to_vec();
-            items.push(PasteboardItem { uti, data });
-        }
-        Ok(Pasteboard { items })
+        let content = v
+            .get(K_CONTENT)
+            .context("pasteboard response missing `_c` content dict")?;
+        let payload = content
+            .get("rActPayload")
+            .and_then(Value::as_bytes)
+            .context("pasteboard response `_c` missing bytes `rActPayload`")?;
+        crate::pasteboard_archive::decode_wrapper(payload)
+            .context("decoding UASharedPasteboardInfoWrapper in rActPayload")
     }
 }
 
@@ -262,7 +293,7 @@ pub use uc::{Pasteboard, PasteboardItem, SystemInfo};
 // ContentChannel and framed as EncryptedData ContinuityPackets. The exact
 // four-byte wire header is authenticated as AAD, as in the reference protocol.
 
-async fn send_opack<S: AsyncWrite + Unpin>(
+pub(crate) async fn send_opack<S: AsyncWrite + Unpin>(
     stream: &mut S,
     channel: &mut ContentChannel,
     value: &Value,
@@ -277,7 +308,7 @@ async fn send_opack<S: AsyncWrite + Unpin>(
     .await
 }
 
-async fn recv_opack<S: AsyncRead + Unpin>(
+pub(crate) async fn recv_opack<S: AsyncRead + Unpin>(
     stream: &mut S,
     channel: &mut ContentChannel,
 ) -> Result<Value> {
@@ -304,51 +335,113 @@ pub struct Session<S> {
     stream: S,
     channel: ContentChannel,
     xid: u64,
+    peer_label: Option<String>,
+    pairing_id: Option<String>,
 }
+
+const MAX_SKIPPED_EVENTS: usize = 16;
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     /// Run Pair-Verify M1->M4 over an already-connected stream and return the
     /// encrypted session. Transport-independent: `stream` is any async byte
     /// stream (a TCP socket in production, a loopback socket in tests).
     pub async fn handshake(mut stream: S, identity: PairingIdentity) -> Result<Self> {
+        let pairing_id = identity.pairing_id.clone();
         let mut client = PairVerifyClient::new(identity);
         write_packet(&mut stream, &client.build_m1())
             .await
-            .context("sending Pair-Verify M1")?;
+            .context("stage M1: sending Pair-Verify M1")?;
         let m2 = read_packet(&mut stream)
             .await
-            .context("reading Pair-Verify M2")?;
+            .context("stage M2: reading Pair-Verify M2")?;
         let m3 = client
             .process_m2(&m2)
-            .context("processing M2 / building M3")?;
+            .context("stage M2: processing M2 / building M3")?;
+        let peer_label = client.peer_label().map(ToString::to_string);
         write_packet(&mut stream, &m3)
             .await
-            .context("sending Pair-Verify M3")?;
+            .context("stage M3: sending Pair-Verify M3")?;
         let m4 = read_packet(&mut stream)
             .await
-            .context("reading Pair-Verify M4")?;
+            .context("stage M4: reading Pair-Verify M4")?;
         let channel = client
             .check_m4(&m4)
-            .context("verifying M4 / deriving content keys")?;
+            .context("stage M4: verifying M4 / deriving content keys")?;
         Ok(Session {
             stream,
             channel,
             xid: 1,
+            peer_label,
+            pairing_id,
         })
+    }
+
+    /// Run Transient Pair-Setup M1->M4 (`Flags=0x10`, `fixedPIN="public"`) over
+    /// `stream` and transition directly into an encrypted [`Session`] without
+    /// requiring a long-term `RPIdentity` keypair.
+    pub async fn handshake_transient(mut stream: S, pin: &str) -> Result<Self> {
+        let session_key = crate::pair_setup::run_transient_pair_setup(&mut stream, pin)
+            .await
+            .context("stage Transient Pair-Setup M1..M4")?;
+        let channel =
+            ContentChannel::from_shared_secret(&session_key, crate::companion::Role::Client);
+        Ok(Session {
+            stream,
+            channel,
+            xid: 1,
+            peer_label: Some("transient".into()),
+            pairing_id: None,
+        })
+    }
+
+    /// Authenticated peer label from Pair-Verify M2, if present.
+    pub fn peer_label(&self) -> Option<&str> {
+        self.peer_label.as_deref()
+    }
+
+    async fn recv_response(&mut self, expected_xid: u64, stage: &str) -> Result<Value> {
+        for _ in 0..=MAX_SKIPPED_EVENTS {
+            let msg = recv_opack(&mut self.stream, &mut self.channel)
+                .await
+                .with_context(|| format!("stage {stage}: reading OPACK message"))?;
+            let msg_type = msg.get(uc::K_TYPE).and_then(Value::as_u64);
+            if msg_type == Some(uc::MSG_EVENT) {
+                tracing::debug!(stage, "skipping unrelated companion-link event (_t=1)");
+                continue;
+            }
+            if msg_type != Some(uc::MSG_RESPONSE) {
+                bail!("stage {stage}: expected response (_t=3), got _t={msg_type:?}");
+            }
+            let got_xid = msg.get(uc::K_XID).and_then(Value::as_u64);
+            if got_xid != Some(expected_xid) {
+                bail!(
+                    "stage {stage}: transaction id mismatch (expected {expected_xid}, got {got_xid:?})"
+                );
+            }
+            if let Some(em) = msg.get(uc::K_ERR_MSG).and_then(Value::as_str) {
+                let ec = msg.get(uc::K_ERR_CODE).and_then(Value::as_u64);
+                bail!("stage {stage}: remote error {ec:?}: {em}");
+            }
+            if let Some(ec) = msg.get(uc::K_ERR_CODE).and_then(Value::as_u64) {
+                bail!("stage {stage}: remote error code {ec}");
+            }
+            return Ok(msg);
+        }
+        bail!("stage {stage}: exceeded {MAX_SKIPPED_EVENTS} skipped events waiting for _x={expected_xid}")
     }
 
     /// P1/P2 system-info exchange: send our system-info dict, read the peer's.
     pub async fn system_info_exchange(&mut self, ours: &SystemInfo) -> Result<SystemInfo> {
+        let xid = self.next_xid();
         send_opack(
             &mut self.stream,
             &mut self.channel,
-            &ours.to_value(uc::MSG_REQUEST),
+            &ours.to_value_with_id(uc::MSG_REQUEST, xid, self.pairing_id.as_deref()),
         )
         .await
-        .context("sending system-info request (P1)")?;
-        let resp = recv_opack(&mut self.stream, &mut self.channel)
-            .await
-            .context("reading system-info response (P2)")?;
+        .context("stage system_info: sending request")?;
+        let resp = self.recv_response(xid, "system_info").await?;
+        tracing::debug!(?resp, "system_info response");
         Ok(SystemInfo::from_value(&resp))
     }
 
@@ -361,17 +454,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     /// deliberately not implemented yet; this handles the inline case only.
     pub async fn fetch_pasteboard(&mut self) -> Result<Pasteboard> {
         let xid = self.next_xid();
+        let req_id = uuid::Uuid::new_v4().to_string();
         send_opack(
             &mut self.stream,
             &mut self.channel,
-            &uc::build_pasteboard_request(xid),
+            &uc::build_pasteboard_request(xid, uc::CMD_PBPASTE2, &req_id, None),
         )
         .await
-        .context("sending pasteboard-fetch request (P3)")?;
-        let resp = recv_opack(&mut self.stream, &mut self.channel)
-            .await
-            .context("reading pasteboard-fetch response (P4)")?;
-        uc::parse_pasteboard_response(&resp).context("parsing pasteboard response")
+        .context("stage payload_request: sending pasteboard-fetch request")?;
+        let resp = self.recv_response(xid, "payload_request").await?;
+        uc::parse_pasteboard_response(&resp)
+            .context("stage archive_decode: parsing pasteboard response")
     }
 
     fn next_xid(&mut self) -> u64 {
@@ -409,6 +502,27 @@ pub async fn connect(
     .context("companion-link Pair-Verify handshake failed")
 }
 
+/// Connect to a companion-link peer over TCP and run Transient Pair-Setup M1..M4
+/// (`Flags=0x10`, `fixedPIN="public"`), returning the encrypted [`Session`].
+pub async fn connect_transient(host: &str, port: u16, pin: &str) -> Result<Session<TcpStream>> {
+    let stream = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        Ok::<_, anyhow::Error>(
+            TcpStream::connect(crate::discover::socket_target(host, port).await?).await?,
+        )
+    })
+    .await
+    .context("TCP connection timed out")?
+    .with_context(|| format!("connecting to companion-link at {host}:{port}"))?;
+    stream.set_nodelay(true).ok();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        Session::handshake_transient(stream, pin),
+    )
+    .await
+    .context("Transient Pair-Setup timed out")?
+    .context("companion-link Transient Pair-Setup handshake failed")
+}
+
 // ---------------------------------------------------------------------------
 // In-process loopback mock server (the peer side, for tests + `pull --loopback`)
 // ---------------------------------------------------------------------------
@@ -439,13 +553,17 @@ pub async fn run_mock_server<S: AsyncRead + AsyncWrite + Unpin>(
         .context("mock: sending M4")?;
 
     // P1/P2: read the client's system-info request, reply with ours.
-    let _client_info = recv_opack(&mut stream, &mut channel)
+    let client_info = recv_opack(&mut stream, &mut channel)
         .await
         .context("mock: reading P1")?;
+    let info_xid = client_info
+        .get(uc::K_XID)
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     send_opack(
         &mut stream,
         &mut channel,
-        &sysinfo.to_value(uc::MSG_RESPONSE),
+        &sysinfo.to_value(uc::MSG_RESPONSE, info_xid),
     )
     .await
     .context("mock: sending P2")?;
@@ -455,13 +573,10 @@ pub async fn run_mock_server<S: AsyncRead + AsyncWrite + Unpin>(
         .await
         .context("mock: reading P3")?;
     let xid = req.get(uc::K_XID).and_then(Value::as_u64).unwrap_or(0);
-    send_opack(
-        &mut stream,
-        &mut channel,
-        &uc::build_pasteboard_response(xid, &pasteboard),
-    )
-    .await
-    .context("mock: sending P4")?;
+    let resp = uc::build_pasteboard_response(xid, &pasteboard)?;
+    send_opack(&mut stream, &mut channel, &resp)
+        .await
+        .context("mock: sending P4")?;
     Ok(())
 }
 
@@ -475,14 +590,18 @@ pub fn matched_loopback_identities() -> (PairingIdentity, PairingIdentity) {
     let client_vk = client_sk.verifying_key();
     let server_vk = server_sk.verifying_key();
     let client = PairingIdentity {
+        pairing_id: None,
         signing: client_sk,
         device_irk: [0u8; 16],
         peers: vec![("mock-server".into(), server_vk)],
+        peer_irks: vec![],
     };
     let server = PairingIdentity {
+        pairing_id: None,
         signing: server_sk,
         device_irk: [0u8; 16],
         peers: vec![("mock-client".into(), client_vk)],
+        peer_irks: vec![],
     };
     (client, server)
 }
@@ -574,11 +693,22 @@ mod tests {
 
     #[test]
     fn pasteboard_request_response_opack_roundtrip() {
-        // The OPACK request/response round-trip is the load-bearing (if
-        // reconstructed) contract: build -> encode -> decode -> parse.
-        let req = uc::build_pasteboard_request(42);
+        let req = uc::build_pasteboard_request(42, uc::CMD_PBPASTE2, "req-1", Some(&[1, 2, 3]));
         let decoded_req = opack::decode(&opack::encode(&req)).unwrap();
+        assert_eq!(
+            decoded_req.get(uc::K_TYPE).and_then(Value::as_u64),
+            Some(uc::MSG_REQUEST)
+        );
+        assert_eq!(
+            decoded_req.get(uc::K_ID).and_then(Value::as_str),
+            Some(uc::SEL_PAYLOAD_REQUEST)
+        );
         assert_eq!(decoded_req.get(uc::K_XID).and_then(Value::as_u64), Some(42));
+        let content = decoded_req.get(uc::K_CONTENT).unwrap();
+        assert_eq!(
+            content.get("rClientCommand").and_then(Value::as_str),
+            Some("pbpaste2")
+        );
 
         let board = Pasteboard {
             items: vec![
@@ -592,7 +722,7 @@ mod tests {
                 },
             ],
         };
-        let resp = uc::build_pasteboard_response(42, &board);
+        let resp = uc::build_pasteboard_response(42, &board).unwrap();
         let decoded = opack::decode(&opack::encode(&resp)).unwrap();
         let parsed = uc::parse_pasteboard_response(&decoded).unwrap();
         assert_eq!(parsed, board);
@@ -601,24 +731,16 @@ mod tests {
 
     #[test]
     fn parse_rejects_malformed_pasteboard() {
-        // Missing `items`.
+        // Missing `_c`.
         let bad = Value::dict([(uc::K_TYPE, Value::Int(uc::MSG_RESPONSE))]);
         assert!(uc::parse_pasteboard_response(&bad).is_err());
-        // `items` present but an item lacks `data`.
-        let bad2 = Value::dict([(
-            "items",
-            Value::Array(vec![Value::dict([(
-                "type",
-                Value::Str("public.text".into()),
-            )])]),
-        )]);
+        // `_c` present but lacks `rActPayload`.
+        let bad2 = Value::dict([(uc::K_CONTENT, Value::dict([]))]);
         assert!(uc::parse_pasteboard_response(&bad2).is_err());
     }
 
     #[tokio::test]
     async fn end_to_end_over_loopback_tcp() {
-        // The whole client flow over a real loopback socket against the mock
-        // server: connect -> Pair-Verify -> system-info -> fetch -> decrypt.
         let (client_id, server_id) = matched_loopback_identities();
         let sysinfo = SystemInfo {
             name: "Peer".into(),
@@ -642,6 +764,7 @@ mod tests {
 
         let stream = TcpStream::connect(addr).await.unwrap();
         let mut session = Session::handshake(stream, client_id).await.unwrap();
+        assert_eq!(session.peer_label(), Some("mock-server"));
         let peer = session
             .system_info_exchange(&SystemInfo {
                 name: "Linux".into(),
@@ -654,6 +777,64 @@ mod tests {
         assert_eq!(got, board);
         assert_eq!(got.plain_text().as_deref(), Some("copied text"));
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatcher_skips_events_and_surfaces_errors_or_xid_mismatch() {
+        let (client_id, server_id) = matched_loopback_identities();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut server = PairVerifyServer::new(server_id);
+            let m1 = read_packet(&mut sock).await.unwrap();
+            let m2 = server.process_m1(&m1).unwrap();
+            write_packet(&mut sock, &m2).await.unwrap();
+            let m3 = read_packet(&mut sock).await.unwrap();
+            let (m4, mut ch) = server.process_m3(&m3).unwrap();
+            write_packet(&mut sock, &m4).await.unwrap();
+
+            // P1: send an unrelated event (_t=1) before the real response (_t=3).
+            let p1 = recv_opack(&mut sock, &mut ch).await.unwrap();
+            let x1 = p1.get(uc::K_XID).and_then(Value::as_u64).unwrap();
+            let evt = Value::dict([(uc::K_TYPE, Value::Int(uc::MSG_EVENT))]);
+            send_opack(&mut sock, &mut ch, &evt).await.unwrap();
+            let resp = SystemInfo::default().to_value(uc::MSG_RESPONSE, x1);
+            send_opack(&mut sock, &mut ch, &resp).await.unwrap();
+
+            // P3: return a remote error.
+            let p3 = recv_opack(&mut sock, &mut ch).await.unwrap();
+            let x3 = p3.get(uc::K_XID).and_then(Value::as_u64).unwrap();
+            let err_resp = Value::dict([
+                (uc::K_TYPE, Value::Int(uc::MSG_RESPONSE)),
+                (uc::K_XID, Value::Int(x3)),
+                (uc::K_ERR_CODE, Value::Int(42)),
+                (uc::K_ERR_MSG, Value::Str("denied".into())),
+            ]);
+            send_opack(&mut sock, &mut ch, &err_resp).await.unwrap();
+
+            // Next request: return mismatched _x.
+            let p4 = recv_opack(&mut sock, &mut ch).await.unwrap();
+            let x4 = p4.get(uc::K_XID).and_then(Value::as_u64).unwrap();
+            let bad_xid = Value::dict([
+                (uc::K_TYPE, Value::Int(uc::MSG_RESPONSE)),
+                (uc::K_XID, Value::Int(x4 + 99)),
+            ]);
+            send_opack(&mut sock, &mut ch, &bad_xid).await.unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut session = Session::handshake(stream, client_id).await.unwrap();
+        let _ = session
+            .system_info_exchange(&SystemInfo::default())
+            .await
+            .unwrap();
+        let err = session.fetch_pasteboard().await.unwrap_err().to_string();
+        assert!(err.contains("denied"), "expected remote error, got: {err}");
+        let err2 = session.fetch_pasteboard().await.unwrap_err().to_string();
+        assert!(err2.contains("transaction id mismatch"), "got: {err2}");
+        srv.await.unwrap();
     }
 
     #[tokio::test]
@@ -671,14 +852,18 @@ mod tests {
         // Unknown signing keys must never authorize clipboard access.
         use ed25519_dalek::SigningKey;
         let client = PairingIdentity {
+            pairing_id: None,
             signing: SigningKey::generate(&mut rand::rngs::OsRng),
             device_irk: [0u8; 16],
             peers: vec![], // knows no peers
+            peer_irks: vec![],
         };
         let server = PairingIdentity {
+            pairing_id: None,
             signing: SigningKey::generate(&mut rand::rngs::OsRng),
             device_irk: [0u8; 16],
             peers: vec![],
+            peer_irks: vec![],
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

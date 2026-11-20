@@ -8,9 +8,56 @@ use std::{
 };
 pub const MAX_TRANSFER: u64 = 32 * 1024 * 1024 * 1024;
 pub const MAX_ENTRIES: usize = 65536;
+pub const MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_DISK_PERCENT: u8 = 30;
+
+pub fn validate_max_disk_percent(percent: u8) -> Result<u8> {
+    ensure!(
+        (1..=90).contains(&percent),
+        "max disk percent must be 1..=90"
+    );
+    Ok(percent)
+}
+
+pub fn allowed_transfer_bytes_for_free(free_bytes: u64, max_percent: u8) -> Result<u64> {
+    let pct = validate_max_disk_percent(max_percent)?;
+    let reserve_cap = free_bytes.saturating_sub(MIN_FREE_BYTES);
+    ensure!(
+        reserve_cap > 0,
+        "insufficient free disk space (< 1 GiB free)"
+    );
+    let percent_cap = ((free_bytes as u128 * pct as u128) / 100) as u64;
+    Ok(percent_cap.min(reserve_cap).min(MAX_TRANSFER))
+}
+
+pub fn available_disk_bytes(path: &Path) -> Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .context("invalid destination path for statvfs")?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    ensure!(
+        rc == 0,
+        "statvfs failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let frsize = if stat.f_frsize > 0 {
+        stat.f_frsize
+    } else {
+        stat.f_bsize
+    };
+    Ok((stat.f_bavail as u128)
+        .saturating_mul(frsize as u128)
+        .min(u64::MAX as u128) as u64)
+}
+
+pub fn max_allowed_bytes(dest: &Path, max_percent: u8) -> Result<u64> {
+    let free = available_disk_bytes(dest)?;
+    allowed_transfer_bytes_for_free(free, max_percent)
+}
 fn bounded_copy(mut source: impl Read, out: &mut impl Write, limit: u64) -> Result<u64> {
     let n = std::io::copy(&mut source.by_ref().take(limit + 1), out)?;
-    ensure!(n <= limit, "transfer exceeds 32 GiB limit");
+    ensure!(n <= limit, "transfer exceeds {limit} byte limit");
     Ok(n)
 }
 fn number(b: &[u8], radix: u32) -> Result<u64> {
@@ -42,6 +89,7 @@ fn decoded(
     mut file: File,
     ty: &str,
     token: super::cancel::Token,
+    limit: u64,
 ) -> Result<tempfile::NamedTempFile> {
     let mut output = tempfile::NamedTempFile::new()?;
     let mut prefix = [0; 2];
@@ -52,7 +100,7 @@ fn decoded(
         bounded_copy(
             flate2::read::GzDecoder::new(file),
             output.as_file_mut(),
-            MAX_TRANSFER,
+            limit,
         )?;
     } else if ty == "application/x-dvzip" {
         let mut written = 0;
@@ -68,12 +116,12 @@ fn decoded(
             ensure!(size > 0, "empty DVZip block");
             let mut block = (&mut file).take(size);
             let n = if header & 0x80000000 != 0 {
-                bounded_copy(&mut block, output.as_file_mut(), MAX_TRANSFER - written)?
+                bounded_copy(&mut block, output.as_file_mut(), limit - written)?
             } else {
                 bounded_copy(
                     flate2::read::ZlibDecoder::new(&mut block),
                     output.as_file_mut(),
-                    MAX_TRANSFER - written,
+                    limit - written,
                 )?
             };
             // Consume the entire bounded block, including any decoder buffering.
@@ -83,7 +131,7 @@ fn decoded(
         }
     } else {
         ensure!(ty == "application/x-cpio", "unsupported archive media type");
-        bounded_copy(file, output.as_file_mut(), MAX_TRANSFER)?;
+        bounded_copy(file, output.as_file_mut(), limit)?;
     }
     output.as_file_mut().rewind()?;
     Ok(output)
@@ -98,13 +146,24 @@ pub struct Saved {
 pub fn receive(file: File, ty: &str, dest: &Path) -> Result<Saved> {
     receive_cancel(file, ty, dest, super::cancel::Token::default())
 }
+#[cfg(test)]
 pub fn receive_cancel(
     file: File,
     ty: &str,
     dest: &Path,
     token: super::cancel::Token,
 ) -> Result<Saved> {
-    let decoded = decoded(file, ty, token.clone())?;
+    receive_cancel_with_limit(file, ty, dest, token, MAX_TRANSFER)
+}
+
+pub fn receive_cancel_with_limit(
+    file: File,
+    ty: &str,
+    dest: &Path,
+    token: super::cancel::Token,
+    limit: u64,
+) -> Result<Saved> {
+    let decoded = decoded(file, ty, token.clone(), limit)?;
     let mut input = std::io::BufReader::new(super::cancel::Reader {
         inner: decoded.as_file(),
         token: token.clone(),
@@ -160,7 +219,7 @@ pub fn receive_cancel(
             trailer = true;
             break;
         }
-        ensure!(size <= MAX_TRANSFER - total, "archive exceeds limit");
+        ensure!(size <= limit - total, "archive exceeds limit");
         total += size;
         if name == "." || name == "./" {
             ensure!(
@@ -303,5 +362,36 @@ mod tests {
             relative("./folder/file.txt").unwrap(),
             PathBuf::from("folder/file.txt")
         );
+    }
+
+    #[test]
+    fn disk_quota_enforces_percent_and_one_gib_reserve() {
+        assert!(validate_max_disk_percent(0).is_err());
+        assert!(validate_max_disk_percent(91).is_err());
+        assert_eq!(validate_max_disk_percent(30).unwrap(), 30);
+
+        // < 1 GiB free is always rejected without underflow.
+        assert!(allowed_transfer_bytes_for_free(512 * 1024 * 1024, 30).is_err());
+        assert!(allowed_transfer_bytes_for_free(MIN_FREE_BYTES, 30).is_err());
+
+        // 10 GiB free at 30% -> 3 GiB cap (reserve cap is 9 GiB).
+        let ten_gib = 10 * MIN_FREE_BYTES;
+        assert_eq!(
+            allowed_transfer_bytes_for_free(ten_gib, 30).unwrap(),
+            3 * MIN_FREE_BYTES
+        );
+
+        // 1.1 GiB free at 50% -> reserve cap (0.1 GiB) is tighter than 50% (0.55 GiB).
+        let just_over = MIN_FREE_BYTES + 100 * 1024 * 1024;
+        assert_eq!(
+            allowed_transfer_bytes_for_free(just_over, 50).unwrap(),
+            100 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn quota_rejection_names_the_quota_that_applied() {
+        let error = bounded_copy(&[0u8; 10][..], &mut Vec::new(), 5).unwrap_err();
+        assert!(error.to_string().contains("5 byte limit"), "{error}");
     }
 }

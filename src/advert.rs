@@ -35,33 +35,57 @@ impl HandoffBle {
     /// begins at the first Continuity TLV (`0c ...`). We accept both framings:
     /// with the leading `4c 00` (raw HCI) and without (BlueZ ManufacturerData).
     pub fn parse(data: &[u8]) -> Option<Self> {
-        // Locate the 0x0c TLV. Two common shapes:
-        //   raw:   4c 00 0c len ...
-        //   bluez: 0c len ...   (company id already consumed)
         let body = if data.len() >= 3 && data[0] == 0x4c && data[1] == 0x00 {
             &data[2..]
         } else {
             data
         };
 
-        if body.len() < 2 || body[0] != TYPE_HANDOFF {
-            return None;
+        // Walk bounded Continuity TLVs (type(1) | len(1) | value(len)).
+        let mut pos = 0;
+        let mut hops = 0usize;
+        while pos < body.len() && hops < 16 {
+            hops += 1;
+            let tlv_type = *body.get(pos)?;
+            let len = *body.get(pos + 1)? as usize;
+            let val_start = pos + 2;
+            let val_end = val_start.checked_add(len)?;
+            let content = body.get(val_start..val_end)?;
+            if tlv_type == TYPE_HANDOFF {
+                if content.len() < 4 {
+                    return None;
+                }
+                return Some(HandoffBle {
+                    status: content[0],
+                    counter_iv: [content[1], content[2]],
+                    tag: [content[3]],
+                    ciphertext: content[4..].to_vec(),
+                });
+            }
+            pos = val_end;
         }
-        let len = body[1] as usize;
-        let content = body.get(2..2 + len)?;
-        if content.len() < 4 {
-            return None;
-        }
-        let status = content[0];
-        let counter_iv = [content[1], content[2]];
-        let tag = [content[3]];
-        let ciphertext = content[4..].to_vec();
-        Some(HandoffBle {
-            status,
-            counter_iv,
-            tag,
-            ciphertext,
-        })
+        None
+    }
+
+    /// Encrypt a 10-byte [`HandoffPayload`] into a 16-byte `0x0c` Continuity TLV
+    /// (`0c 0e 08 iv0 iv1 tag0 ct[10]`) ready for `advertise::broadcast`.
+    #[allow(dead_code)]
+    pub fn seal(
+        key: &[u8],
+        counter_iv: [u8; 2],
+        payload: &HandoffPayload,
+    ) -> anyhow::Result<Vec<u8>> {
+        let status = 0x08u8;
+        let plain = payload.encode();
+        let (ct, tag) = crate::gcm::seal_truncated(key, &counter_iv, &[status], &plain, 1)?;
+        let mut out = Vec::with_capacity(16);
+        out.push(TYPE_HANDOFF);
+        out.push(14);
+        out.push(status);
+        out.extend_from_slice(&counter_iv);
+        out.push(tag[0]);
+        out.extend_from_slice(&ct);
+        Ok(out)
     }
 }
 
@@ -82,6 +106,16 @@ pub struct HandoffPayload {
 }
 
 impl HandoffPayload {
+    #[allow(dead_code)]
+    pub fn encode(&self) -> [u8; 10] {
+        let mut out = [0u8; 10];
+        out[0] = self.status;
+        out[1..8].copy_from_slice(&self.activity_hash);
+        out[8] = self.flags.raw;
+        out[9] = 0x20;
+        out
+    }
+
     pub fn parse(plain: &[u8]) -> Option<Self> {
         if plain.len() < 10 {
             return None;
@@ -183,8 +217,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_handoff_after_preceding_continuity_tlv() {
+        // Nearby Info (0x10, len 2) followed by Handoff (0x0c, len 14).
+        let mut data = vec![0x10, 0x02, 0xaa, 0xbb, 0x0c, 0x0e, 0x08, 0x2a, 0x00, 0x99];
+        data.extend_from_slice(&[0xde; 10]);
+        let h = HandoffBle::parse(&data).expect("should find 0x0c after 0x10");
+        assert_eq!(h.counter_iv, [0x2a, 0x00]);
+    }
+
+    #[test]
+    fn rejects_truncated_tlv() {
+        // Preceding TLV claims 5 bytes, only 2 present.
+        assert!(HandoffBle::parse(&[0x10, 0x05, 0xaa, 0xbb]).is_none());
+        // Handoff TLV claims 14 bytes, truncated.
+        assert!(HandoffBle::parse(&[0x0c, 0x0e, 0x08, 0x2a, 0x00]).is_none());
+    }
+
+    #[test]
     fn flags_clipboard_bit() {
         assert!(HandoffFlags::from_byte(0x08).clipboard_available());
         assert!(!HandoffFlags::from_byte(0x01).clipboard_available());
+    }
+
+    #[test]
+    fn seal_and_parse_roundtrip() {
+        let key = [0x42u8; 16];
+        let payload = HandoffPayload {
+            status: 0x00,
+            activity_hash: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77],
+            flags: HandoffFlags::from_byte(0x08),
+        };
+        let tlv = HandoffBle::seal(&key, [0x34, 0x12], &payload).unwrap();
+        assert_eq!(tlv.len(), 16);
+        let parsed = HandoffBle::parse(&tlv).unwrap();
+        let plain = crate::gcm::open_truncated(
+            &key,
+            &parsed.counter_iv,
+            &[parsed.status],
+            &parsed.ciphertext,
+            &parsed.tag,
+        )
+        .unwrap()
+        .unwrap();
+        let back = HandoffPayload::parse(&plain).unwrap();
+        assert_eq!(back.activity_hash, payload.activity_hash);
+        assert!(back.flags.clipboard_available());
     }
 }
