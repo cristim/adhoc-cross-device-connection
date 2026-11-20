@@ -36,6 +36,7 @@ pub async fn broadcast(data: Vec<u8>, seconds: u64, interval_ms: u64) -> Result<
         adapter.is_powered().await?,
         "Bluetooth adapter is powered off"
     );
+    let tlv_len = data.len();
     let advertisement = bluer::adv::Advertisement {
         advertisement_type: bluer::adv::Type::Broadcast,
         manufacturer_data: BTreeMap::from([(0x004c, data)]),
@@ -45,7 +46,7 @@ pub async fn broadcast(data: Vec<u8>, seconds: u64, interval_ms: u64) -> Result<
         ..Default::default()
     };
     let handle = adapter.advertise(advertisement).await?;
-    tracing::info!(adapter=%adapter.name(),seconds,"BLE advertisement registered");
+    tracing::info!(adapter=%adapter.name(),seconds,interval_ms,tlv_len,"BLE advertisement registered");
     tokio::select! {_=tokio::time::sleep(Duration::from_secs(seconds))=>{},_=crate::shutdown()=>{}}
     drop(handle);
     tokio::time::sleep(Duration::from_millis(100)).await;

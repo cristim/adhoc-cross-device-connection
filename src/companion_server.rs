@@ -162,6 +162,7 @@ pub async fn run_server(
     if let Some(ba) = ble_addr {
         props.insert("rpBA".into(), ba);
     }
+    tracing::debug!(txt = %txt_summary(&props), "companion-link mDNS TXT record");
     let host_label = "ac-dc.local.";
     let svc_info = ServiceInfo::new(
         SERVICE_TYPE,
@@ -198,6 +199,30 @@ pub async fn run_server(
     let _ = mdns.unregister(&fullname);
     let _ = mdns.shutdown();
     res
+}
+
+/// TXT keys a real Apple device publishes; `absent=` lists the ones we omit so
+/// a Mac-side comparison shows what is missing. Identifying values are never logged.
+const APPLE_TXT_KEYS: [&str; 6] = ["rpAD", "rpBA", "rpHA", "rpHI", "rpMac", "rpHN"];
+
+/// One-line view of a companion-link TXT record: plain values for the fields
+/// we set, only the length for device-identifying ones (`rpBA`, `rpAD`).
+fn txt_summary(props: &HashMap<String, String>) -> String {
+    let mut keys: Vec<_> = props.keys().collect();
+    keys.sort();
+    let mut parts: Vec<String> = keys
+        .into_iter()
+        .map(|k| match k.as_str() {
+            "rpBA" | "rpAD" => format!("{k}=<len {}>", props[k].len()),
+            _ => format!("{k}={}", props[k]),
+        })
+        .collect();
+    let missing: Vec<&str> = APPLE_TXT_KEYS
+        .into_iter()
+        .filter(|k| !props.contains_key(*k))
+        .collect();
+    parts.push(format!("absent=[{}]", missing.join(",")));
+    parts.join(" ")
 }
 
 /// Watch Wayland clipboard changes via `wl-paste --watch` and broadcast
@@ -258,6 +283,15 @@ pub async fn run_clipboard_broadcaster(keys: Vec<HandoffKey>, echo_guard: EchoGu
             prev.abort();
         }
         let key_id = key.id.clone();
+        tracing::debug!(
+            key_index = 0,
+            keys_total = keys.len(),
+            status = format_args!("{:#04x}", tlv[2]),
+            flags = format_args!("{:#04x}", payload.flags.raw),
+            counter,
+            tlv_len = tlv.len(),
+            "0x0c advert content"
+        );
         adv_task = Some(tokio::spawn(async move {
             tracing::info!(key = %key_id, counter, "broadcasting 0x0c Universal Clipboard BLE advert");
             if let Err(e) = crate::advertise::broadcast(tlv, 20, 100).await {
@@ -275,6 +309,23 @@ mod tests {
         matched_loopback_identities, PasteboardItem, Session, SystemInfo,
     };
     use tokio::net::TcpStream;
+
+    #[test]
+    fn txt_summary_hides_identifying_values_and_lists_what_is_absent() {
+        let props: HashMap<String, String> = [
+            ("rpMd", "MacBookPro18,3"),
+            ("rpHN", "ac-dc"),
+            ("rpBA", "AA:BB:CC:DD:EE:FF"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let line = txt_summary(&props);
+        assert!(line.contains("rpMd=MacBookPro18,3"));
+        assert!(line.contains("rpBA=<len 17>"));
+        assert!(!line.contains("AA:BB"));
+        assert!(line.ends_with("absent=[rpAD,rpHA,rpHI,rpMac]"));
+    }
 
     #[tokio::test]
     async fn server_serves_system_info_and_pasteboard_over_loopback() {
