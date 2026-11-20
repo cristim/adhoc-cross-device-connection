@@ -165,7 +165,7 @@ pub async fn run_server(
     let host_label = "ac-dc.local.";
     let svc_info = ServiceInfo::new(
         SERVICE_TYPE,
-        "ac-dc",
+        crate::discover::OWN_INSTANCE,
         host_label,
         (),
         local_port,
