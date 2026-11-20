@@ -6,7 +6,11 @@ pub struct Request {
     pub path: String,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
-    pub upload: Option<tempfile::NamedTempFile>,
+    pub upload: Option<Upload>,
+}
+pub struct Upload {
+    pub file: tempfile::NamedTempFile,
+    pub limit: u64,
 }
 async fn line<S: AsyncRead + Unpin>(io: &mut BufReader<S>) -> Result<String> {
     let mut b = Vec::new();
@@ -33,18 +37,20 @@ async fn line<S: AsyncRead + Unpin>(io: &mut BufReader<S>) -> Result<String> {
 }
 #[cfg(test)]
 pub async fn read<S: AsyncRead + AsyncWrite + Unpin>(io: &mut BufReader<S>) -> Result<Request> {
-    read_inner(io, false, || true).await
+    read_inner(io, false, || true, || Ok(64 * 1024 * 1024)).await
 }
 pub async fn read_spooled<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut BufReader<S>,
     authorize: impl FnMut() -> bool,
+    quota: impl FnOnce() -> Result<u64>,
 ) -> Result<Request> {
-    read_inner(io, true, authorize).await
+    read_inner(io, true, authorize, quota).await
 }
 async fn read_inner<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut BufReader<S>,
     spool: bool,
     mut authorize: impl FnMut() -> bool,
+    quota: impl FnOnce() -> Result<u64>,
 ) -> Result<Request> {
     let first = line(io).await?;
     let parts = first.split_whitespace().collect::<Vec<_>>();
@@ -78,15 +84,31 @@ async fn read_inner<S: AsyncRead + AsyncWrite + Unpin>(
         respond(io.get_mut(), 403, b"").await?;
         anyhow::bail!("Upload requires an accepted Ask");
     }
-    let limit = if path == "/Upload" {
-        if spool {
-            super::storage::MAX_TRANSFER as usize
-        } else {
-            64 * 1024 * 1024
+    let upload_limit = if path == "/Upload" {
+        match quota() {
+            Ok(q) => q,
+            Err(e) => {
+                respond(io.get_mut(), 507, b"").await?;
+                return Err(e);
+            }
         }
+    } else {
+        0
+    };
+    let limit = if path == "/Upload" {
+        usize::try_from(upload_limit).unwrap_or(usize::MAX)
     } else {
         1024 * 1024
     };
+    if path == "/Upload"
+        && headers
+            .get("totalbytes")
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|declared| declared > upload_limit)
+    {
+        respond(io.get_mut(), 413, b"").await?;
+        anyhow::bail!("declared transfer exceeds the disk space quota");
+    }
     let te = headers.get("transfer-encoding");
     let cl = headers.get("content-length");
     ensure!(
@@ -100,7 +122,10 @@ async fn read_inner<S: AsyncRead + AsyncWrite + Unpin>(
         );
     }
     let length = cl.map(|s| s.parse::<usize>()).transpose()?.unwrap_or(0);
-    ensure!(length <= limit, "request body exceeds limit");
+    if length > limit {
+        respond(io.get_mut(), 413, b"").await?;
+        anyhow::bail!("request body exceeds limit");
+    }
     if headers
         .get("expect")
         .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
@@ -111,13 +136,16 @@ async fn read_inner<S: AsyncRead + AsyncWrite + Unpin>(
         io.get_mut().flush().await?;
     }
     let upload = if spool && path == "/Upload" {
-        Some(tempfile::NamedTempFile::new()?)
+        Some(Upload {
+            file: tempfile::NamedTempFile::new()?,
+            limit: upload_limit,
+        })
     } else {
         None
     };
     let mut disk = upload
         .as_ref()
-        .map(|f| f.reopen().map(tokio::fs::File::from_std))
+        .map(|u| u.file.reopen().map(tokio::fs::File::from_std))
         .transpose()?;
     let mut body = Vec::new();
     let mut consumed = 0usize;
@@ -138,7 +166,10 @@ async fn read_inner<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 break;
             }
-            ensure!(n <= limit - consumed, "chunked body exceeds limit");
+            if n > limit - consumed {
+                respond(io.get_mut(), 413, b"").await?;
+                anyhow::bail!("chunked body exceeds limit");
+            }
             copy_body(io, &mut disk, &mut body, n).await?;
             consumed += n;
             let mut end = [0; 2];
@@ -164,7 +195,9 @@ fn reason_phrase(status: u16) -> &'static str {
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
+        413 => "Payload Too Large",
         415 => "Unsupported Media Type",
+        507 => "Insufficient Storage",
         _ => "Internal Server Error",
     }
 }
@@ -252,7 +285,7 @@ mod authorization_tests {
             .unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            read_spooled(&mut BufReader::new(s), || false),
+            read_spooled(&mut BufReader::new(s), || false, || Ok(u64::MAX)),
         )
         .await
         .unwrap();
@@ -260,5 +293,67 @@ mod authorization_tests {
         let mut b = [0; 256];
         let n = c.read(&mut b).await.unwrap();
         assert!(std::str::from_utf8(&b[..n]).unwrap().contains("403"));
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    async fn upload_status(head: &str, quota: u64) -> (Result<Request>, String) {
+        let (mut c, s) = tokio::io::duplex(1024);
+        c.write_all(head.as_bytes()).await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_spooled(&mut BufReader::new(s), || true, move || Ok(quota)),
+        )
+        .await
+        .expect("the body was read instead of refused");
+        let mut b = [0; 256];
+        let n = c.read(&mut b).await.unwrap();
+        (result, String::from_utf8_lossy(&b[..n]).into_owned())
+    }
+
+    #[tokio::test]
+    async fn content_length_over_the_quota_is_refused_before_any_body_is_read() {
+        let (result, reply) =
+            upload_status("POST /Upload HTTP/1.1\r\nContent-Length: 1000\r\n\r\n", 10).await;
+        assert!(result.is_err());
+        assert!(reply.contains("413"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn declared_total_over_the_quota_is_refused_for_a_chunked_upload() {
+        let head =
+            "POST /Upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTotalBytes: 1000\r\n\r\n";
+        let (result, reply) = upload_status(head, 10).await;
+        assert!(result.is_err());
+        assert!(reply.contains("413"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn chunks_are_counted_against_the_quota() {
+        let head = "POST /Upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nB\r\n";
+        let (result, reply) = upload_status(head, 10).await;
+        assert!(result.is_err());
+        assert!(reply.contains("413"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_quota_lookup_gets_507_before_the_body() {
+        let (mut c, s) = tokio::io::duplex(1024);
+        c.write_all(b"POST /Upload HTTP/1.1\r\nContent-Length: 5\r\n\r\n")
+            .await
+            .unwrap();
+        let result = read_spooled(
+            &mut BufReader::new(s),
+            || true,
+            || anyhow::bail!("disk full"),
+        )
+        .await;
+        assert!(result.is_err());
+        let mut b = [0; 256];
+        let n = c.read(&mut b).await.unwrap();
+        assert!(std::str::from_utf8(&b[..n]).unwrap().contains("507"));
     }
 }

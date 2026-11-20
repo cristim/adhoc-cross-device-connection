@@ -57,7 +57,7 @@ pub fn max_allowed_bytes(dest: &Path, max_percent: u8) -> Result<u64> {
 }
 fn bounded_copy(mut source: impl Read, out: &mut impl Write, limit: u64) -> Result<u64> {
     let n = std::io::copy(&mut source.by_ref().take(limit + 1), out)?;
-    ensure!(n <= limit, "transfer exceeds 32 GiB limit");
+    ensure!(n <= limit, "transfer exceeds {limit} byte limit");
     Ok(n)
 }
 fn number(b: &[u8], radix: u32) -> Result<u64> {
@@ -387,5 +387,11 @@ mod tests {
             allowed_transfer_bytes_for_free(just_over, 50).unwrap(),
             100 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn quota_rejection_names_the_quota_that_applied() {
+        let error = bounded_copy(&[0u8; 10][..], &mut Vec::new(), 5).unwrap_err();
+        assert!(error.to_string().contains("5 byte limit"), "{error}");
     }
 }

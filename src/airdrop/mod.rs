@@ -373,6 +373,11 @@ fn has_valid_sender_record(dict: &plist::Dictionary) -> bool {
         .is_some_and(|b| !b.is_empty() && b.len() <= MAX_VALIDATION_RECORD_BYTES)
 }
 
+enum Reply {
+    Body(Vec<u8>, bool),
+    Status(u16),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connection(
     stream: tokio::net::TcpStream,
@@ -399,198 +404,207 @@ async fn connection(
     for _ in 0..32 {
         let req = tokio::time::timeout(
             Duration::from_secs(3600),
-            http::read_spooled(&mut io, || {
-                sessions
-                    .approved
-                    .lock()
-                    .unwrap()
-                    .remove(&peer)
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(120))
-            }),
+            http::read_spooled(
+                &mut io,
+                || {
+                    sessions
+                        .approved
+                        .lock()
+                        .unwrap()
+                        .remove(&peer)
+                        .is_some_and(|t| t.elapsed() < Duration::from_secs(120))
+                },
+                || storage::max_allowed_bytes(&dest, max_disk_percent),
+            ),
         )
         .await
         .context("Airdrop-compatible request timed out")??;
         tracing::info!(%peer,endpoint=%req.path,"Airdrop-compatible incoming request");
-        let result = match req.path.as_str() {
-            "/Discover" => {
-                let value = plist::Value::from_reader(Cursor::new(&req.body))
-                    .context("invalid Discover plist")?;
-                let dict = value
-                    .as_dictionary()
-                    .context("Discover must be a dictionary")?;
-                if visibility == VisibilityMode::ContactsOnly && !has_valid_sender_record(dict) {
-                    Err(Unauthorized.into())
-                } else {
-                    Ok((
-                        response(&name, record.as_deref().map(Vec::as_slice))?,
-                        false,
-                    ))
-                }
-            }
-            "/Ask" => {
-                let value = plist::Value::from_reader(Cursor::new(&req.body))?;
-                let dict = value.as_dictionary().context("Ask must be a dictionary")?;
-                if visibility == VisibilityMode::ContactsOnly && !has_valid_sender_record(dict) {
-                    Err(Unauthorized.into())
-                } else {
-                    let links = is_link_transfer(dict.get("TransferType"))
-                        || (dict.contains_key("Items") && !dict.contains_key("Files"));
-                    if let Some(approval) = &sessions.approval {
-                        let sender = dict
-                            .get("SenderComputerName")
-                            .and_then(plist::Value::as_string)
-                            .unwrap_or("Nearby device")
-                            .chars()
-                            .filter(|c| !c.is_control())
-                            .take(128)
-                            .collect();
-                        let items = if links {
-                            dict.get("Items")
-                        } else {
-                            dict.get("Files")
-                        }
-                        .and_then(plist::Value::as_array)
-                        .context("Ask has no items")?
-                        .iter()
-                        .take(512)
-                        .map(|v| {
-                            if links {
-                                v.as_string()
-                            } else {
-                                v.as_dictionary()
-                                    .and_then(|d| d.get("FileName"))
-                                    .and_then(plist::Value::as_string)
-                            }
-                            .unwrap_or("File")
-                            .chars()
-                            .filter(|c| !c.is_control())
-                            .take(256)
-                            .collect()
-                        })
-                        .collect();
-                        let (decision, result) = tokio::sync::oneshot::channel();
-                        let accepted = match approval.try_send(Incoming {
-                            sender,
-                            items,
-                            decision,
-                        }) {
-                            Ok(()) => tokio::time::timeout(Duration::from_secs(90), result)
-                                .await
-                                .ok()
-                                .and_then(Result::ok)
-                                .unwrap_or(false),
-                            Err(_) => false,
-                        };
-                        if !accepted {
-                            http::respond(io.get_mut(), 403, b"").await?;
-                            continue;
-                        }
-                    }
-                    if links {
-                        let mut entries = Vec::new();
-                        for url in dict
-                            .get("Items")
-                            .and_then(plist::Value::as_array)
-                            .context("link Items missing")?
-                        {
-                            let url = url.as_string().context("link is not text")?;
-                            let url = validate_http_url(url)?;
-                            entries.push(archive::Entry {
-                                name: "shared-link.txt".into(),
-                                bytes: url.into_bytes(),
-                            });
-                        }
-                        deliver(entries, dest.clone(), notify, copy_to_clipboard).await?;
-                    }
-                    if !links {
-                        let mut grants = sessions.approved.lock().unwrap();
-                        grants.retain(|_, t| t.elapsed() < Duration::from_secs(120));
-                        ensure!(grants.len() < 128, "too many pending transfers");
-                        grants.insert(peer, std::time::Instant::now());
-                    }
-                    Ok((response(&name, None)?, links))
-                }
-            }
-            "/Upload" => {
-                let ty = req
-                    .headers
-                    .get("content-type")
-                    .map(|s| s.split(';').next().unwrap_or(""))
-                    .unwrap_or("");
-                if !matches!(ty, "application/x-cpio" | "application/x-dvzip") {
-                    http::respond(io.get_mut(), 415, b"").await?;
-                    continue;
-                }
-                let upload = req.upload.context("upload spool missing")?;
-                let ty = ty.to_owned();
-                let directory = dest.clone();
-                let limit = storage::max_allowed_bytes(&directory, max_disk_percent)?;
-                if let Some(declared) = req
-                    .headers
-                    .get("totalbytes")
-                    .or_else(|| req.headers.get("content-length"))
-                    .and_then(|s| s.parse::<u64>().ok())
-                {
-                    ensure!(declared <= limit, "transfer exceeds disk space quota");
-                }
-                let cancellation = cancel::Guard(cancel::Token::default());
-                let token = cancellation.0.clone();
-                let saved = tokio::task::spawn_blocking(move || {
-                    use std::io::Seek;
-                    let mut file = upload.reopen()?;
-                    file.rewind()?;
-                    storage::receive_cancel_with_limit(file, &ty, &directory, token, limit)
-                })
-                .await??;
-                let copied = if copy_to_clipboard {
-                    let pb = if saved.clipboard.is_empty() {
-                        crate::companion_client::Pasteboard {
-                            items: vec![crate::companion_client::PasteboardItem {
-                                uti: "public.utf8-plain-text".into(),
-                                data: saved.directory.display().to_string().into_bytes(),
-                            }],
-                        }
+        let http::Request {
+            path,
+            headers,
+            body: request_body,
+            upload,
+        } = req;
+        let result: Result<Reply> = async {
+            match path.as_str() {
+                "/Discover" => {
+                    let value = plist::Value::from_reader(Cursor::new(&request_body))
+                        .context("invalid Discover plist")?;
+                    let dict = value
+                        .as_dictionary()
+                        .context("Discover must be a dictionary")?;
+                    if visibility == VisibilityMode::ContactsOnly && !has_valid_sender_record(dict) {
+                        Err(Unauthorized.into())
                     } else {
-                        board(&saved.clipboard)
-                    };
-                    crate::clipboard_out::copy_pasteboard(&pb)
-                        .ok()
-                        .is_some_and(|v| v.is_some_and(|v| v.spawned))
-                } else {
-                    false
-                };
-                tracing::info!(
-                    files = saved.files,
-                    bytes = saved.bytes,
-                    copied,
-                    "Airdrop-compatible transfer received"
-                );
-                println!(
-                    "{}",
-                    serde_json::json!({"received":saved.directory,"files":saved.files,"bytes":saved.bytes,"copied":copied})
-                );
-                if notify {
-                    let _ = tokio::process::Command::new("notify-send")
-                        .args([
-                            "Airdrop-compatible received",
-                            &format!(
-                                "Saved {} file(s) in {}",
-                                saved.files,
-                                saved.directory.display()
-                            ),
-                        ])
-                        .kill_on_drop(true)
-                        .spawn();
+                        Ok(Reply::Body(
+                            response(&name, record.as_deref().map(Vec::as_slice))?,
+                            false,
+                        ))
+                    }
                 }
-                Ok((Vec::new(), true))
+                "/Ask" => {
+                    let value = plist::Value::from_reader(Cursor::new(&request_body))?;
+                    let dict = value.as_dictionary().context("Ask must be a dictionary")?;
+                    if visibility == VisibilityMode::ContactsOnly && !has_valid_sender_record(dict) {
+                        Err(Unauthorized.into())
+                    } else {
+                        let links = is_link_transfer(dict.get("TransferType"))
+                            || (dict.contains_key("Items") && !dict.contains_key("Files"));
+                        let urls = if links {
+                            dict.get("Items")
+                                .and_then(plist::Value::as_array)
+                                .context("link Items missing")?
+                                .iter()
+                                .map(|v| validate_http_url(v.as_string().context("link is not text")?))
+                                .collect::<Result<Vec<_>>>()?
+                        } else {
+                            Vec::new()
+                        };
+                        if let Some(approval) = &sessions.approval {
+                            let sender = dict
+                                .get("SenderComputerName")
+                                .and_then(plist::Value::as_string)
+                                .unwrap_or("Nearby device")
+                                .chars()
+                                .filter(|c| !c.is_control())
+                                .take(128)
+                                .collect();
+                            let items = if links {
+                                dict.get("Items")
+                            } else {
+                                dict.get("Files")
+                            }
+                            .and_then(plist::Value::as_array)
+                            .context("Ask has no items")?
+                            .iter()
+                            .take(512)
+                            .map(|v| {
+                                if links {
+                                    v.as_string()
+                                } else {
+                                    v.as_dictionary()
+                                        .and_then(|d| d.get("FileName"))
+                                        .and_then(plist::Value::as_string)
+                                }
+                                .unwrap_or("File")
+                                .chars()
+                                .filter(|c| !c.is_control())
+                                .take(256)
+                                .collect()
+                            })
+                            .collect();
+                            let (decision, result) = tokio::sync::oneshot::channel();
+                            let accepted = match approval.try_send(Incoming {
+                                sender,
+                                items,
+                                decision,
+                            }) {
+                                Ok(()) => tokio::time::timeout(Duration::from_secs(90), result)
+                                    .await
+                                    .ok()
+                                    .and_then(Result::ok)
+                                    .unwrap_or(false),
+                                Err(_) => false,
+                            };
+                            if !accepted {
+                                return Ok(Reply::Status(403));
+                            }
+                        }
+                        if links {
+                            let entries = urls
+                                .into_iter()
+                                .map(|url| archive::Entry {
+                                    name: "shared-link.txt".into(),
+                                    bytes: url.into_bytes(),
+                                })
+                                .collect();
+                            deliver(entries, dest.clone(), notify, copy_to_clipboard).await?;
+                        }
+                        if !links {
+                            let mut grants = sessions.approved.lock().unwrap();
+                            grants.retain(|_, t| t.elapsed() < Duration::from_secs(120));
+                            ensure!(grants.len() < 128, "too many pending transfers");
+                            grants.insert(peer, std::time::Instant::now());
+                        }
+                        Ok(Reply::Body(response(&name, None)?, links))
+                    }
+                }
+                "/Upload" => {
+                    let ty = headers
+                        .get("content-type")
+                        .map(|s| s.split(';').next().unwrap_or(""))
+                        .unwrap_or("");
+                    if !matches!(ty, "application/x-cpio" | "application/x-dvzip") {
+                        return Ok(Reply::Status(415));
+                    }
+                    let upload = upload.context("upload spool missing")?;
+                    let ty = ty.to_owned();
+                    let directory = dest.clone();
+                    let limit = upload.limit;
+                    let cancellation = cancel::Guard(cancel::Token::default());
+                    let token = cancellation.0.clone();
+                    let saved = tokio::task::spawn_blocking(move || {
+                        use std::io::Seek;
+                        let mut file = upload.file.reopen()?;
+                        file.rewind()?;
+                        storage::receive_cancel_with_limit(file, &ty, &directory, token, limit)
+                    })
+                    .await??;
+                    let copied = if copy_to_clipboard {
+                        let pb = if saved.clipboard.is_empty() {
+                            crate::companion_client::Pasteboard {
+                                items: vec![crate::companion_client::PasteboardItem {
+                                    uti: "public.utf8-plain-text".into(),
+                                    data: saved.directory.display().to_string().into_bytes(),
+                                }],
+                            }
+                        } else {
+                            board(&saved.clipboard)
+                        };
+                        crate::clipboard_out::copy_pasteboard(&pb)
+                            .ok()
+                            .is_some_and(|v| v.is_some_and(|v| v.spawned))
+                    } else {
+                        false
+                    };
+                    tracing::info!(
+                        files = saved.files,
+                        bytes = saved.bytes,
+                        copied,
+                        "Airdrop-compatible transfer received"
+                    );
+                    println!(
+                        "{}",
+                        serde_json::json!({"received":saved.directory,"files":saved.files,"bytes":saved.bytes,"copied":copied})
+                    );
+                    if notify {
+                        let _ = tokio::process::Command::new("notify-send")
+                            .args([
+                                "Airdrop-compatible received",
+                                &format!(
+                                    "Saved {} file(s) in {}",
+                                    saved.files,
+                                    saved.directory.display()
+                                ),
+                            ])
+                            .kill_on_drop(true)
+                            .spawn();
+                    }
+                    Ok(Reply::Body(Vec::new(), true))
+                }
+                _ => Err(anyhow::anyhow!(
+                    "Upload requires Ask on the same TLS connection"
+                )),
             }
-            _ => Err(anyhow::anyhow!(
-                "Upload requires Ask on the same TLS connection"
-            )),
-        };
+        }
+        .await;
         match result {
-            Ok((body, done)) => {
-                if req.path == "/Discover" {
+            Ok(Reply::Status(status)) => {
+                http::respond(io.get_mut(), status, b"").await?;
+            }
+            Ok(Reply::Body(body, done)) => {
+                if path == "/Discover" {
                     http::respond_close(io.get_mut(), 200, &body).await?;
                     tracing::debug!(%peer, "Airdrop-compatible discovery response sent; closing discovery connection");
                     return Ok(());
@@ -609,7 +623,7 @@ async fn connection(
                 }
             }
             Err(e) if e.is::<Unauthorized>() => {
-                if req.path == "/Discover" {
+                if path == "/Discover" {
                     http::respond_close(io.get_mut(), 401, b"").await?;
                 } else {
                     http::respond(io.get_mut(), 401, b"").await?;
@@ -1322,6 +1336,188 @@ mod upload_wire_tests {
         assert!(validate_http_url("javascript:alert(1)").is_err());
         assert!(validate_http_url("https:///no-host").is_err());
         assert!(validate_http_url("https://example.com/bad url").is_err());
+    }
+}
+
+#[cfg(test)]
+mod receive_response_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    struct Wire {
+        io: tokio::io::BufReader<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+        server: tokio::task::JoinHandle<Result<()>>,
+        _root: tempfile::TempDir,
+    }
+
+    async fn wire(approval: Option<tokio::sync::mpsc::Sender<Incoming>>, percent: u8) -> Wire {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("received");
+        std::fs::create_dir(&dest).unwrap();
+        let identity = root.path().join("identity");
+        let acceptor = tls(&identity).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done, _) = tokio::sync::mpsc::channel(1);
+        let sessions = Sessions {
+            approval,
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            connection(
+                stream,
+                acceptor,
+                "Test".into(),
+                dest,
+                false,
+                false,
+                done,
+                sessions,
+                VisibilityMode::Everyone,
+                None,
+                percent,
+                false,
+            )
+            .await
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(identity_bundle(&identity).unwrap().cert).unwrap();
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect("ac-dc.local".try_into().unwrap(), stream)
+            .await
+            .unwrap();
+        Wire {
+            io: tokio::io::BufReader::new(stream),
+            server,
+            _root: root,
+        }
+    }
+
+    impl Wire {
+        async fn post(&mut self, path: &str, headers: &str, body: &[u8]) -> u16 {
+            let head = format!(
+                "POST {path} HTTP/1.1\r\n{headers}Content-Length: {}\r\n\r\n",
+                body.len()
+            );
+            self.io.get_mut().write_all(head.as_bytes()).await.unwrap();
+            self.io.get_mut().write_all(body).await.unwrap();
+            self.status().await
+        }
+
+        async fn status(&mut self) -> u16 {
+            let mut line = String::new();
+            let n = tokio::time::timeout(Duration::from_secs(5), self.io.read_line(&mut line))
+                .await
+                .expect("receiver did not answer")
+                .unwrap_or(0);
+            if n == 0 {
+                return 0;
+            }
+            let status = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+            let mut size = 0;
+            loop {
+                line.clear();
+                self.io.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.strip_prefix("Content-Length: ") {
+                    size = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; size];
+            self.io.read_exact(&mut body).await.unwrap();
+            status
+        }
+    }
+
+    fn plist_bytes(value: plist::Value) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        value.to_writer_binary(&mut bytes).unwrap();
+        bytes
+    }
+
+    async fn ask(wire: &mut Wire) {
+        let body = plist_bytes(plist::Value::Dictionary(plist::Dictionary::new()));
+        assert_eq!(wire.post("/Ask", "", &body).await, 200);
+    }
+
+    #[tokio::test]
+    async fn upload_over_the_quota_gets_a_final_413() {
+        let mut wire = wire(None, storage::DEFAULT_MAX_DISK_PERCENT).await;
+        ask(&mut wire).await;
+        let status = wire
+            .post(
+                "/Upload",
+                "Content-Type: application/x-dvzip\r\nTotalBytes: 18446744073709551615\r\n",
+                b"x",
+            )
+            .await;
+        assert_eq!(
+            status, 413,
+            "0 means the connection closed with no response"
+        );
+        wire.server.abort();
+    }
+
+    #[tokio::test]
+    async fn undecodable_upload_gets_a_final_400() {
+        let mut wire = wire(None, storage::DEFAULT_MAX_DISK_PERCENT).await;
+        ask(&mut wire).await;
+        let status = wire
+            .post(
+                "/Upload",
+                "Content-Type: application/x-cpio\r\n",
+                b"not a cpio",
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "0 means the connection closed with no response"
+        );
+        assert!(wire.server.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_ask_gets_a_final_400() {
+        let mut wire = wire(None, storage::DEFAULT_MAX_DISK_PERCENT).await;
+        let status = wire.post("/Ask", "", b"not a plist").await;
+        assert_eq!(
+            status, 400,
+            "0 means the connection closed with no response"
+        );
+        wire.server.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_link_is_refused_before_the_user_is_asked() {
+        let (approval, mut prompts) = tokio::sync::mpsc::channel(4);
+        let mut wire = wire(Some(approval), storage::DEFAULT_MAX_DISK_PERCENT).await;
+        let mut ask = plist::Dictionary::new();
+        ask.insert(
+            "Items".into(),
+            plist::Value::Array(vec![
+                format!("https://example.com/{}", "a".repeat(5000)).into()
+            ]),
+        );
+        ask.insert(
+            "TransferType".into(),
+            plist::Value::Array(vec!["links".into()]),
+        );
+        let status = wire
+            .post("/Ask", "", &plist_bytes(plist::Value::Dictionary(ask)))
+            .await;
+        assert_eq!(status, 400);
+        assert!(
+            prompts.try_recv().is_err(),
+            "the user was asked to approve an unusable link"
+        );
+        wire.server.abort();
     }
 }
 

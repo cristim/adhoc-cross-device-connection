@@ -22,7 +22,7 @@ pub fn connector(identity: &Path) -> Result<SslConnector> {
     let key = PKey::private_key_from_pkcs8(bundle.key.secret_der())?;
     let mut tls = SslConnector::builder(SslMethod::tls_client())?;
     tls.set_min_proto_version(Some(SslVersion::TLS1_2))?;
-    // AirDrop uses Apple/self-signed peer certs over AWDL, verified via CMS records in Contacts Only mode.
+    // AirDrop peers present Apple/self-signed certs over AWDL, so TLS does not authenticate the peer.
     tls.set_verify(SslVerifyMode::NONE);
     tls.set_certificate(&cert)?;
     tls.set_private_key(&key)?;
