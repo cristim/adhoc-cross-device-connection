@@ -748,6 +748,18 @@ async fn run_receive_loop(
             }
         };
 
+        // Whatever ended this cycle (the sender's own deadline passing with
+        // no decision, the transfer completing, or an error), any approval
+        // card shown for it is no longer actionable; the UI must stop
+        // offering an action that cannot succeed.
+        {
+            let mut st = task_state.lock().await;
+            if st.pending.is_some() {
+                st.pending = None;
+                st.publish();
+            }
+        }
+
         iter_res?;
         if mode != ReceiveMode::Always {
             return Ok(());
@@ -1189,6 +1201,7 @@ mod tests {
         airdrop_runs: AtomicUsize,
         always_secs: u64,
         trigger_approval: bool,
+        approval_expires_unanswered: bool,
     }
 
     impl MockOps {
@@ -1200,6 +1213,7 @@ mod tests {
                 airdrop_runs: AtomicUsize::new(0),
                 always_secs: 2,
                 trigger_approval: false,
+                approval_expires_unanswered: false,
             }
         }
     }
@@ -1216,6 +1230,7 @@ mod tests {
         fn run_airdrop(&self, cfg: airdrop::Config) -> BoxFuture<'_, Result<()>> {
             let run_idx = self.airdrop_runs.fetch_add(1, Ordering::SeqCst);
             let trigger_approval = self.trigger_approval;
+            let approval_expires_unanswered = self.approval_expires_unanswered;
             Box::pin(async move {
                 if trigger_approval && run_idx == 0 {
                     if let Some(tx) = cfg.approval {
@@ -1227,6 +1242,19 @@ mod tests {
                                 decision: dtx,
                             })
                             .await;
+                        if approval_expires_unanswered {
+                            // Models the sender's own deadline passing with
+                            // no decision ever made: drop `drx` and end this
+                            // cycle without anyone calling `decide()`. The
+                            // short sleep gives `run_receive_loop`'s select!
+                            // a chance to actually process the approval
+                            // message before `receive` resolves; without it,
+                            // tokio's random tie-break between an already-
+                            // ready `receive` and the channel recv can skip
+                            // the approval branch entirely.
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            return Ok(());
+                        }
                         let accepted = drx.await.unwrap_or(false);
                         if accepted && cfg.once {
                             return Ok(());
@@ -1730,6 +1758,43 @@ mod tests {
             "a parent dir the daemon creates itself must be locked to the owner"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_approval_is_cleared_once_its_receive_cycle_ends_unanswered() {
+        let mut ops = MockOps::new();
+        ops.trigger_approval = true;
+        ops.approval_expires_unanswered = true;
+        let ops = Arc::new(ops);
+        let state = test_state(ops.clone());
+
+        let mut req = request("receive");
+        req.mode = Some(ReceiveMode::Once);
+        assert!(start_receive(state.clone(), req).await.ok);
+
+        let mut saw_pending = false;
+        for _ in 0..50 {
+            if state.lock().await.pending.is_some() {
+                saw_pending = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(saw_pending, "never saw the approval card appear");
+
+        let mut cleared = false;
+        for _ in 0..50 {
+            if state.lock().await.pending.is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cleared,
+            "the approval card must not outlive the sender's own deadline, \
+             even though decide() was never called"
+        );
     }
 
     #[tokio::test]
