@@ -507,7 +507,11 @@ impl PairVerifyServer {
             .ephemeral
             .take()
             .context("server ephemeral already consumed")?;
-        let shared = eph.diffie_hellman(&client_pub).to_bytes();
+        let secret = eph.diffie_hellman(&client_pub);
+        if !secret.was_contributory() {
+            bail!("invalid low-order X25519 client key");
+        }
+        let shared = secret.to_bytes();
         self.shared = Some(shared);
         self.client_pub = Some(client_pub_bytes);
 
@@ -757,5 +761,26 @@ mod tests {
         m4_tlv.push_u8(tlv_type::STATE, 4);
         let m4 = ContinuityPacket::new(PacketType::PairVerifyContinue, wrap_pairing_data(&m4_tlv));
         assert!(client.check_m4(&m4).is_ok());
+    }
+
+    #[test]
+    fn pair_verify_server_rejects_non_contributory_client_key() {
+        use rand::rngs::OsRng;
+        let identity = PairingIdentity {
+            pairing_id: None,
+            signing: SigningKey::generate(&mut OsRng),
+            device_irk: [0u8; 16],
+            peers: vec![],
+            peer_irks: vec![],
+        };
+        let mut server = PairVerifyServer::new(identity);
+        let mut m1_tlv = Tlv8::new();
+        m1_tlv
+            .push(tlv_type::PUBLIC_KEY, vec![0u8; 32])
+            .push_u8(tlv_type::STATE, 1);
+        let m1 = ContinuityPacket::new(PacketType::PairVerifyPublicKey, wrap_pairing_data(&m1_tlv));
+
+        let err = server.process_m1(&m1).err().expect("must reject");
+        assert!(format!("{err:#}").contains("low-order"), "{err:#}");
     }
 }
