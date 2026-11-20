@@ -205,7 +205,13 @@ pub async fn run_with_reporter(
         }
         anyhow::Ok(())
     };
-    let server_fut = companion_server::run_server(server_identity, 0, None);
+    // A local-listener failure (bind, mDNS init, or an accept error) must not
+    // end the whole clipboard task: an explicit remote endpoint lets pulls
+    // continue without it, same as the broadcaster's own failure isolation.
+    let server_fut = park_on_exit(
+        "Companion-Link server",
+        companion_server::run_server(server_identity, 0, None),
+    );
     let broadcaster_fut = park_on_exit(
         "Linux -> Mac clipboard watcher",
         companion_server::run_clipboard_broadcaster(adv_keys, echo_guard),
