@@ -83,20 +83,26 @@ fn generate_self_signed(cert_path: &Path, key_path: &Path) -> Result<()> {
         .build(&x.x509v3_context(None, None))?;
     x.append_extension(san)?;
     x.sign(&key, MessageDigest::sha256())?;
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(key_path)?;
-    f.write_all(&key.private_key_to_pem_pkcs8()?)?;
-    f.sync_all()?;
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(cert_path)?;
-    f.write_all(&x.build().to_pem()?)?;
-    f.sync_all()?;
+    let key_pem = key.private_key_to_pem_pkcs8()?;
+    let cert_pem = x.build().to_pem()?;
+    // A half pair would make identity_bundle fail forever, so undo the file this call created.
+    let write_new = |path: &Path, bytes: &[u8]| -> Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+            let _ = std::fs::remove_file(path);
+            return Err(e.into());
+        }
+        Ok(())
+    };
+    write_new(key_path, &key_pem)?;
+    if let Err(e) = write_new(cert_path, &cert_pem) {
+        let _ = std::fs::remove_file(key_path);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -1309,5 +1315,23 @@ mod upload_wire_tests {
         assert!(validate_http_url("javascript:alert(1)").is_err());
         assert!(validate_http_url("https:///no-host").is_err());
         assert!(validate_http_url("https://example.com/bad url").is_err());
+    }
+}
+
+#[cfg(test)]
+mod self_signed_retry_tests {
+    use super::*;
+
+    #[test]
+    fn failed_certificate_write_removes_the_new_key_so_a_retry_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("certificate.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::create_dir(&cert).unwrap();
+        assert!(generate_self_signed(&cert, &key).is_err());
+        assert!(!key.exists(), "half pair left behind");
+        std::fs::remove_dir(&cert).unwrap();
+        generate_self_signed(&cert, &key).unwrap();
+        load_and_verify_pair(&cert, &key).unwrap();
     }
 }
