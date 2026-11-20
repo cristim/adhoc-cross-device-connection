@@ -22,7 +22,27 @@ use crate::keystore::{HandoffKey, KeyStore};
 /// Per-device dedupe state: last (counter, activity_hash) seen for each key id.
 /// Keying on the device *key* (not the BLE address) collapses both Apple's
 /// address rotation and the constant re-broadcasts into one line per real copy.
-type SeenMap = Arc<Mutex<HashMap<String, (u16, [u8; 7])>>>;
+type SeenMap = Arc<Mutex<HashMap<String, CopySig>>>;
+
+type CopySig = (u16, [u8; 7]);
+
+/// Mark `sig` seen only when `send` delivered it, so a copy whose event was
+/// dropped (full queue) is retried by the next re-broadcast instead of suppressed.
+fn deliver_once(
+    seen: &mut HashMap<String, CopySig>,
+    key_id: &str,
+    sig: CopySig,
+    send: impl FnOnce() -> bool,
+) -> bool {
+    if seen.get(key_id) == Some(&sig) {
+        return false;
+    }
+    let sent = send();
+    if sent {
+        seen.insert(key_id.to_string(), sig);
+    }
+    sent
+}
 
 #[derive(Debug, Clone)]
 pub struct CopyEvent {
@@ -217,14 +237,10 @@ impl Worker {
         }
 
         let counter = u16::from_le_bytes(ble.counter_iv);
+        let sig = (counter, p.activity_hash);
         // Collapse address rotation + re-broadcasts: one line per (device, copy).
-        {
-            let sig = (counter, p.activity_hash);
-            let mut seen = self.seen.lock().await;
-            if seen.get(key_id) == Some(&sig) {
-                return;
-            }
-            seen.insert(key_id.to_string(), sig);
+        if self.seen.lock().await.get(key_id) == Some(&sig) {
+            return;
         }
 
         let who = self.device_label(addr).await;
@@ -236,6 +252,7 @@ impl Worker {
             activity = %activity,
             "CLIPBOARD AVAILABLE"
         );
+        let mut seen = self.seen.lock().await;
         if let Some(events) = &self.events {
             let mut raw_adv = Vec::with_capacity(6 + ble.ciphertext.len());
             let len = (4 + ble.ciphertext.len()) as u8;
@@ -249,19 +266,28 @@ impl Worker {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            if let Err(e) = events.try_send(CopyEvent {
-                device: who.clone(),
-                key_id: key_id.into(),
-                activity: activity.to_string(),
-                raw_adv,
-                flags: p.flags.raw,
-                iv: ble.counter_iv,
-                timestamp_ms,
-            }) {
-                tracing::warn!(error = %e, "copy event queue full or closed");
-            }
+            deliver_once(&mut seen, key_id, sig, || {
+                match events.try_send(CopyEvent {
+                    device: who.clone(),
+                    key_id: key_id.into(),
+                    activity: activity.to_string(),
+                    raw_adv,
+                    flags: p.flags.raw,
+                    iv: ble.counter_iv,
+                    timestamp_ms,
+                }) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "copy event queue full or closed");
+                        false
+                    }
+                }
+            });
         } else {
-            println!("📋  {who} copied — {activity}   [device key {key_id}]");
+            deliver_once(&mut seen, key_id, sig, || {
+                println!("📋  {who} copied — {activity}   [device key {key_id}]");
+                true
+            });
         }
     }
 
@@ -282,5 +308,29 @@ impl Worker {
             }
         }
         addr.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropped_event_is_retried_by_the_next_rebroadcast() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(1);
+        tx.try_send(0).unwrap();
+        let mut seen = HashMap::new();
+        let sig = (7u16, [1u8; 7]);
+
+        assert!(!deliver_once(&mut seen, "k", sig, || tx
+            .try_send(1)
+            .is_ok()));
+        assert!(seen.is_empty(), "a dropped event must not be marked seen");
+
+        rx.try_recv().unwrap();
+        assert!(deliver_once(&mut seen, "k", sig, || tx.try_send(1).is_ok()));
+        assert!(!deliver_once(&mut seen, "k", sig, || panic!(
+            "duplicate sent"
+        )));
     }
 }
