@@ -14,6 +14,7 @@ use crate::companion_client::{Pasteboard, PasteboardItem};
 const MAX_DEPTH: usize = 32;
 const MAX_NODES: usize = 4096;
 const MAX_ARCHIVE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
 
 const ALLOWED_CLASSES: &[&str] = &[
     "UASharedPasteboardInfoWrapper",
@@ -174,13 +175,15 @@ impl<'a> Archive<'a> {
                     .context("negative integer in NSKeyedArchiver offset/size")?;
                 Some(usize::try_from(u).context("integer overflows usize")?)
             }
-            Value::Dictionary(d) => {
-                if let Some(u) = d.get("NS.integer").and_then(Value::as_unsigned_integer) {
+            Value::Dictionary(d) => match d.get("NS.integer") {
+                Some(n) => {
+                    let u = n.as_unsigned_integer().context(
+                        "negative or non-integer NS.integer in NSKeyedArchiver offset/size",
+                    )?;
                     Some(usize::try_from(u).context("integer overflows usize")?)
-                } else {
-                    None
                 }
-            }
+                None => None,
+            },
             _ => None,
         };
         if let Some(uid) = guard {
@@ -349,6 +352,7 @@ fn decode_pbinfo<'a>(
     };
     let item_refs = ar.as_array_uids(items_val, 2)?;
     let mut out_items = Vec::new();
+    let mut decoded_bytes = 0usize;
 
     for item_ref in item_refs {
         let (item_val, item_guard) = ar.resolve_deref(item_ref, 3)?;
@@ -382,6 +386,7 @@ fn decode_pbinfo<'a>(
                             None => None,
                         };
                     let data = if let Some(inline_bytes) = inline {
+                        charge_decoded(&mut decoded_bytes, inline_bytes.len())?;
                         inline_bytes
                     } else {
                         let size = match get_any(
@@ -409,14 +414,14 @@ fn decode_pbinfo<'a>(
                             let end = offset
                                 .checked_add(size)
                                 .context("type offset + dataSize overflows usize")?;
-                            blob.get(offset..end)
-                                .with_context(|| {
-                                    format!(
-                                        "type slice {offset}..{end} out of bounds for dataFile ({} bytes)",
-                                        blob.len()
-                                    )
-                                })?
-                                .to_vec()
+                            let slice = blob.get(offset..end).with_context(|| {
+                                format!(
+                                    "type slice {offset}..{end} out of bounds for dataFile ({} bytes)",
+                                    blob.len()
+                                )
+                            })?;
+                            charge_decoded(&mut decoded_bytes, slice.len())?;
+                            slice.to_vec()
                         }
                     };
                     out_items.push(PasteboardItem { uti, data });
@@ -436,6 +441,15 @@ fn decode_pbinfo<'a>(
     }
 
     Ok(Pasteboard { items: out_items })
+}
+
+fn charge_decoded(total: &mut usize, n: usize) -> Result<()> {
+    *total = total.saturating_add(n);
+    ensure!(
+        *total <= MAX_DECODED_BYTES,
+        "decoded pasteboard exceeds {MAX_DECODED_BYTES} bytes"
+    );
+    Ok(())
 }
 
 /// Encode a [`Pasteboard`] as a binary `NSKeyedArchiver`
@@ -797,6 +811,76 @@ mod tests {
             .to_writer_binary(&mut neg_bytes)
             .unwrap();
         assert!(decode_wrapper(&neg_bytes).is_err());
+    }
+
+    fn archive_with_types(types: Vec<Dictionary>, data_file: Vec<u8>) -> Vec<u8> {
+        let mut objects: Vec<Value> = vec![Value::String("$null".into())];
+        let n = types.len() as u64;
+        let mut keys = Vec::new();
+        let mut uids = Vec::new();
+        for (i, t) in types.into_iter().enumerate() {
+            objects.push(Value::Dictionary(t));
+            keys.push(Value::String(format!("public.t{i}")));
+            uids.push(Value::Uid(Uid::new(i as u64 + 1)));
+        }
+        let mut types_dict = Dictionary::new();
+        types_dict.insert("NS.keys".into(), Value::Array(keys));
+        types_dict.insert("NS.objects".into(), Value::Array(uids));
+        objects.push(Value::Dictionary(types_dict));
+        let mut item = Dictionary::new();
+        item.insert("types".into(), Value::Uid(Uid::new(n + 1)));
+        objects.push(Value::Dictionary(item));
+        let mut info = Dictionary::new();
+        info.insert(
+            "items".into(),
+            Value::Array(vec![Value::Uid(Uid::new(n + 2))]),
+        );
+        info.insert("dataFile".into(), Value::Data(data_file));
+        objects.push(Value::Dictionary(info));
+        let mut top = Dictionary::new();
+        top.insert("root".into(), Value::Uid(Uid::new(n + 3)));
+        let mut root = Dictionary::new();
+        root.insert("$archiver".into(), Value::String("NSKeyedArchiver".into()));
+        root.insert("$top".into(), Value::Dictionary(top));
+        root.insert("$objects".into(), Value::Array(objects));
+        let mut bytes = Vec::new();
+        Value::Dictionary(root)
+            .to_writer_binary(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    fn type_range(offset: Value, size: i64) -> Dictionary {
+        let mut t = Dictionary::new();
+        t.insert("offset".into(), offset);
+        t.insert("dataSize".into(), Value::Integer(size.into()));
+        t
+    }
+
+    #[test]
+    fn rejects_negative_wrapped_offset() {
+        let mut wrapped = Dictionary::new();
+        wrapped.insert("NS.integer".into(), Value::Integer((-1i64).into()));
+        let bytes = archive_with_types(
+            vec![type_range(Value::Dictionary(wrapped), 2)],
+            vec![1, 2, 3, 4],
+        );
+        let err = decode_wrapper(&bytes).unwrap_err();
+        assert!(format!("{err:#}").contains("negative"), "got: {err:#}");
+    }
+
+    #[test]
+    fn rejects_many_types_sharing_one_large_range() {
+        // Each type is within bounds, but together they would expand ~20 MiB.
+        let mib = 1024 * 1024;
+        let types = (0..20)
+            .map(|_| type_range(Value::Integer(0.into()), mib as i64))
+            .collect();
+        let bytes = archive_with_types(types, vec![7u8; mib]);
+        let Err(err) = decode_wrapper(&bytes) else {
+            panic!("budget must reject");
+        };
+        assert!(format!("{err:#}").contains("decoded"), "got: {err:#}");
     }
 
     #[test]
