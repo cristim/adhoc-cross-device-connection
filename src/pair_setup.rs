@@ -35,6 +35,7 @@ const N_HEX: &str = concat!(
 );
 const N_BYTES: usize = 384;
 
+const PAIR_SETUP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const PTYPE_PAIR_SETUP_START: u8 = 0x03;
 const PTYPE_PAIR_SETUP_NEXT: u8 = 0x04;
 
@@ -97,6 +98,18 @@ async fn write_raw_packet<S: AsyncWrite + Unpin>(
 }
 
 async fn read_pd_tlv<S: AsyncRead + Unpin>(stream: &mut S, expected_state: u8) -> Result<Tlv8> {
+    tokio::time::timeout(
+        PAIR_SETUP_READ_TIMEOUT,
+        read_pd_tlv_untimed(stream, expected_state),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("PairSetup read timed out after {PAIR_SETUP_READ_TIMEOUT:?}"))?
+}
+
+async fn read_pd_tlv_untimed<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    expected_state: u8,
+) -> Result<Tlv8> {
     // Use ContinuityPacket framing reader by reading header + body directly.
     use tokio::io::AsyncReadExt;
     let mut hdr = [0u8; 4];
@@ -460,8 +473,6 @@ where
 
 /// Write a `PairingIdentity`-compatible JSON file with mode 0600.
 pub fn write_identity_json(path: &Path, paired: &PairedPeer) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let doc = serde_json::json!({
         "pairing_id": paired.pairing_id,
         "ed_sk": hex::encode(paired.our_sk.to_bytes()),
@@ -471,21 +482,9 @@ pub fn write_identity_json(path: &Path, paired: &PairedPeer) -> Result<()> {
             "edpk": hex::encode(paired.peer_edpk.to_bytes()),
         }]
     });
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(serde_json::to_string_pretty(&doc)?.as_bytes())?;
-    f.write_all(b"\n")?;
-    f.sync_all()?;
-    Ok(())
+    let mut body = serde_json::to_string_pretty(&doc)?;
+    body.push('\n');
+    crate::keystore::write_private_atomic(path, body.as_bytes())
 }
 
 #[cfg(test)]
@@ -493,10 +492,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn srp_client_matches_macos26_cupairingsession_public_vector() {
-        // From live macOS 26.1 CUPairingSession (fixedPIN="public") in-process vector:
-        // verify our M2 proof formula H(A || M1 || K) and HKDF key derivation against
-        // the exact (M2, M3, M4) wire capture in /tmp/agent-mail/files/cupairing-public-vector.txt.
+    fn srp_client_output_lengths_smoke() {
         let m2_tlv = Tlv8::decode(
             &hex::decode(concat!(
                 "060102021016df3288f1bfd849c21c01a6e3df9c6903ffa0ed51b87fb9d6ba28b06c183fed0e77",
@@ -524,5 +520,58 @@ mod tests {
         assert_eq!(srp.session_key.len(), 64);
         assert_eq!(srp.m1_proof.len(), 64);
         assert_eq!(srp.exp_m2.len(), 64);
+    }
+
+    fn sample_peer() -> PairedPeer {
+        PairedPeer {
+            pairing_id: "id".into(),
+            label: "Mac".into(),
+            peer_edpk: SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
+            our_sk: SigningKey::from_bytes(&[0x11; 32]),
+        }
+    }
+
+    #[test]
+    fn write_identity_json_tightens_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rpidentity.json");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_identity_json(&path, &sample_peer()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("ed_sk"));
+    }
+
+    #[test]
+    fn write_identity_json_failure_keeps_old_identity() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rpidentity.json");
+        std::fs::write(&path, "old identity").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = write_identity_json(&path, &sample_peer());
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old identity");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_pair_setup_times_out_when_peer_never_answers() {
+        let (mut client, _silent_peer) = tokio::io::duplex(64 * 1024);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            run_transient_pair_setup(&mut client, "public"),
+        )
+        .await
+        .expect("pair setup must bound its own reads");
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("timed out"), "{err}");
     }
 }

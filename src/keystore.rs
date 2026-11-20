@@ -71,6 +71,29 @@ pub fn default_data_dir() -> PathBuf {
     data_home.join("ac-dc")
 }
 
+/// Replace `path` with `data` at mode 0600, keeping the old file until the new
+/// one is fully written: the temp file is 0600 from creation, then renamed over.
+/// A symlink at `path` is replaced by the regular file, not followed.
+pub fn write_private_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temp file in {}", parent.display()))?;
+    tmp.write_all(data)
+        .with_context(|| format!("write {}", path.display()))?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("sync {}", path.display()))?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("replace {}", path.display()))?;
+    Ok(())
+}
+
 pub fn default_keys_path() -> PathBuf {
     default_data_dir().join("keys.json")
 }
@@ -185,5 +208,26 @@ mod tests {
             .expect("20-byte key must be rejected");
         let msg = format!("{err:#}");
         assert!(msg.contains("bad") && msg.contains("got 20"), "{msg}");
+    }
+
+    #[test]
+    fn write_private_atomic_replaces_with_private_mode_and_leaves_no_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub/secret.json");
+        write_private_atomic(&path, b"one").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private_atomic(&path, b"two").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
     }
 }

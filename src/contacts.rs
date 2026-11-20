@@ -26,6 +26,10 @@ pub fn normalize_identifier(raw: &str) -> Result<String> {
         "invalid contact identifier"
     );
     if trimmed.contains('@') {
+        ensure!(
+            !trimmed.starts_with('#'),
+            "contact identifier cannot start with '#'"
+        );
         Ok(trimmed.to_ascii_lowercase())
     } else {
         let digits: String = trimmed
@@ -69,21 +73,12 @@ impl TrustedSenders {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let mut content = String::new();
         for entry in &self.entries {
             content.push_str(entry);
             content.push('\n');
         }
-        std::fs::write(path, content).with_context(|| format!("write {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        crate::keystore::write_private_atomic(path, content.as_bytes())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -150,5 +145,62 @@ mod tests {
         assert!(normalize_identifier("   ").is_err());
         assert!(normalize_identifier("bad\nuser@icloud.com").is_err());
         assert!(normalize_identifier("abc").is_err());
+    }
+
+    #[test]
+    fn rejects_identifier_that_would_load_back_as_a_comment() {
+        let mut store = TrustedSenders::default();
+        assert!(store.add("#alice@example.com").is_err());
+        assert!(store.add("  #alice@example.com").is_err());
+        // A phone-style entry keeps only its digits, so a leading '#' stays harmless.
+        assert_eq!(normalize_identifier("#123").unwrap(), "123");
+    }
+
+    #[test]
+    fn save_creates_private_file_and_tightens_existing_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TrustedSenders::default();
+        store.add("a@example.com").unwrap();
+
+        let fresh = dir.path().join("fresh.txt");
+        store.save(&fresh).unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let existing = dir.path().join("existing.txt");
+        std::fs::write(&existing, "b@example.com\n").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        store.save(&existing).unwrap();
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "a@example.com\n"
+        );
+    }
+
+    #[test]
+    fn failed_save_keeps_the_original_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contacts.txt");
+        std::fs::write(&path, "keep@example.com\n").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let mut store = TrustedSenders::default();
+        store.add("new@example.com").unwrap();
+        let result = store.save(&path);
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "keep@example.com\n"
+        );
     }
 }
