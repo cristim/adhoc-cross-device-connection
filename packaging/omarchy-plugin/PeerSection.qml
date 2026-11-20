@@ -152,13 +152,30 @@ ColumnLayout {
     }
   }
 
+  // send.rs rejects a request unless exactly one of files/links is set
+  // (files.is_empty() != links.is_empty()), so the button must match.
+  function hasExactlyOneTarget() {
+    return (section.selectedFiles.length > 0) !== (section.linkText.trim().length > 0)
+  }
+
+  Text {
+    visible: section.selectedFiles.length > 0 && section.linkText.trim().length > 0
+    text: "Choose files or a link, not both"
+    textFormat: Text.PlainText
+    color: Color.urgent
+    wrapMode: Text.WordWrap
+    Layout.fillWidth: true
+    font.family: section.fontFn(Style.font.caption)
+    font.pixelSize: Style.font.caption
+  }
+
   Button {
     Layout.fillWidth: true
     visible: !section.sending
     text: "Send"
     enabled: !section.busy
       && section.selectedPeer >= 0
-      && (section.selectedFiles.length > 0 || section.linkText.trim().length > 0)
+      && section.hasExactlyOneTarget()
     onClicked: section.sendRequested()
   }
 }

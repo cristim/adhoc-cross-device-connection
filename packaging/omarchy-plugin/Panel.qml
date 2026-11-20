@@ -63,7 +63,10 @@ Panel {
   property string maxDiskPercentText: String(parseDiskPercent(setting("maxDiskPercent", 30)))
   property string settingsError: ""
 
-  readonly property bool receiving: phase === "receiving" || phase === "starting"
+  // daemon.rs recompute_phase() reports "sending" whenever a send task is running,
+  // even while a receive window (windowState) is also open, so phase alone cannot
+  // tell Stop apart from Receive during a concurrent send.
+  readonly property bool receiving: root.windowState !== null && root.phase !== "offline"
   readonly property bool sending: phase === "sending"
   readonly property bool busy: actionProc.running || peersProc.running
 
@@ -160,6 +163,7 @@ Panel {
 
   function runCtl(args) {
     if (actionProc.running) return
+    actionProc.gotJson = false
     actionProc.command = ["/usr/bin/ac-dc", "ctl"].concat(args)
     actionProc.running = true
   }
@@ -189,8 +193,33 @@ Panel {
     root.runCtl(args)
   }
 
+  // orchestrate.rs reports a recoverable pull failure as state "error" with
+  // available: true (the watcher keeps running); only a terminal failure or an
+  // explicit pause sets available: false / state "paused" (daemon.rs).
+  function clipboardPaused() {
+    var cs = root.clipboardState
+    if (!cs) return false
+    if (cs.state === "paused" || cs.state === "stopped") return true
+    return cs.state === "error" && cs.available === false
+  }
+
+  function reportCtlFailure(exitCode, gotJson, stderrText) {
+    if (exitCode === 0 || gotJson) return
+    var detail = root.sanitizeText(String(stderrText || "").trim(), 200)
+    root.lastError = detail.length > 0
+      ? ("ac-dc ctl failed: " + detail)
+      : ("ac-dc ctl exited with status " + exitCode)
+  }
+
+  function openReceiveFolder() {
+    if (openFolderProc.running) return
+    openFolderProc.command = ["xdg-open", root.resolveDir(root.receivePath)]
+    openFolderProc.running = true
+  }
+
   function findPeers() {
     if (peersProc.running) return
+    peersProc.gotJson = false
     peersProc.running = true
   }
 
@@ -287,38 +316,70 @@ Panel {
 
   Process {
     id: actionProc
+    property bool gotJson: false
     stdout: StdioCollector {
+      id: actionStdout
       waitForEnd: true
       onStreamFinished: {
         try {
           var r = JSON.parse(String(text).trim())
-          if (r && r.ok === false && r.message) {
-            root.lastError = root.sanitizeText(r.message, 200)
+          if (r && typeof r === "object") {
+            actionProc.gotJson = true
+            if (r.ok === false && r.message) {
+              root.lastError = root.sanitizeText(r.message, 200)
+            }
           }
         } catch (e) {}
       }
+    }
+    stderr: StdioCollector {
+      id: actionStderr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      root.reportCtlFailure(exitCode, actionProc.gotJson, actionStderr.text)
+      actionProc.gotJson = false
     }
   }
 
   Process {
     id: peersProc
     command: ["/usr/bin/ac-dc", "ctl", "peers"]
+    property bool gotJson: false
     stdout: StdioCollector {
+      id: peersStdout
       waitForEnd: true
       onStreamFinished: {
         try {
           var r = JSON.parse(String(text).trim())
-          if (r && r.ok === false && r.message) {
-            root.lastError = root.sanitizeText(r.message, 200)
+          if (r && typeof r === "object") {
+            peersProc.gotJson = true
+            if (r.ok === false && r.message) {
+              root.lastError = root.sanitizeText(r.message, 200)
+            }
           }
         } catch (e) {}
       }
+    }
+    stderr: StdioCollector {
+      id: peersStderr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      root.reportCtlFailure(exitCode, peersProc.gotJson, peersStderr.text)
+      peersProc.gotJson = false
     }
   }
 
   Process {
     id: fullUiProc
     command: ["/usr/bin/ac-dc", "ui"]
+  }
+
+  // Follows the open_directory() helper in src/airdrop/mod.rs, which also
+  // shells out to the bare `xdg-open` command (resolved via PATH).
+  Process {
+    id: openFolderProc
   }
 
   BarIconButton {
@@ -530,7 +591,14 @@ Panel {
           onFilesDropped: function(urls) {
             var next = root.selectedFiles.slice()
             for (var i = 0; i < urls.length; i++) {
-              var p = String(urls[i]).replace(/^file:\/\//, "")
+              var raw = String(urls[i])
+              if (raw.indexOf("file://") !== 0) continue
+              var p
+              try {
+                p = decodeURIComponent(raw.substring(7))
+              } catch (e) {
+                continue
+              }
               if (p.length > 0 && next.indexOf(p) < 0) next.push(p)
             }
             root.selectedFiles = next
@@ -577,13 +645,27 @@ Panel {
           }
           Button {
             visible: root.clipboardState !== null && root.clipboardState.state !== "unpaired"
-            text: (root.clipboardState && (root.clipboardState.state === "paused" || root.clipboardState.state === "error"))
-              ? "Start"
-              : "Pause"
-            onClicked: {
-              var paused = root.clipboardState && (root.clipboardState.state === "paused" || root.clipboardState.state === "error")
-              root.runCtl([paused ? "clipboard_start" : "clipboard_stop"])
-            }
+            text: root.clipboardPaused() ? "Start" : "Pause"
+            onClicked: root.runCtl([root.clipboardPaused() ? "clipboard_start" : "clipboard_stop"])
+          }
+        }
+
+        RowLayout {
+          visible: root.settingsOpen
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+          Text {
+            Layout.fillWidth: true
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
+            color: Qt.rgba(1, 1, 1, 0.65)
+            font.family: root.font(Style.font.caption)
+            font.pixelSize: Style.font.caption
+            text: "Receive folder: " + root.resolveDir(root.receivePath)
+          }
+          Button {
+            text: "Open folder"
+            onClicked: root.openReceiveFolder()
           }
         }
 

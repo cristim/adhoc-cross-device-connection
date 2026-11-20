@@ -13,8 +13,8 @@ Apple Universal Clipboard and AirDrop-compatible file-transfer tools for Linux, 
 | Feature | Status | Notes |
 | --- | --- | --- |
 | **Mac -> Linux Universal Clipboard** | Live-verified (`macOS 26.1`) | `PairSetup M1..M6`, `PairVerify M1..M4`, `_systemInfo`, `pbpaste2`, `UASharedPasteboardInfoWrapper`, `wl-copy` |
-| **Linux -> Mac Universal Clipboard** | Wired & smoke-tested | `_companion-link._tcp.local.` mDNS/TCP server + `wl-paste --watch` + `0x0c` BLE broadcaster (`hci0`) |
-| **AirDrop-compatible Send / Receive** | Interop-tested in Rust | Everyone & Contacts Only (`SenderRecordData` / `ReceiverRecordData`), DVZip/CPIO; real Apple AWDL delivery depends on `brcmfmac-awdl` |
+| **Linux -> Mac Universal Clipboard** | Smoke-tested on Linux only; not yet confirmed on a real Mac | `_companion-link._tcp.local.` mDNS/TCP server + `wl-paste --watch` + `0x0c` BLE broadcaster (`hci0`); see [docs/mac-requests.md](docs/mac-requests.md) |
+| **AirDrop-compatible Send / Receive** | Interop-tested in Rust | Everyone mode works; `Contacts Only` (`SenderRecordData` / `ReceiverRecordData`) only checks that a sender record is present, it does not yet verify the sender against the trusted-contacts list; DVZip/CPIO; real Apple AWDL delivery depends on `brcmfmac-awdl` |
 | **Event-Driven Daemon & Omarchy UI** | Implemented | `ac-dc ctl subscribe` JSONL stream, zero-polling `Panel.qml`, GPUI `ac-dc ui` |
 
 > **AWDL note:** The `brcmfmac` AWDL kernel/driver tooling lives in the sibling [brcmfmac-awdl](https://github.com/cristim/brcmfmac-awdl) repository (`awdlctl`). Universal Clipboard works over ordinary Wi-Fi/LAN (`_companion-link._tcp.local.`) even when `awdl0` is down, falling back to `awdl0` if present.
