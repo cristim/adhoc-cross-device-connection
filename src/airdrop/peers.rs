@@ -88,7 +88,10 @@ pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Pe
     // The AWDL driver can decode mDNS service records from management frames
     // even when a userspace mDNS socket does not receive the multicast packet.
     // Use those decoded SRV records as a fallback for Linux AWDL adapters.
-    if candidates.is_empty() {
+    // Our own announcement must not count as a peer, or it suppresses the fallback.
+    let own_ip = own_link_local().await;
+    let own_id = super::service_id(identity).ok();
+    if needs_event_fallback(&mut candidates, own_ip, own_id.as_deref()) {
         let lines = if unsafe { libc::geteuid() } == 0 {
             let output = tokio::process::Command::new("/usr/bin/awdlctl")
                 .args(["events", "--seconds", &seconds.to_string()])
@@ -105,12 +108,7 @@ pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Pe
                 Vec::new()
             }
         } else {
-            crate::radio_daemon::fetch_events(
-                Path::new(crate::radio_daemon::DEFAULT_SOCKET),
-                seconds,
-            )
-            .await
-            .unwrap_or_default()
+            events_via_broker(Path::new(crate::radio_daemon::DEFAULT_SOCKET), seconds).await?
         };
         for line in lines {
             let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -151,21 +149,11 @@ pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Pe
                 );
             }
         }
+        drop_own(&mut candidates, own_ip, own_id.as_deref());
         tracing::debug!(
             count = candidates.len(),
             "AWDL event fallback yielded candidates"
         );
-    }
-    if let Ok(state) = crate::health::radio().await {
-        if let Some(own) = state["link_local"]
-            .as_str()
-            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-        {
-            candidates.retain(|address, _| address.ip() != own);
-        }
-    }
-    if let Ok(own_id) = super::service_id(identity) {
-        candidates.retain(|_, inst| !is_own_instance(inst, &own_id));
     }
     let mut work = tokio::task::JoinSet::new();
     for (address, instance) in candidates.into_iter().take(32) {
@@ -197,6 +185,40 @@ pub async fn browse(iface: &str, identity: &Path, seconds: u64) -> Result<Vec<Pe
     Ok(peers)
 }
 
+async fn own_link_local() -> Option<std::net::IpAddr> {
+    let state = crate::health::radio().await.ok()?;
+    state["link_local"].as_str()?.parse().ok()
+}
+
+/// Drop our own announcement first, then decide: it must not count as a peer.
+fn needs_event_fallback(
+    candidates: &mut BTreeMap<SocketAddr, String>,
+    own_ip: Option<std::net::IpAddr>,
+    own_id: Option<&str>,
+) -> bool {
+    drop_own(candidates, own_ip, own_id);
+    candidates.is_empty()
+}
+
+fn drop_own(
+    candidates: &mut BTreeMap<SocketAddr, String>,
+    own_ip: Option<std::net::IpAddr>,
+    own_id: Option<&str>,
+) {
+    if let Some(own) = own_ip {
+        candidates.retain(|address, _| address.ip() != own);
+    }
+    if let Some(id) = own_id {
+        candidates.retain(|_, inst| !is_own_instance(inst, id));
+    }
+}
+
+async fn events_via_broker(socket: &Path, seconds: u64) -> Result<Vec<String>> {
+    crate::radio_daemon::fetch_events(socket, seconds)
+        .await
+        .context("AWDL event fallback via radio daemon")
+}
+
 fn is_own_instance(instance: &str, own_id: &str) -> bool {
     instance == own_id || instance.starts_with(&format!("{own_id}."))
 }
@@ -211,6 +233,51 @@ mod tests {
         assert_eq!(sanitize_instance("Mac\nBook\tPro"), "MacBookPro");
         let long = "a".repeat(300);
         assert_eq!(sanitize_instance(&long).len(), MAX_INSTANCE_LEN);
+    }
+
+    #[test]
+    fn own_announcement_alone_leaves_no_candidates() {
+        let own_addr: SocketAddr = "[fe80::1%2]:8771".parse().unwrap();
+        let peer_addr: SocketAddr = "[fe80::2%2]:8771".parse().unwrap();
+        let mut by_ip = BTreeMap::from([(own_addr, "whatever".to_string())]);
+        drop_own(&mut by_ip, Some(own_addr.ip()), None);
+        assert!(by_ip.is_empty());
+        let mut by_id = BTreeMap::from([(peer_addr, "aabbccddeeff._airdrop._tcp.local.".into())]);
+        drop_own(&mut by_id, None, Some("aabbccddeeff"));
+        assert!(by_id.is_empty());
+        let mut other = BTreeMap::from([(peer_addr, "112233445566._airdrop._tcp.local.".into())]);
+        drop_own(&mut other, Some(own_addr.ip()), Some("aabbccddeeff"));
+        assert_eq!(other.len(), 1);
+    }
+
+    #[test]
+    fn only_our_own_announcement_still_triggers_the_event_fallback() {
+        let own_addr: SocketAddr = "[fe80::1%2]:8771".parse().unwrap();
+        let peer_addr: SocketAddr = "[fe80::2%2]:8771".parse().unwrap();
+        let mut only_us = BTreeMap::from([(own_addr, "us".to_string())]);
+        assert!(needs_event_fallback(
+            &mut only_us,
+            Some(own_addr.ip()),
+            None
+        ));
+        let mut with_peer = BTreeMap::from([
+            (own_addr, "us".to_string()),
+            (peer_addr, "peer".to_string()),
+        ]);
+        assert!(!needs_event_fallback(
+            &mut with_peer,
+            Some(own_addr.ip()),
+            None
+        ));
+    }
+
+    #[tokio::test]
+    async fn broker_failure_is_an_error_not_an_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = events_via_broker(&dir.path().join("absent.sock"), 1)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("AWDL event fallback via radio daemon"));
     }
 
     #[test]
