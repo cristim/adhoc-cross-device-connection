@@ -256,7 +256,9 @@ impl Default for DaemonConfig {
 struct State {
     receive_task: Option<tokio::task::JoinHandle<()>>,
     send_task: Option<tokio::task::JoinHandle<()>>,
+    send_progress_task: Option<tokio::task::AbortHandle>,
     clipboard_task: Option<tokio::task::JoinHandle<()>>,
+    clipboard_reporter: Option<tokio::task::JoinHandle<()>>,
     radio_starting: bool,
     pending: Option<Pending>,
     snapshot: DaemonSnapshot,
@@ -276,7 +278,9 @@ impl State {
         Arc::new(Mutex::new(Self {
             receive_task: None,
             send_task: None,
+            send_progress_task: None,
             clipboard_task: None,
+            clipboard_reporter: None,
             radio_starting: false,
             pending: None,
             snapshot,
@@ -759,6 +763,9 @@ async fn cancel_send(state: Arc<Mutex<State>>) -> Reply {
     if let Some(task) = s.send_task.take() {
         task.abort();
     }
+    if let Some(progress) = s.send_progress_task.take() {
+        progress.abort();
+    }
     s.snapshot.active_transfer = None;
     s.publish();
     ok_reply(&s, "send cancelled", None)
@@ -769,7 +776,10 @@ async fn decide(state: Arc<Mutex<State>>, accepted: bool) -> Reply {
     let Some(pending) = s.pending.take() else {
         return err_reply(&s, "no transfer is waiting for approval");
     };
-    let _ = pending.decision.send(accepted);
+    if pending.decision.send(accepted).is_err() {
+        s.publish();
+        return err_reply(&s, "transfer request expired");
+    }
     s.publish();
     ok_reply(
         &s,
@@ -895,6 +905,10 @@ async fn start_send(state: Arc<Mutex<State>>, request: Request) -> Reply {
                     st.publish();
                 }
             });
+            // `cancel_send` aborts this alongside `send_task`, so a cancelled
+            // send's stale progress updates cannot land on a later send that
+            // reuses the same `active_transfer` slot.
+            task_state.lock().await.send_progress_task = Some(prog_task.abort_handle());
             let send_res = ops
                 .send_transfer(&host, port, &identity, &name, files, links, prog_tx)
                 .await;
@@ -909,6 +923,7 @@ async fn start_send(state: Arc<Mutex<State>>, request: Request) -> Reply {
         let mut st = task_state.lock().await;
         st.snapshot.active_transfer = None;
         st.send_task = None;
+        st.send_progress_task = None;
         if let Err(e) = result {
             let msg = format!("{e:#}");
             tracing::error!(error=%msg, "Airdrop-compatible send failed");
@@ -955,13 +970,14 @@ async fn start_clipboard_sync(state: Arc<Mutex<State>>) -> Reply {
 
     let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel();
     let reporter_state = state.clone();
-    tokio::spawn(async move {
+    let reporter_task = tokio::spawn(async move {
         while let Some(status) = status_rx.recv().await {
             let mut st = reporter_state.lock().await;
             st.snapshot.clipboard = Some(status);
             st.publish();
         }
     });
+    s.clipboard_reporter = Some(reporter_task);
 
     let task_state = state.clone();
     s.clipboard_task = Some(tokio::spawn(async move {
@@ -978,26 +994,44 @@ async fn start_clipboard_sync(state: Arc<Mutex<State>>) -> Reply {
             Some(status_tx),
         )
         .await;
-        let mut st = task_state.lock().await;
-        st.clipboard_task = None;
-        if let Err(e) = res {
+        finish_clipboard_sync(&task_state, res).await;
+    }));
+    ok_reply(&s, "clipboard sync started", None)
+}
+
+/// Reports the clipboard watcher's own exit, including a clean `Ok(())` (for
+/// example the broadcaster finishing without error), so the panel never keeps
+/// showing a stale "watching"/"listening" status after the task is gone.
+async fn finish_clipboard_sync(state: &Arc<Mutex<State>>, res: Result<()>) {
+    let mut st = state.lock().await;
+    st.clipboard_task = None;
+    st.snapshot.clipboard = Some(match res {
+        Ok(()) => crate::ipc::ClipboardStatus {
+            available: false,
+            state: "stopped".into(),
+            last_item_kind: None,
+            last_error: None,
+        },
+        Err(e) => {
             let msg = format!("{e:#}");
             tracing::warn!(error=%msg, "clipboard auto-sync stopped");
-            st.snapshot.clipboard = Some(crate::ipc::ClipboardStatus {
+            crate::ipc::ClipboardStatus {
                 available: false,
                 state: "error".into(),
                 last_item_kind: None,
                 last_error: Some(msg),
-            });
-            st.publish();
+            }
         }
-    }));
-    ok_reply(&s, "clipboard sync started", None)
+    });
+    st.publish();
 }
 
 async fn stop_clipboard_sync(state: Arc<Mutex<State>>) -> Reply {
     let mut s = state.lock().await;
     if let Some(task) = s.clipboard_task.take() {
+        task.abort();
+    }
+    if let Some(task) = s.clipboard_reporter.take() {
         task.abort();
     }
     if let Some(c) = s.snapshot.clipboard.as_mut() {
@@ -1226,6 +1260,235 @@ mod tests {
         )
     }
 
+    #[test]
+    fn publish_truncates_a_pending_snapshot_under_the_panel_display_limit() {
+        let state = test_state(Arc::new(MockOps::new()));
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut s = state.try_lock().unwrap();
+        s.pending = Some(Pending {
+            sender: "Test Mac".into(),
+            items: (0..350).map(|i| "x".repeat(200) + &i.to_string()).collect(),
+            decision: tx,
+        });
+        s.publish();
+        let pending = s.snapshot.pending.as_ref().expect("pending snapshot");
+        assert_eq!(pending.total_items, 350);
+        assert!(
+            pending.items.len() <= MAX_PENDING_ITEMS,
+            "{} items were not truncated",
+            pending.items.len()
+        );
+        let json = serde_json::to_string(&s.snapshot).unwrap();
+        assert!(
+            json.len() < 65536,
+            "snapshot is {} bytes, still over the panel's display limit",
+            json.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_reports_expired_when_the_receive_loop_already_gave_up() {
+        let state = test_state(Arc::new(MockOps::new()));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        {
+            let mut s = state.lock().await;
+            s.pending = Some(Pending {
+                sender: "Test Mac".into(),
+                items: vec!["photo.jpg".into()],
+                decision: tx,
+            });
+        }
+
+        let reply = decide(state.clone(), true).await;
+
+        assert!(!reply.ok, "expired decision was reported as accepted");
+        assert!(
+            reply.message.contains("expired"),
+            "unexpected message: {}",
+            reply.message
+        );
+        let s = state.lock().await;
+        assert!(s.pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_clipboard_sync_aborts_the_reporter_so_late_reports_do_not_undo_pause() {
+        let state = test_state(Arc::new(MockOps::new()));
+        let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reporter_state = state.clone();
+        let reporter = tokio::spawn(async move {
+            while let Some(status) = status_rx.recv().await {
+                let mut st = reporter_state.lock().await;
+                st.snapshot.clipboard = Some(status);
+                st.publish();
+            }
+        });
+        {
+            let mut s = state.lock().await;
+            s.snapshot.clipboard = Some(crate::ipc::ClipboardStatus {
+                available: true,
+                state: "listening".into(),
+                last_item_kind: None,
+                last_error: None,
+            });
+            s.clipboard_task = Some(tokio::spawn(async {}));
+            s.clipboard_reporter = Some(reporter);
+        }
+
+        let reply = stop_clipboard_sync(state.clone()).await;
+        assert!(reply.ok);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // A clipboard status that was already in flight when stop was requested.
+        let _ = status_tx.send(crate::ipc::ClipboardStatus {
+            available: true,
+            state: "listening".into(),
+            last_item_kind: None,
+            last_error: None,
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let s = state.lock().await;
+        assert_eq!(
+            s.snapshot.clipboard.as_ref().map(|c| c.state.as_str()),
+            Some("paused"),
+            "a late reporter message undid the pause"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_clipboard_sync_publishes_stopped_on_a_clean_exit() {
+        let state = test_state(Arc::new(MockOps::new()));
+        {
+            let mut s = state.lock().await;
+            s.snapshot.clipboard = Some(crate::ipc::ClipboardStatus {
+                available: true,
+                state: "listening".into(),
+                last_item_kind: None,
+                last_error: None,
+            });
+            s.clipboard_task = Some(tokio::spawn(async {}));
+        }
+
+        finish_clipboard_sync(&state, Ok(())).await;
+
+        let s = state.lock().await;
+        let status = s.snapshot.clipboard.as_ref().expect("clipboard status");
+        assert_eq!(status.state, "stopped");
+        assert!(!status.available);
+        assert!(s.clipboard_task.is_none());
+    }
+
+    struct CapturingOps {
+        captured_first: Mutex<Option<watch::Sender<(u64, u64)>>>,
+        call_count: AtomicUsize,
+    }
+
+    struct NoRadio;
+    impl RadioHandle for NoRadio {
+        fn renew(&mut self) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn stop(&mut self) -> BoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    impl ServiceOps for CapturingOps {
+        fn start_radio(&self, _seconds: u64) -> BoxFuture<'_, Result<Box<dyn RadioHandle>>> {
+            Box::pin(async { Ok(Box::new(NoRadio) as Box<dyn RadioHandle>) })
+        }
+        fn run_airdrop(&self, _cfg: airdrop::Config) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn browse_peers<'a>(
+            &'a self,
+            _iface: &'a str,
+            _identity: &'a Path,
+        ) -> BoxFuture<'a, Result<Vec<airdrop::peers::Peer>>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn send_transfer<'a>(
+            &'a self,
+            _host: &'a str,
+            _port: u16,
+            _identity: &'a Path,
+            _name: &'a str,
+            _files: Vec<PathBuf>,
+            _links: Vec<String>,
+            progress: watch::Sender<(u64, u64)>,
+        ) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async move {
+                let first = self.call_count.fetch_add(1, Ordering::SeqCst) == 0;
+                if first {
+                    *self.captured_first.lock().await = Some(progress);
+                }
+                std::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                Ok(String::new())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_send_stops_stale_progress_from_corrupting_the_replacement_send() {
+        let ops = Arc::new(CapturingOps {
+            captured_first: Mutex::new(None),
+            call_count: AtomicUsize::new(0),
+        });
+        let state = test_state(ops.clone());
+
+        let mut req1 = request("send");
+        req1.host = Some("fe80::1%awdl0".into());
+        assert!(start_send(state.clone(), req1).await.ok);
+
+        let progress_tx = loop {
+            if let Some(tx) = ops.captured_first.lock().await.clone() {
+                break tx;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert!(cancel_send(state.clone()).await.ok);
+        {
+            let s = state.lock().await;
+            assert!(s.snapshot.active_transfer.is_none());
+        }
+
+        let mut req2 = request("send");
+        req2.host = Some("fe80::2%awdl0".into());
+        assert!(start_send(state.clone(), req2).await.ok);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        {
+            let s = state.lock().await;
+            let active = s
+                .snapshot
+                .active_transfer
+                .as_ref()
+                .expect("replacement send has no active_transfer");
+            assert_eq!(active.target, "fe80::2%awdl0");
+            assert_eq!(active.sent_bytes, 0);
+        }
+
+        // A progress update from the cancelled first send racing in now must
+        // not overwrite the replacement send's byte counts.
+        let _ = progress_tx.send((999, 999));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let s = state.lock().await;
+        let active = s
+            .snapshot
+            .active_transfer
+            .as_ref()
+            .expect("replacement send's active_transfer vanished");
+        assert_eq!(active.target, "fe80::2%awdl0");
+        assert_eq!(
+            active.sent_bytes, 0,
+            "stale progress from the cancelled send corrupted the replacement send"
+        );
+    }
+
     #[tokio::test]
     async fn start_receive_rejects_a_window_outside_the_allowed_range() {
         for seconds in [0, 3601] {
@@ -1438,31 +1701,5 @@ mod tests {
             "unexpected error: {error:#}"
         );
         mute.abort();
-    }
-
-    #[test]
-    fn publish_truncates_a_pending_snapshot_under_the_panel_display_limit() {
-        let state = test_state(Arc::new(MockOps::new()));
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        let mut s = state.try_lock().unwrap();
-        s.pending = Some(Pending {
-            sender: "Test Mac".into(),
-            items: (0..350).map(|i| "x".repeat(200) + &i.to_string()).collect(),
-            decision: tx,
-        });
-        s.publish();
-        let pending = s.snapshot.pending.as_ref().expect("pending snapshot");
-        assert_eq!(pending.total_items, 350);
-        assert!(
-            pending.items.len() <= MAX_PENDING_ITEMS,
-            "{} items were not truncated",
-            pending.items.len()
-        );
-        let json = serde_json::to_string(&s.snapshot).unwrap();
-        assert!(
-            json.len() < 65536,
-            "snapshot is {} bytes, still over the panel's display limit",
-            json.len()
-        );
     }
 }
