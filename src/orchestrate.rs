@@ -38,6 +38,21 @@ async fn report_status(
     }
 }
 
+/// Run an optional subsystem; if it ends or fails, log once and park so it cannot
+/// win the `select!` and tear down Mac -> Linux reception.
+async fn park_on_exit(
+    name: &str,
+    fut: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    match fut.await {
+        Ok(()) => tracing::warn!("{name} stopped; clipboard reception continues without it"),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "{name} failed; clipboard reception continues without it")
+        }
+    }
+    std::future::pending().await
+}
+
 pub async fn run(cfg: AutoConfig) -> Result<()> {
     run_with_reporter(cfg, None).await
 }
@@ -154,12 +169,34 @@ pub async fn run_with_reporter(
         anyhow::Ok(())
     };
     let server_fut = companion_server::run_server(server_identity, 0, None);
-    let broadcaster_fut = companion_server::run_clipboard_broadcaster(adv_keys, echo_guard);
+    let broadcaster_fut = park_on_exit(
+        "Linux -> Mac clipboard watcher",
+        companion_server::run_clipboard_broadcaster(adv_keys, echo_guard),
+    );
     tokio::select! {
         r = scanner.run() => r,
         r = process => r,
         r = server_fut => r,
         r = broadcaster_fut => r,
         _ = crate::shutdown() => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_or_finished_subsystem_parks_instead_of_ending_the_select() {
+        let wait = Duration::from_millis(150);
+        let failing = park_on_exit("t", async { anyhow::bail!("wl-paste missing") });
+        assert!(tokio::time::timeout(wait, failing).await.is_err());
+        let finished = park_on_exit("t", async { Ok(()) });
+        assert!(tokio::time::timeout(wait, finished).await.is_err());
+        let no_keys = park_on_exit(
+            "t",
+            companion_server::run_clipboard_broadcaster(vec![], Arc::new(Mutex::new(None))),
+        );
+        assert!(tokio::time::timeout(wait, no_keys).await.is_err());
     }
 }
