@@ -22,6 +22,14 @@ pub struct AutoConfig {
     pub notify: bool,
 }
 
+/// True when a just-fetched pull's content digest matches the digest of
+/// whatever we last actually landed on the clipboard from the Mac. An empty
+/// or not-yet-known digest on either side never counts as a duplicate, so
+/// the very first pull (and an empty pasteboard) always proceeds.
+fn is_duplicate_pull(incoming: Option<[u8; 32]>, last_landed: Option<[u8; 32]>) -> bool {
+    incoming.is_some() && incoming == last_landed
+}
+
 /// LAN first, as `resolve_preferred` prefers, but if the LAN-resolved
 /// endpoint actively refuses the connection (not merely slow), retry once on
 /// `awdl0` for the exact same instance rather than a different device: the
@@ -126,6 +134,14 @@ pub async fn run_with_reporter(
     .await;
 
     let pull_echo = echo_guard.clone();
+    // Independent from `echo_guard`: the broadcaster clears that cell on any
+    // local copy that doesn't match it (so a later genuine local copy isn't
+    // suppressed forever), which would also erase this loop's memory of what
+    // it last landed if the two shared one cell. That reopens the exact
+    // overwrite race this dedupe exists to close: a local copy made between
+    // two Mac-originated re-adverts of the same old content would clear the
+    // shared guard, making the old content look "new" again on the next pull.
+    let last_landed_from_mac: Arc<Mutex<Option<[u8; 32]>>> = Arc::new(Mutex::new(None));
     let process = async {
         while let Some(event) = rx.recv().await {
             tracing::info!(
@@ -154,11 +170,27 @@ pub async fn run_with_reporter(
                     })
                     .await?;
                 let board = session.fetch_pasteboard().await?;
+                let incoming_digest = clipboard_out::written_digest(&board);
+                // The Mac re-broadcasts its "clipboard available" advert on a
+                // timer that has nothing to do with a real copy: its rotating
+                // nearby-action counter changes even when the pasteboard
+                // content hasn't, so `scan.rs`'s (counter, activity) dedupe
+                // alone can't tell a repeat from a new copy. Compare against
+                // what we actually landed last time; a repeat must not
+                // re-overwrite a genuinely new local copy made in between.
+                if is_duplicate_pull(incoming_digest, *last_landed_from_mac.lock().await) {
+                    tracing::debug!(
+                        device = %event.device,
+                        "duplicate clipboard content pulled from Mac; not re-copying"
+                    );
+                    return anyhow::Ok(());
+                }
                 let outcome = clipboard_out::copy_pasteboard(&board)?;
                 // Only a write that actually reached the clipboard can echo
                 // back to the Mac; a failed write (the `?` above) must not
                 // leave a stale digest suppressing a later, genuine local copy.
-                *pull_echo.lock().await = clipboard_out::written_digest(&board);
+                *pull_echo.lock().await = incoming_digest;
+                *last_landed_from_mac.lock().await = incoming_digest;
                 if let Some(out) = outcome {
                     tracing::info!(
                         bytes = out.bytes,
@@ -241,5 +273,32 @@ mod tests {
             companion_server::run_clipboard_broadcaster(vec![], Arc::new(Mutex::new(None))),
         );
         assert!(tokio::time::timeout(wait, no_keys).await.is_err());
+    }
+
+    #[test]
+    fn repeat_of_the_last_landed_digest_is_a_duplicate() {
+        let d = [7u8; 32];
+        assert!(is_duplicate_pull(Some(d), Some(d)));
+    }
+
+    #[test]
+    fn a_different_digest_is_not_a_duplicate() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        assert!(!is_duplicate_pull(Some(a), Some(b)));
+    }
+
+    #[test]
+    fn the_first_ever_pull_is_never_a_duplicate() {
+        assert!(!is_duplicate_pull(Some([1u8; 32]), None));
+    }
+
+    #[test]
+    fn an_empty_pasteboard_is_never_a_duplicate() {
+        // `written_digest` returns `None` for an empty pasteboard; it must
+        // still reach `copy_pasteboard` so the existing "nothing to copy"
+        // warning fires, not be silently swallowed as a repeat.
+        assert!(!is_duplicate_pull(None, None));
+        assert!(!is_duplicate_pull(None, Some([9u8; 32])));
     }
 }
