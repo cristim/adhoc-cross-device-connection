@@ -15,6 +15,9 @@
 //! a compositor.
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 // Reuse the M2 pull client's pasteboard types — do NOT duplicate them.
 use crate::companion_client::{Pasteboard, PasteboardItem};
@@ -188,47 +191,82 @@ pub fn copy_pasteboard(pb: &Pasteboard) -> Result<Option<CopyOutcome>> {
     }))
 }
 
+const PASTE_DEADLINE: Duration = Duration::from_secs(5);
+/// Cap on one `wl-paste` read. Text goes out twice (two UTIs), so the archive is
+/// about twice this; 1.4 MB keeps it under the server's 3 MiB `MAX_ARCHIVE_PAYLOAD`.
+pub(crate) const MAX_PASTE_BYTES: usize = 1_400_000;
+const PASSWORD_MANAGER_MIME: &str = "x-kde-passwordManagerHint";
+
+/// Password managers mark a secret selection with this MIME; it must never leave the machine.
+fn is_sensitive(mimes: &[&str]) -> bool {
+    mimes.contains(&PASSWORD_MANAGER_MIME)
+}
+
+/// Digest of the bytes the Mac pull put on the clipboard (the representation `copy_pasteboard` writes).
+pub fn written_digest(pb: &Pasteboard) -> Option<[u8; 32]> {
+    plan_copy(pb).map(|plan| Sha256::digest(&pb.items[plan.index].data).into())
+}
+
+/// Digest of a [`read_clipboard`] board, comparable to [`written_digest`]: only the first
+/// item's bytes, since `read_clipboard` rebuilds the board from one text or image read.
+pub fn read_digest(pb: &Pasteboard) -> Option<[u8; 32]> {
+    pb.items.first().map(|i| Sha256::digest(&i.data).into())
+}
+
 /// Read the current Wayland clipboard via `wl-paste` into a [`Pasteboard`]
 /// suitable for serving to a macOS Universal Clipboard peer.
-#[allow(dead_code)]
-pub fn read_clipboard() -> Result<Pasteboard> {
-    use std::process::Command;
+pub async fn read_clipboard() -> Result<Pasteboard> {
     if !wayland_available() {
         bail!("WAYLAND_DISPLAY is not set");
     }
-    let types_out = Command::new("wl-paste")
-        .arg("--list-types")
-        .output()
-        .context("running wl-paste --list-types")?;
-    if !types_out.status.success() {
+    read_clipboard_via("wl-paste", &[], PASTE_DEADLINE).await
+}
+
+async fn read_clipboard_via(
+    program: &str,
+    base_args: &[&str],
+    deadline: Duration,
+) -> Result<Pasteboard> {
+    let Some(types_out) = paste(program, base_args, &["--list-types"], deadline)
+        .await
+        .context("running wl-paste --list-types")?
+    else {
         return Ok(Pasteboard::default());
-    }
-    let list = String::from_utf8_lossy(&types_out.stdout);
+    };
+    let list = String::from_utf8_lossy(&types_out);
     let mimes: Vec<&str> = list
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
+    if is_sensitive(&mimes) {
+        tracing::debug!("clipboard marked sensitive by a password manager; not reading it");
+        return Ok(Pasteboard::default());
+    }
 
     if let Some(mime) = mimes
         .iter()
         .copied()
         .find(|m| *m == "text/plain;charset=utf-8" || *m == "UTF8_STRING" || *m == "text/plain")
     {
-        let out = Command::new("wl-paste")
-            .args(["--no-newline", "--type", mime])
-            .output()
-            .context("reading Wayland text clipboard")?;
-        if out.status.success() && !out.stdout.is_empty() {
+        let out = paste(
+            program,
+            base_args,
+            &["--no-newline", "--type", mime],
+            deadline,
+        )
+        .await
+        .context("reading Wayland text clipboard")?;
+        if let Some(text) = out.filter(|t| !t.is_empty()) {
             return Ok(Pasteboard {
                 items: vec![
                     PasteboardItem {
                         uti: "public.utf8-plain-text".into(),
-                        data: out.stdout.clone(),
+                        data: text.clone(),
                     },
                     PasteboardItem {
                         uti: "public.text".into(),
-                        data: out.stdout,
+                        data: text,
                     },
                 ],
             });
@@ -236,21 +274,55 @@ pub fn read_clipboard() -> Result<Pasteboard> {
     }
 
     if mimes.contains(&"image/png") {
-        let out = Command::new("wl-paste")
-            .args(["--type", "image/png"])
-            .output()
+        let out = paste(program, base_args, &["--type", "image/png"], deadline)
+            .await
             .context("reading Wayland image/png clipboard")?;
-        if out.status.success() && !out.stdout.is_empty() {
+        if let Some(png) = out.filter(|p| !p.is_empty()) {
             return Ok(Pasteboard {
                 items: vec![PasteboardItem {
                     uti: "public.png".into(),
-                    data: out.stdout,
+                    data: png,
                 }],
             });
         }
     }
 
     Ok(Pasteboard::default())
+}
+
+/// Run one `wl-paste` read under a deadline and a size cap. `None` means it exited non-zero.
+/// Dropping the future on timeout or overflow kills the child (`kill_on_drop`).
+async fn paste(
+    program: &str,
+    base_args: &[&str],
+    args: &[&str],
+    deadline: Duration,
+) -> Result<Option<Vec<u8>>> {
+    let mut child = tokio::process::Command::new(program)
+        .args(base_args)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawning wl-paste (is wl-clipboard installed?)")?;
+    let mut stdout = child.stdout.take().context("wl-paste stdout missing")?;
+    tokio::time::timeout(deadline, async {
+        let mut buf = Vec::new();
+        (&mut stdout)
+            .take(MAX_PASTE_BYTES as u64 + 1)
+            .read_to_end(&mut buf)
+            .await?;
+        anyhow::ensure!(
+            buf.len() <= MAX_PASTE_BYTES,
+            "clipboard exceeds {MAX_PASTE_BYTES} bytes"
+        );
+        let status = child.wait().await?;
+        anyhow::Ok(status.success().then_some(buf))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("wl-paste did not answer within {deadline:?}"))?
 }
 
 /// Thin, side-effecting wrapper around the `wl-copy` process: spawn it (with an
@@ -413,6 +485,93 @@ mod tests {
         let plan = plan_copy(&pb).unwrap();
         assert_eq!(plan.index, 0);
         assert_eq!(plan.kind, PlanKind::Text);
+    }
+
+    /// Run `read_clipboard_via` against a shell script standing in for `wl-paste`.
+    /// The script is passed as `sh`'s argument so no freshly written file is exec'd.
+    async fn read_with_script(script: &str, deadline: Duration) -> Result<Pasteboard> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-wl-paste.sh");
+        std::fs::write(&path, script).unwrap();
+        read_clipboard_via("sh", &[path.to_str().unwrap()], deadline).await
+    }
+
+    const FAKE_TEXT: &str = r#"case "$1" in
+  --list-types) printf 'text/plain;charset=utf-8\nTEXT\n' ;;
+  *) printf 'hello' ;;
+esac"#;
+
+    #[test]
+    fn password_manager_hint_marks_a_selection_sensitive() {
+        assert!(is_sensitive(&["text/plain", "x-kde-passwordManagerHint"]));
+        assert!(!is_sensitive(&["text/plain", "image/png"]));
+    }
+
+    #[tokio::test]
+    async fn sensitive_selection_is_never_read() {
+        let script = r#"case "$1" in
+  --list-types) printf 'text/plain;charset=utf-8\nx-kde-passwordManagerHint\n' ;;
+  *) printf 'hunter2' ;;
+esac"#;
+        let pb = read_with_script(script, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(pb.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn text_selection_reads_as_two_text_items() {
+        let pb = read_with_script(FAKE_TEXT, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let utis: Vec<_> = pb.items.iter().map(|i| i.uti.as_str()).collect();
+        assert_eq!(utis, ["public.utf8-plain-text", "public.text"]);
+        assert_eq!(pb.items[0].data, b"hello");
+    }
+
+    #[tokio::test]
+    async fn stalled_selection_owner_times_out_without_blocking_the_runtime() {
+        let started = std::time::Instant::now();
+        let err = read_with_script("exec sleep 30", Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("did not answer"),
+            "got: {err:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn oversized_selection_is_rejected() {
+        let script = format!(
+            r#"case "$1" in
+  --list-types) printf 'text/plain\n' ;;
+  *) head -c {} /dev/zero ;;
+esac"#,
+            4 * 1024 * 1024
+        );
+        let err = read_with_script(&script, Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds"), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn echo_digest_matches_between_a_mac_board_and_the_local_reread() {
+        // A Mac board with extra representations: whole-board hashing would differ.
+        let mac = Pasteboard {
+            items: vec![
+                item("public.html", b"<b>hello</b>"),
+                item("public.utf8-plain-text", b"hello"),
+                item("public.text", b"hello"),
+            ],
+        };
+        let reread = read_with_script(FAKE_TEXT, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(written_digest(&mac).is_some());
+        assert_eq!(written_digest(&mac), read_digest(&reread));
     }
 
     #[test]

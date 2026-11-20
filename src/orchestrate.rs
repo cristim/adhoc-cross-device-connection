@@ -120,7 +120,7 @@ pub async fn run_with_reporter(
                     })
                     .await?;
                 let board = session.fetch_pasteboard().await?;
-                *pull_echo.lock().await = Some(companion_server::hash_pasteboard(&board));
+                *pull_echo.lock().await = clipboard_out::written_digest(&board);
                 let outcome = clipboard_out::copy_pasteboard(&board)?;
                 if let Some(out) = outcome {
                     tracing::info!(
