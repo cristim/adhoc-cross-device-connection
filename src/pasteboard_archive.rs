@@ -5,6 +5,7 @@
 //! node-expansion budget, and checked `offset + size` end-exclusive slicing.
 
 use anyhow::{bail, ensure, Context, Result};
+use plist::stream::{BinaryReader, Event, OwnedEvent};
 use plist::{Dictionary, Uid, Value};
 use std::collections::HashSet;
 use std::io::Cursor;
@@ -15,6 +16,94 @@ const MAX_DEPTH: usize = 32;
 const MAX_NODES: usize = 4096;
 const MAX_ARCHIVE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Builds a [`Value`] tree from one already-consumed stream `event`, pulling
+/// further events (for arrays/dictionaries) from `events`.
+///
+/// `plist` 1.10.1's binary reader only rejects a reference back to an object
+/// still on its own resolution stack (a true cycle); a later, separate
+/// reference to an already-resolved object is parsed again from scratch. A
+/// small, acyclic but deeply reference-sharing plist can therefore expand
+/// exponentially once fully materialized by `Value::from_reader`, even though
+/// its wire size is bounded by `MAX_ARCHIVE_BYTES`. Walking the event stream
+/// ourselves and charging `node_budget`/depth here, before any `Value` tree
+/// exists, bounds that expansion the same way `Archive` already bounds the
+/// NSKeyedArchiver `$objects` graph built on top of it.
+fn value_from_event(
+    event: OwnedEvent,
+    events: &mut impl Iterator<Item = Result<OwnedEvent, plist::Error>>,
+    depth: usize,
+    node_budget: &mut usize,
+) -> Result<Value> {
+    *node_budget = node_budget
+        .checked_sub(1)
+        .with_context(|| format!("plist node budget ({MAX_NODES}) exceeded while parsing"))?;
+    Ok(match event {
+        Event::StartArray(_) => {
+            ensure!(depth < MAX_DEPTH, "plist nesting exceeds {MAX_DEPTH}");
+            let mut items = Vec::new();
+            loop {
+                let next = events
+                    .next()
+                    .context("plist event stream ended inside an array")??;
+                if matches!(next, Event::EndCollection) {
+                    break;
+                }
+                items.push(value_from_event(next, events, depth + 1, node_budget)?);
+            }
+            Value::Array(items)
+        }
+        Event::StartDictionary(_) => {
+            ensure!(depth < MAX_DEPTH, "plist nesting exceeds {MAX_DEPTH}");
+            let mut dict = Dictionary::new();
+            loop {
+                let key_event = events
+                    .next()
+                    .context("plist event stream ended inside a dictionary")??;
+                let key = match key_event {
+                    Event::EndCollection => break,
+                    Event::String(s) => s.into_owned(),
+                    other => bail!("non-string plist dictionary key: {other:?}"),
+                };
+                let value_event = events
+                    .next()
+                    .context("plist dictionary key missing its value")??;
+                ensure!(
+                    !matches!(value_event, Event::EndCollection),
+                    "plist dictionary key missing its value"
+                );
+                let value = value_from_event(value_event, events, depth + 1, node_budget)?;
+                dict.insert(key, value);
+            }
+            Value::Dictionary(dict)
+        }
+        Event::Boolean(b) => Value::Boolean(b),
+        Event::Data(d) => Value::Data(d.into_owned()),
+        Event::Date(d) => Value::Date(d),
+        Event::Integer(i) => Value::Integer(i),
+        Event::Real(r) => Value::Real(r),
+        Event::String(s) => Value::String(s.into_owned()),
+        Event::Uid(u) => Value::Uid(u),
+        other => bail!("unsupported plist event: {other:?}"),
+    })
+}
+
+/// Parses a binary plist into a [`Value`] with `MAX_NODES`/`MAX_DEPTH` charged
+/// during parsing rather than after, per [`value_from_event`].
+fn decode_plist_bounded(bytes: &[u8]) -> Result<Value> {
+    let mut events = BinaryReader::new(Cursor::new(bytes));
+    let root = events
+        .next()
+        .context("empty plist event stream")?
+        .context("parsing binary plist")?;
+    let mut node_budget = MAX_NODES;
+    let value = value_from_event(root, &mut events, 0, &mut node_budget)?;
+    ensure!(
+        events.next().is_none(),
+        "plist event stream has trailing data after its root value"
+    );
+    Ok(value)
+}
 
 const ALLOWED_CLASSES: &[&str] = &[
     "UASharedPasteboardInfoWrapper",
@@ -257,7 +346,7 @@ pub fn decode_wrapper(bytes: &[u8]) -> Result<Pasteboard> {
         bytes.len() <= MAX_ARCHIVE_BYTES,
         "pasteboard archive exceeds {MAX_ARCHIVE_BYTES} bytes"
     );
-    let root_val = Value::from_reader(Cursor::new(bytes)).context("parsing binary plist")?;
+    let root_val = decode_plist_bounded(bytes)?;
     let root_dict = root_val
         .as_dictionary()
         .context("NSKeyedArchiver root is not a dictionary")?;
@@ -945,5 +1034,35 @@ mod tests {
             .unwrap();
         assert!(decode_wrapper(&bytes).is_err());
         assert!(decode_wrapper(b"bplist00truncated").is_err());
+    }
+
+    // `plist` 1.10.1's binary reader has no API to force an actual shared
+    // offset-table entry from a `Value` tree (its writer has no notion of
+    // object identity), so the exact "revisited shared object" expansion
+    // CodeRabbit flagged cannot be constructed through the available crate
+    // API. This instead proves the mechanism the fix adds: `decode_wrapper`
+    // now charges a node budget while building the `Value` tree itself
+    // (`decode_plist_bounded`), before `Archive` ever runs, so a flat plist
+    // that is small on the wire but exceeds that budget is rejected at parse
+    // time with a distinct message from `Archive`'s own (post-parse) one.
+    #[test]
+    fn rejects_a_plist_whose_raw_node_count_exceeds_the_parse_time_budget() {
+        let filler: Vec<Value> = (0..MAX_NODES + 100)
+            .map(|i| Value::String(format!("filler-{i}")))
+            .collect();
+        let mut bytes = Vec::new();
+        Value::Array(filler).to_writer_binary(&mut bytes).unwrap();
+        assert!(
+            bytes.len() <= MAX_ARCHIVE_BYTES,
+            "fixture must stay under the wire-size cap to prove this is a \
+             count limit, not the pre-existing byte-size one"
+        );
+
+        let err = decode_wrapper(&bytes).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("node budget") && msg.contains("while parsing"),
+            "expected a parse-time node budget error, got: {msg}"
+        );
     }
 }
