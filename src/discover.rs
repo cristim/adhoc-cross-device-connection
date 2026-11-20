@@ -55,7 +55,8 @@ pub async fn companion_link_target(host: &str, port: u16) -> Result<(String, u16
     if port != 0 {
         return Ok((host.into(), port));
     }
-    resolve_preferred(None, Duration::from_secs(10)).await
+    let (host, port, _fullname) = resolve_preferred(None, Duration::from_secs(10)).await?;
+    Ok((host, port))
 }
 fn normalized_address(s: &str) -> String {
     s.chars()
@@ -64,7 +65,13 @@ fn normalized_address(s: &str) -> String {
         .collect()
 }
 /// Try LAN mDNS first (works without `awdl0`), then fall back to `awdl0` if present.
-pub async fn resolve_preferred(instance: Option<&str>, timeout: Duration) -> Result<(String, u16)> {
+/// Also returns the matched fullname, so a caller whose LAN-resolved endpoint
+/// refuses the connection can retry the exact same instance over `awdl0`
+/// instead of a different device (`resolve_on` with that fullname directly).
+pub async fn resolve_preferred(
+    instance: Option<&str>,
+    timeout: Duration,
+) -> Result<(String, u16, String)> {
     let lan_budget = timeout.min(Duration::from_secs(4));
     match resolve_on(None, instance, lan_budget).await {
         Ok(target) => Ok(target),
@@ -110,7 +117,7 @@ pub async fn resolve_on(
     iface: Option<&str>,
     instance: Option<&str>,
     timeout: Duration,
-) -> Result<(String, u16)> {
+) -> Result<(String, u16, String)> {
     if let Some(i) = iface {
         ensure!(
             std::path::Path::new("/sys/class/net").join(i).exists(),
@@ -134,7 +141,11 @@ pub async fn resolve_on(
             }
             let addrs: Vec<_> = info.get_addresses().iter().copied().collect();
             if let Some(scoped) = pick_address(addrs, iface)? {
-                return Ok((host_string(scoped), info.get_port()));
+                return Ok((
+                    host_string(scoped),
+                    info.get_port(),
+                    info.get_fullname().to_string(),
+                ));
             }
         }
     }

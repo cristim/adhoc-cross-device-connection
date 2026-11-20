@@ -22,6 +22,46 @@ pub struct AutoConfig {
     pub notify: bool,
 }
 
+/// LAN first, as `resolve_preferred` prefers, but if the LAN-resolved
+/// endpoint actively refuses the connection (not merely slow), retry once on
+/// `awdl0` for the exact same instance rather than a different device: the
+/// same Mac can still be reachable over AWDL even when its LAN port is
+/// unusable. Both attempts run within the caller's own pull deadline.
+async fn connect_via_discovery(
+    instance: Option<&str>,
+    identity_path: &std::path::Path,
+) -> Result<companion_client::Session<tokio::net::TcpStream>> {
+    let identity = PairingIdentity::load(identity_path)?;
+    match discover::resolve_on(None, instance, Duration::from_secs(4)).await {
+        Ok((host, port, fullname)) => {
+            match companion_client::connect(&host, port, identity.clone()).await {
+                Ok(session) => Ok(session),
+                Err(lan_connect_err) => {
+                    if !std::path::Path::new("/sys/class/net/awdl0").exists() {
+                        return Err(lan_connect_err);
+                    }
+                    let (host, port, _) = discover::resolve_on(
+                        Some("awdl0"),
+                        Some(&fullname),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .context("LAN connection failed and no AWDL fallback was found")?;
+                    companion_client::connect(&host, port, identity).await
+                }
+            }
+        }
+        Err(lan_resolve_err) => {
+            if !std::path::Path::new("/sys/class/net/awdl0").exists() {
+                return Err(lan_resolve_err);
+            }
+            let (host, port, _) =
+                discover::resolve_on(Some("awdl0"), instance, Duration::from_secs(10)).await?;
+            companion_client::connect(&host, port, identity).await
+        }
+    }
+}
+
 async fn report_status(
     tx: Option<&tokio::sync::mpsc::UnboundedSender<ClipboardStatus>>,
     status: ClipboardStatus,
@@ -99,18 +139,12 @@ pub async fn run_with_reporter(
                 "copy detected"
             );
             let result = tokio::time::timeout(Duration::from_secs(40), async {
-                let (host, port) = if let (Some(h), Some(p)) = (cfg.host.as_deref(), cfg.port) {
-                    (h.to_string(), p)
-                } else {
-                    discover::resolve_preferred(cfg.instance.as_deref(), Duration::from_secs(10))
+                let mut session = if let (Some(h), Some(p)) = (cfg.host.as_deref(), cfg.port) {
+                    companion_client::connect(h, p, PairingIdentity::load(&cfg.identity_path)?)
                         .await?
+                } else {
+                    connect_via_discovery(cfg.instance.as_deref(), &cfg.identity_path).await?
                 };
-                let mut session = companion_client::connect(
-                    &host,
-                    port,
-                    PairingIdentity::load(&cfg.identity_path)?,
-                )
-                .await?;
                 tracing::info!(peer=?session.peer_label(), "Pair-Verify authenticated");
                 session
                     .system_info_exchange(&SystemInfo {
