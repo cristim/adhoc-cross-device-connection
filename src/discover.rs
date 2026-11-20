@@ -93,6 +93,19 @@ fn service_matches(fullname: &str, instance: Option<&str>) -> bool {
     }
 }
 
+/// Off AWDL there is no interface to scope an `fe80::` address with, and an
+/// unscoped one cannot be dialed, so such services are skipped.
+fn pick_address(mut addrs: Vec<IpAddr>, iface: Option<&str>) -> Result<Option<SocketAddr>> {
+    addrs.sort();
+    match iface {
+        Some(i) => addrs.first().map(|a| scope_address(*a, i)).transpose(),
+        None => Ok(addrs
+            .into_iter()
+            .find(|a| !matches!(a, IpAddr::V6(v) if v.is_unicast_link_local()))
+            .map(|a| SocketAddr::new(a, 0))),
+    }
+}
+
 pub async fn resolve_on(
     iface: Option<&str>,
     instance: Option<&str>,
@@ -119,13 +132,8 @@ pub async fn resolve_on(
             if !service_matches(info.get_fullname(), instance) {
                 continue;
             }
-            let mut addrs: Vec<_> = info.get_addresses().iter().copied().collect();
-            addrs.sort();
-            if let Some(addr) = addrs.first() {
-                let scoped = match iface {
-                    Some(i) => scope_address(*addr, i)?,
-                    None => SocketAddr::new(*addr, 0),
-                };
+            let addrs: Vec<_> = info.get_addresses().iter().copied().collect();
+            if let Some(scoped) = pick_address(addrs, iface)? {
                 return Ok((host_string(scoped), info.get_port()));
             }
         }
@@ -240,6 +248,19 @@ mod tests {
         // Pair-Verify with "unknown peer signature".
         assert!(!service_matches(OWN, None));
         assert!(service_matches(MAC, None));
+    }
+
+    #[test]
+    fn lan_pass_never_returns_an_unscoped_link_local_address() {
+        let ll: IpAddr = "fe80::1".parse().unwrap();
+        let v4: IpAddr = "192.168.1.9".parse().unwrap();
+        assert_eq!(pick_address(vec![ll], None).unwrap(), None);
+        assert_eq!(
+            pick_address(vec![ll, v4], None).unwrap(),
+            Some(SocketAddr::new(v4, 0))
+        );
+        let scoped = pick_address(vec![ll], Some("lo")).unwrap().unwrap();
+        assert!(matches!(scoped, SocketAddr::V6(v) if v.scope_id() > 0));
     }
 
     #[test]
