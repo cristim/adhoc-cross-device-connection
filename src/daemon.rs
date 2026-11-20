@@ -379,7 +379,12 @@ pub async fn run(socket: PathBuf) -> Result<()> {
 }
 
 async fn run_with_ops(socket: PathBuf, ops: Arc<dyn ServiceOps>, cfg: DaemonConfig) -> Result<()> {
+    // A custom `--socket` can point under a directory that already exists
+    // (e.g. `/tmp`) and is shared with every other user and process; only a
+    // directory the daemon itself creates here is ours to lock down.
+    let mut created_parent_dir = false;
     if let Some(parent) = socket.parent() {
+        created_parent_dir = !parent.exists();
         tokio::fs::create_dir_all(parent).await?;
     }
     let _ = tokio::fs::remove_file(&socket).await;
@@ -389,9 +394,11 @@ async fn run_with_ops(socket: PathBuf, ops: Arc<dyn ServiceOps>, cfg: DaemonConf
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let is_root = unsafe { libc::geteuid() } == 0;
-        if let Some(parent) = socket.parent() {
-            let dir_mode = if is_root { 0o750 } else { 0o700 };
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(dir_mode));
+        if created_parent_dir {
+            if let Some(parent) = socket.parent() {
+                let dir_mode = if is_root { 0o750 } else { 0o700 };
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(dir_mode));
+            }
         }
         let sock_mode = if is_root { 0o660 } else { 0o600 };
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(sock_mode))?;
@@ -1666,6 +1673,62 @@ mod tests {
             "never returned to idle with cleared pending"
         );
         assert!(ops.radio_stopped.load(Ordering::SeqCst));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn daemon_does_not_chmod_a_pre_existing_custom_socket_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Simulates a `--socket` pointed under a directory that already
+        // exists and is shared with others (e.g. `/tmp`).
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = shared.join("control.sock");
+
+        let srv_sock = socket.clone();
+        let server = tokio::spawn(async move {
+            let _ = run_with_ops(srv_sock, Arc::new(MockOps::new()), DaemonConfig::default()).await;
+        });
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists(), "daemon never created its control socket");
+        let mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "a pre-existing socket parent must not be re-chmod'd"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn daemon_locks_down_a_parent_dir_it_creates_itself() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh").join("nested");
+        let socket = fresh.join("control.sock");
+
+        let srv_sock = socket.clone();
+        let server = tokio::spawn(async move {
+            let _ = run_with_ops(srv_sock, Arc::new(MockOps::new()), DaemonConfig::default()).await;
+        });
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists(), "daemon never created its control socket");
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "a parent dir the daemon creates itself must be locked to the owner"
+        );
         server.abort();
     }
 
