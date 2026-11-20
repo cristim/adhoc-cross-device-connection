@@ -293,11 +293,31 @@ fn get_any<'a>(dict: &'a Dictionary, keys: &[&str]) -> Option<&'a Value> {
     keys.iter().find_map(|k| dict.get(k))
 }
 
+/// Type name only, never contents: for error messages about unexpected payloads.
+fn kind(v: &Value) -> &'static str {
+    match v {
+        Value::Dictionary(_) => "dictionary",
+        Value::Array(_) => "array",
+        Value::String(s) if s == "$null" => "$null",
+        Value::String(_) => "string",
+        Value::Data(_) => "data",
+        Value::Integer(_) => "integer",
+        Value::Real(_) => "real",
+        Value::Boolean(_) => "boolean",
+        Value::Date(_) => "date",
+        Value::Uid(_) => "uid",
+        _ => "other",
+    }
+}
+
 fn decode_root(ar: &mut Archive<'_>, root_uid: &Uid) -> Result<Pasteboard> {
-    let root_dict = ar
-        .resolve_raw(root_uid, 0)?
-        .as_dictionary()
-        .context("NSKeyedArchiver root object is not a dictionary")?;
+    let root = ar.resolve_raw(root_uid, 0)?;
+    let root_dict = root.as_dictionary().with_context(|| {
+        format!(
+            "NSKeyedArchiver root object is a {}, not a dictionary",
+            kind(root)
+        )
+    })?;
 
     let wrapper_data_file = match get_any(
         root_dict,
@@ -881,6 +901,30 @@ mod tests {
             panic!("budget must reject");
         };
         assert!(format!("{err:#}").contains("decoded"), "got: {err:#}");
+    }
+
+    #[test]
+    fn non_dictionary_root_error_names_its_kind() {
+        let mut top = Dictionary::new();
+        top.insert("root".into(), Value::Uid(Uid::new(1)));
+        let mut root = Dictionary::new();
+        root.insert("$archiver".into(), Value::String("NSKeyedArchiver".into()));
+        root.insert("$top".into(), Value::Dictionary(top));
+        root.insert(
+            "$objects".into(),
+            Value::Array(vec![
+                Value::String("$null".into()),
+                Value::String("some text".into()),
+            ]),
+        );
+        let mut bytes = Vec::new();
+        Value::Dictionary(root)
+            .to_writer_binary(&mut bytes)
+            .unwrap();
+        let err = decode_wrapper(&bytes).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("root object is a string"), "got: {msg}");
+        assert!(!msg.contains("some text"), "contents must not leak: {msg}");
     }
 
     #[test]
