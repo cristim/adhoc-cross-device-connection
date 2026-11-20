@@ -5,7 +5,10 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
@@ -38,6 +41,7 @@ pub struct RadioReply {
 pub trait RadioChild: Send + Sync {
     fn renew(&mut self) -> BoxFuture<'_, Result<()>>;
     fn stop(&mut self) -> BoxFuture<'_, ()>;
+    fn exited(&mut self) -> bool;
 }
 
 pub trait RadioBackend: Send + Sync {
@@ -61,6 +65,10 @@ impl RadioChild for ChildProcess {
             }
             Ok(())
         })
+    }
+
+    fn exited(&mut self) -> bool {
+        !matches!(self.child.try_wait(), Ok(None))
     }
 
     fn stop(&mut self) -> BoxFuture<'_, ()> {
@@ -193,7 +201,7 @@ async fn run_with_backend(socket: PathBuf, backend: Arc<dyn RadioBackend>) -> Re
         }
     }
 
-    let lease: Arc<Mutex<Option<Box<dyn RadioChild>>>> = Arc::new(Mutex::new(None));
+    let lease: LeaseSlot = Arc::new(Mutex::new(None));
     tracing::info!(path = %socket.display(), "ac-dc radio daemon listening");
     loop {
         let (stream, _) = listener.accept().await?;
@@ -207,21 +215,59 @@ async fn run_with_backend(socket: PathBuf, backend: Arc<dyn RadioBackend>) -> Re
     }
 }
 
+struct Lease {
+    id: u64,
+    child: Box<dyn RadioChild>,
+}
+
+type LeaseSlot = Arc<Mutex<Option<Lease>>>;
+
+static NEXT_LEASE_ID: AtomicU64 = AtomicU64::new(1);
+
+async fn drop_exited_lease(slot: &mut Option<Lease>) {
+    if slot.as_mut().is_some_and(|l| l.child.exited()) {
+        if let Some(mut dead) = slot.take() {
+            dead.child.stop().await;
+        }
+    }
+}
+
+async fn release_lease(lease: &LeaseSlot, owned: &mut Option<u64>) {
+    let Some(id) = owned.take() else { return };
+    let mut guard = lease.lock().await;
+    if guard.as_ref().is_some_and(|l| l.id == id) {
+        if let Some(mut l) = guard.take() {
+            l.child.stop().await;
+        }
+    }
+}
+
 async fn handle_client(
     stream: UnixStream,
     backend: Arc<dyn RadioBackend>,
-    lease: Arc<Mutex<Option<Box<dyn RadioChild>>>>,
+    lease: LeaseSlot,
+) -> Result<()> {
+    let mut owned = None;
+    let result = serve_client(stream, backend, &lease, &mut owned).await;
+    release_lease(&lease, &mut owned).await;
+    result
+}
+
+async fn serve_client(
+    stream: UnixStream,
+    backend: Arc<dyn RadioBackend>,
+    lease: &LeaseSlot,
+    owned: &mut Option<u64>,
 ) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
-    let mut owns_lease = false;
     let mut line = String::new();
 
     loop {
         line.clear();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
-            break;
+            return Ok(());
         }
         let req: RadioRequest =
             serde_json::from_str(line.trim()).context("invalid radio daemon request")?;
@@ -229,6 +275,7 @@ async fn handle_client(
             "start" => {
                 let seconds = req.seconds.unwrap_or(600).clamp(1, 3600);
                 let mut guard = lease.lock().await;
+                drop_exited_lease(&mut guard).await;
                 if guard.is_some() {
                     RadioReply {
                         ok: false,
@@ -238,8 +285,9 @@ async fn handle_client(
                 } else {
                     match backend.spawn_discoverable(seconds).await {
                         Ok(child) => {
-                            *guard = Some(child);
-                            owns_lease = true;
+                            let id = NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed);
+                            *guard = Some(Lease { id, child });
+                            *owned = Some(id);
                             RadioReply {
                                 ok: true,
                                 message: "radio ready".into(),
@@ -256,8 +304,9 @@ async fn handle_client(
             }
             "renew" => {
                 let mut guard = lease.lock().await;
+                drop_exited_lease(&mut guard).await;
                 match guard.as_mut() {
-                    Some(child) => match child.renew().await {
+                    Some(l) if Some(l.id) == *owned => match l.child.renew().await {
                         Ok(()) => RadioReply {
                             ok: true,
                             message: "radio renewed".into(),
@@ -269,6 +318,11 @@ async fn handle_client(
                             lines: None,
                         },
                     },
+                    Some(_) => RadioReply {
+                        ok: false,
+                        message: "not the radio lease owner".into(),
+                        lines: None,
+                    },
                     None => RadioReply {
                         ok: false,
                         message: "no active radio lease".into(),
@@ -277,12 +331,7 @@ async fn handle_client(
                 }
             }
             "stop" => {
-                if owns_lease {
-                    if let Some(mut child) = lease.lock().await.take() {
-                        child.stop().await;
-                    }
-                    owns_lease = false;
-                }
+                release_lease(lease, owned).await;
                 RadioReply {
                     ok: true,
                     message: "radio stopped".into(),
@@ -315,13 +364,6 @@ async fn handle_client(
             .await?;
         write.write_all(b"\n").await?;
     }
-
-    if owns_lease {
-        if let Some(mut child) = lease.lock().await.take() {
-            child.stop().await;
-        }
-    }
-    Ok(())
 }
 
 pub struct RemoteRadioClient {
@@ -415,6 +457,7 @@ mod tests {
     struct MockChild {
         stopped: Arc<AtomicBool>,
         renewed: Arc<AtomicUsize>,
+        exited: Arc<AtomicBool>,
     }
 
     impl RadioChild for MockChild {
@@ -429,20 +472,33 @@ mod tests {
                 self.stopped.store(true, Ordering::SeqCst);
             })
         }
+        fn exited(&mut self) -> bool {
+            self.exited.load(Ordering::SeqCst)
+        }
     }
 
+    #[derive(Default)]
     struct MockBackend {
         stopped: Arc<AtomicBool>,
         renewed: Arc<AtomicUsize>,
+        exited: Arc<AtomicBool>,
+        spawn_delay: Duration,
     }
 
     impl RadioBackend for MockBackend {
         fn spawn_discoverable(&self, _seconds: u64) -> BoxFuture<'_, Result<Box<dyn RadioChild>>> {
             let stopped = self.stopped.clone();
             let renewed = self.renewed.clone();
-            Box::pin(
-                async move { Ok(Box::new(MockChild { stopped, renewed }) as Box<dyn RadioChild>) },
-            )
+            let exited = self.exited.clone();
+            let delay = self.spawn_delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(Box::new(MockChild {
+                    stopped,
+                    renewed,
+                    exited,
+                }) as Box<dyn RadioChild>)
+            })
         }
         fn run_events(&self, _seconds: u64) -> BoxFuture<'_, Result<Vec<String>>> {
             Box::pin(async { Ok(vec!["{\"host\":\"fe80::1\"}".into()]) })
@@ -458,6 +514,7 @@ mod tests {
         let backend = Arc::new(MockBackend {
             stopped: stopped.clone(),
             renewed: renewed.clone(),
+            ..Default::default()
         });
 
         let srv_sock = socket.clone();
@@ -490,6 +547,148 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(stopped.load(Ordering::SeqCst));
+        srv.abort();
+    }
+
+    async fn serve(
+        backend: Arc<MockBackend>,
+    ) -> (tempfile::TempDir, PathBuf, tokio::task::JoinHandle<()>) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("radio.sock");
+        let srv_sock = socket.clone();
+        let srv = tokio::spawn(async move {
+            let _ = run_with_backend(srv_sock, backend).await;
+        });
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (dir, socket, srv)
+    }
+
+    async fn wait_for(flag: &AtomicBool) -> bool {
+        for _ in 0..100 {
+            if flag.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    async fn raw_op(stream: &mut BufReader<UnixStream>, op: &str) -> RadioReply {
+        let req = serde_json::to_string(&RadioRequest {
+            op: op.into(),
+            seconds: None,
+        })
+        .unwrap();
+        stream.get_mut().write_all(req.as_bytes()).await.unwrap();
+        stream.get_mut().write_all(b"\n").await.unwrap();
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn lease_released_when_client_closes_during_start() {
+        let backend = Arc::new(MockBackend {
+            spawn_delay: Duration::from_millis(100),
+            ..Default::default()
+        });
+        let stopped = backend.stopped.clone();
+        let (_dir, socket, srv) = serve(backend).await;
+
+        let mut raw = UnixStream::connect(&socket).await.unwrap();
+        raw.write_all(b"{\"op\":\"start\"}\n").await.unwrap();
+        drop(raw);
+
+        assert!(
+            wait_for(&stopped).await,
+            "lease leaked after reply write failed"
+        );
+        RemoteRadioClient::connect_and_start(&socket, 60)
+            .await
+            .unwrap();
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn lease_released_on_protocol_error() {
+        let backend = Arc::new(MockBackend::default());
+        let stopped = backend.stopped.clone();
+        let (_dir, socket, srv) = serve(backend).await;
+
+        let mut client = RemoteRadioClient::connect_and_start(&socket, 60)
+            .await
+            .unwrap();
+        client.write.write_all(b"not json\n").await.unwrap();
+
+        assert!(
+            wait_for(&stopped).await,
+            "lease leaked after protocol error"
+        );
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn exited_child_lease_is_cleared() {
+        let backend = Arc::new(MockBackend::default());
+        let exited = backend.exited.clone();
+        let (_dir, socket, srv) = serve(backend).await;
+
+        let mut owner = RemoteRadioClient::connect_and_start(&socket, 60)
+            .await
+            .unwrap();
+        exited.store(true, Ordering::SeqCst);
+        assert!(
+            owner.renew().await.is_err(),
+            "renew succeeded on a dead child"
+        );
+
+        exited.store(false, Ordering::SeqCst);
+        let mut next = RemoteRadioClient::connect_and_start(&socket, 60)
+            .await
+            .unwrap();
+        next.renew().await.unwrap();
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn start_replaces_exited_child_lease_and_old_owner_cannot_release_it() {
+        let backend = Arc::new(MockBackend::default());
+        let exited = backend.exited.clone();
+        let (_dir, socket, srv) = serve(backend).await;
+
+        let stale_owner = RemoteRadioClient::connect_and_start(&socket, 60)
+            .await
+            .unwrap();
+        exited.store(true, Ordering::SeqCst);
+        let mut next = RemoteRadioClient::connect_and_start(&socket, 60)
+            .await
+            .unwrap();
+        exited.store(false, Ordering::SeqCst);
+
+        drop(stale_owner);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        next.renew().await.unwrap();
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn renew_requires_lease_ownership() {
+        let backend = Arc::new(MockBackend::default());
+        let renewed = backend.renewed.clone();
+        let (_dir, socket, srv) = serve(backend).await;
+
+        let _owner = RemoteRadioClient::connect_and_start(&socket, 60)
+            .await
+            .unwrap();
+        let mut other = BufReader::new(UnixStream::connect(&socket).await.unwrap());
+        let reply = raw_op(&mut other, "renew").await;
+        assert!(!reply.ok, "non-owner renew accepted: {}", reply.message);
+        assert_eq!(renewed.load(Ordering::SeqCst), 0);
         srv.abort();
     }
 }
