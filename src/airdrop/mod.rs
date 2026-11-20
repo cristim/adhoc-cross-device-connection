@@ -249,14 +249,21 @@ pub fn validate_http_url(raw: &str) -> Result<String> {
             && !trimmed.chars().any(|c| c.is_control() || c.is_whitespace()),
         "unsupported link"
     );
-    let rest = if trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("https://") {
-        &trimmed[8..]
-    } else if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("http://") {
-        &trimmed[7..]
-    } else {
-        anyhow::bail!("unsupported link scheme");
+    let rest = ["https://", "http://"]
+        .iter()
+        .find(|scheme| {
+            trimmed
+                .get(..scheme.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(scheme))
+        })
+        .map(|scheme| &trimmed[scheme.len()..])
+        .context("unsupported link scheme")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host_port.split(':').next().unwrap_or(""),
     };
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
     ensure!(!host.is_empty(), "link missing host");
     Ok(trimmed.to_string())
 }
@@ -1333,5 +1340,36 @@ mod self_signed_retry_tests {
         std::fs::remove_dir(&cert).unwrap();
         generate_self_signed(&cert, &key).unwrap();
         load_and_verify_pair(&cert, &key).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod link_and_identity_tests {
+    use super::*;
+
+    #[test]
+    fn validate_http_url_survives_multibyte_text_at_the_scheme_boundary() {
+        for raw in ["abcdefgé", "abcdefé", "é", "https:/é/x"] {
+            assert!(validate_http_url(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn validate_http_url_requires_a_host_after_userinfo_and_port() {
+        for raw in [
+            "https://:443/",
+            "https://@/",
+            "http://user@:80",
+            "https://[]:80/",
+        ] {
+            assert!(validate_http_url(raw).is_err(), "{raw}");
+        }
+        for raw in [
+            "https://user@example.com:8443/p",
+            "http://[::1]:80/",
+            "https://bücher.de/",
+        ] {
+            assert!(validate_http_url(raw).is_ok(), "{raw}");
+        }
     }
 }
