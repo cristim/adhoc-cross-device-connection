@@ -9,7 +9,12 @@ use gpui::{
     WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
-use std::{path::PathBuf, rc::Rc, sync::mpsc, time::Duration};
+use std::{
+    path::PathBuf,
+    rc::Rc,
+    sync::{atomic::AtomicBool, atomic::Ordering, mpsc, Arc},
+    time::Duration,
+};
 
 actions!(ac_dc, [Quit]);
 
@@ -49,7 +54,7 @@ enum Event {
     Status(String),
     Radio(String),
     Peers(Vec<Peer>),
-    Incoming(String, Vec<String>),
+    Incoming(String, Vec<String>, usize),
     IncomingCleared(usize),
     IncomingAllCleared,
 }
@@ -106,18 +111,20 @@ fn format_radio_banner(snap: &DaemonSnapshot) -> String {
 
 fn apply_snapshot(
     snap: &DaemonSnapshot,
-    last_pending: &mut Option<(String, Vec<String>)>,
+    last_pending: &mut Option<(String, Vec<String>, usize)>,
+    last_active_send: &mut bool,
     events: &mpsc::Sender<Event>,
+    suppress_finished: &AtomicBool,
 ) {
     let _ = events.send(Event::Radio(format_radio_banner(snap)));
     let pending = snap
         .pending
         .as_ref()
-        .map(|p| (p.sender.clone(), p.items.clone()));
+        .map(|p| (p.sender.clone(), p.items.clone(), p.total_items));
     if pending != *last_pending {
         match &pending {
-            Some((sender, items)) => {
-                let _ = events.send(Event::Incoming(sender.clone(), items.clone()));
+            Some((sender, items, total_items)) => {
+                let _ = events.send(Event::Incoming(sender.clone(), items.clone(), *total_items));
             }
             None => {
                 let _ = events.send(Event::IncomingAllCleared);
@@ -125,6 +132,7 @@ fn apply_snapshot(
         }
         *last_pending = pending;
     }
+    let active_now = snap.active_transfer.is_some();
     if let Some(err) = snap.last_error.as_ref() {
         let _ = events.send(Event::Status(format!("Error: {err}")));
     } else if let Some(t) = snap.active_transfer.as_ref() {
@@ -139,12 +147,23 @@ fn apply_snapshot(
             _ => format!("Preparing transfer for {}…", t.target),
         };
         let _ = events.send(Event::Status(msg));
+    } else if *last_active_send && !suppress_finished.swap(false, Ordering::Relaxed) {
+        // The send just ended without an error; otherwise the last "Sending…"
+        // status would stay on screen forever. A user-initiated cancel
+        // already announced its own status and sets the flag we just read.
+        let _ = events.send(Event::Status("Send finished".into()));
     }
+    *last_active_send = active_now;
 }
 
-async fn subscribe_loop(socket: PathBuf, events: mpsc::Sender<Event>) {
+async fn subscribe_loop(
+    socket: PathBuf,
+    events: mpsc::Sender<Event>,
+    suppress_finished: Arc<AtomicBool>,
+) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let mut last_pending: Option<(String, Vec<String>)> = None;
+    let mut last_pending: Option<(String, Vec<String>, usize)> = None;
+    let mut last_active_send = false;
     loop {
         if let Ok(mut stream) = tokio::net::UnixStream::connect(&socket).await {
             if stream.write_all(b"{\"op\":\"subscribe\"}\n").await.is_ok() {
@@ -155,7 +174,13 @@ async fn subscribe_loop(socket: PathBuf, events: mpsc::Sender<Event>) {
                         break;
                     }
                     if let Ok(snap) = serde_json::from_str::<DaemonSnapshot>(line.trim()) {
-                        apply_snapshot(&snap, &mut last_pending, &events);
+                        apply_snapshot(
+                            &snap,
+                            &mut last_pending,
+                            &mut last_active_send,
+                            &events,
+                            &suppress_finished,
+                        );
                     }
                     line.clear();
                 }
@@ -192,10 +217,15 @@ async fn daemon_peers() -> Result<Vec<Peer>> {
 async fn engine(
     mut actions: tokio::sync::mpsc::UnboundedReceiver<Action>,
     events: std::sync::mpsc::Sender<Event>,
+    socket: PathBuf,
 ) {
-    let socket = daemon::default_socket();
     let mut browsing: Option<tokio::task::JoinHandle<()>> = None;
-    let sub_task = tokio::spawn(subscribe_loop(socket.clone(), events.clone()));
+    let suppress_finished = Arc::new(AtomicBool::new(false));
+    let sub_task = tokio::spawn(subscribe_loop(
+        socket.clone(),
+        events.clone(),
+        suppress_finished.clone(),
+    ));
     loop {
         let Some(action) = actions.recv().await else {
             break;
@@ -265,14 +295,17 @@ async fn engine(
                 {
                     Ok(reply) => {
                         let _ = events.send(Event::Status(reply.message));
+                        let _ = events.send(Event::IncomingCleared(id));
                     }
                     Err(e) => {
+                        // The daemon never saw the decision, so keep showing the
+                        // card: clearing it here would hide a request that is
+                        // still pending approval.
                         let _ = events.send(Event::Status(format!(
                             "Could not reach the ac-dc daemon: {e:#}"
                         )));
                     }
                 }
-                let _ = events.send(Event::IncomingCleared(id));
             }
             Action::Browse => {
                 let _ = events.send(Event::Status(
@@ -297,6 +330,9 @@ async fn engine(
             }
             Action::Cancel => match daemon::ctl(socket.clone(), daemon::request("cancel")).await {
                 Ok(reply) => {
+                    // Suppress the heuristic "Send finished" the next snapshot
+                    // would otherwise announce once active_transfer clears.
+                    suppress_finished.store(true, Ordering::Relaxed);
                     let _ = events.send(Event::Status(reply.message));
                 }
                 Err(e) => {
@@ -418,12 +454,18 @@ impl AcDcApp {
                                         this.peer_selected = 0;
                                         this.peer_drop_open = false;
                                     }
-                                    Event::Incoming(sender, items) => {
+                                    Event::Incoming(sender, items, total_items) => {
                                         this.incoming_counter += 1;
+                                        let more = total_items.saturating_sub(items.len());
+                                        let suffix = if more > 0 {
+                                            format!("\n… and {more} more")
+                                        } else {
+                                            String::new()
+                                        };
                                         this.incoming.push(IncomingCard {
                                             id: this.incoming_counter,
                                             label: format!(
-                                                "{sender} wants to share:\n{}",
+                                                "{sender} wants to share:\n{}{suffix}",
                                                 items.join("\n")
                                             ),
                                         });
@@ -896,7 +938,7 @@ pub fn run() -> Result<()> {
         .unwrap_or_default();
     let (actions_tx, actions_rx) = tokio::sync::mpsc::unbounded_channel();
     let (events_tx, events_rx) = mpsc::channel();
-    let worker = runtime.spawn(engine(actions_rx, events_tx));
+    let worker = runtime.spawn(engine(actions_rx, events_tx, daemon::default_socket()));
 
     let shutdown = actions_tx.clone();
     let final_shutdown = shutdown.clone();
@@ -956,12 +998,13 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{PendingTransfer, RadioState, WindowState};
+    use crate::ipc::{ActiveTransfer, PendingTransfer, RadioState, TransferDirection, WindowState};
 
     #[test]
     fn apply_snapshot_emits_radio_and_pending_transitions() {
         let (tx, rx) = mpsc::channel();
         let mut last_pending = None;
+        let mut last_active_send = false;
         let snap = DaemonSnapshot {
             phase: "receiving".into(),
             window: Some(WindowState {
@@ -977,20 +1020,170 @@ mod tests {
             pending: Some(PendingTransfer {
                 sender: "Test Mac".into(),
                 items: vec!["photo.jpg".into()],
+                total_items: 1,
             }),
             ..Default::default()
         };
-        apply_snapshot(&snap, &mut last_pending, &tx);
+        let suppress = AtomicBool::new(false);
+        apply_snapshot(
+            &snap,
+            &mut last_pending,
+            &mut last_active_send,
+            &tx,
+            &suppress,
+        );
         let events: Vec<Event> = rx.try_iter().collect();
         assert!(matches!(&events[0], Event::Radio(s) if s == "Radio: 2:05 remaining · visible"));
         assert!(
-            matches!(&events[1], Event::Incoming(s, items) if s == "Test Mac" && items == &vec!["photo.jpg".to_string()])
+            matches!(&events[1], Event::Incoming(s, items, total) if s == "Test Mac" && items == &vec!["photo.jpg".to_string()] && *total == 1)
         );
 
         let cleared = DaemonSnapshot::default();
-        apply_snapshot(&cleared, &mut last_pending, &tx);
+        apply_snapshot(
+            &cleared,
+            &mut last_pending,
+            &mut last_active_send,
+            &tx,
+            &suppress,
+        );
         let events2: Vec<Event> = rx.try_iter().collect();
         assert!(matches!(&events2[0], Event::Radio(s) if s == "Radio window closed"));
         assert!(matches!(&events2[1], Event::IncomingAllCleared));
+    }
+
+    #[test]
+    fn apply_snapshot_announces_completion_when_the_active_transfer_clears() {
+        let (tx, rx) = mpsc::channel();
+        let mut last_pending = None;
+        let mut last_active_send = false;
+        let sending = DaemonSnapshot {
+            phase: "sending".into(),
+            active_transfer: Some(ActiveTransfer {
+                direction: TransferDirection::Send,
+                target: "iPhone".into(),
+                sent_bytes: 100,
+                total_bytes: Some(100),
+            }),
+            ..Default::default()
+        };
+        let suppress = AtomicBool::new(false);
+        apply_snapshot(
+            &sending,
+            &mut last_pending,
+            &mut last_active_send,
+            &tx,
+            &suppress,
+        );
+        let _: Vec<Event> = rx.try_iter().collect();
+        assert!(last_active_send, "active send was not tracked");
+
+        let done = DaemonSnapshot::default();
+        apply_snapshot(
+            &done,
+            &mut last_pending,
+            &mut last_active_send,
+            &tx,
+            &suppress,
+        );
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Status(s) if s == "Send finished")),
+            "no completion status emitted once the active transfer cleared"
+        );
+        assert!(!last_active_send);
+    }
+
+    #[test]
+    fn apply_snapshot_suppresses_finished_right_after_a_cancel() {
+        let (tx, rx) = mpsc::channel();
+        let mut last_pending = None;
+        let mut last_active_send = false;
+        let suppress = AtomicBool::new(false);
+        let sending = DaemonSnapshot {
+            phase: "sending".into(),
+            active_transfer: Some(ActiveTransfer {
+                direction: TransferDirection::Send,
+                target: "iPhone".into(),
+                sent_bytes: 100,
+                total_bytes: Some(100),
+            }),
+            ..Default::default()
+        };
+        apply_snapshot(
+            &sending,
+            &mut last_pending,
+            &mut last_active_send,
+            &tx,
+            &suppress,
+        );
+        let _: Vec<Event> = rx.try_iter().collect();
+
+        // The UI's own Cancel handler sets this before the next snapshot lands.
+        suppress.store(true, Ordering::Relaxed);
+        let done = DaemonSnapshot::default();
+        apply_snapshot(
+            &done,
+            &mut last_pending,
+            &mut last_active_send,
+            &tx,
+            &suppress,
+        );
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Status(s) if s == "Send finished")),
+            "a cancelled send must not also be announced as finished"
+        );
+        assert!(
+            !suppress.load(Ordering::Relaxed),
+            "the flag must be consumed, not left set for the next real finish"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_failure_keeps_the_incoming_card() {
+        // No socket listens here, so every daemon::ctl call fails the way an
+        // unreachable daemon would; a per-test tempdir avoids touching the
+        // process-global XDG_RUNTIME_DIR, which other tests read concurrently.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+
+        let (actions_tx, actions_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::channel();
+        let engine_task = tokio::spawn(engine(actions_rx, events_tx, socket));
+
+        actions_tx.send(Action::Decline(7)).unwrap();
+
+        let mut saw_cleared = false;
+        let mut saw_transport_error = false;
+        for _ in 0..50 {
+            match events_rx.try_recv() {
+                Ok(Event::IncomingCleared(7)) => saw_cleared = true,
+                Ok(Event::Status(s)) if s.contains("Could not reach") => {
+                    saw_transport_error = true;
+                }
+                Ok(_) => {}
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Once the transport-error status has arrived, keep
+                    // draining without sleeping so a same-tick
+                    // `IncomingCleared` (the bug this guards against) is not
+                    // missed by stopping too early.
+                    if saw_transport_error {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        let _ = actions_tx.send(Action::Quit);
+        let _ = engine_task.await;
+
+        assert!(saw_transport_error, "expected a daemon-unreachable status");
+        assert!(!saw_cleared, "card was cleared despite the ctl failure");
     }
 }
