@@ -310,10 +310,25 @@ impl State {
         self.recompute_phase();
         self.snapshot.pending = self.pending.as_ref().map(|p| PendingTransfer {
             sender: p.sender.clone(),
-            items: p.items.clone(),
+            items: truncate_pending_items(&p.items),
+            total_items: p.items.len(),
         });
         let _ = self.tx.send(self.snapshot.clone());
     }
+}
+
+/// Panel.qml drops an entire snapshot line over 65536 chars, so a sender that
+/// lists hundreds of long item names must not blow that budget; the panel
+/// already only displays the first 16 entries anyway.
+const MAX_PENDING_ITEMS: usize = 16;
+const MAX_PENDING_ITEM_CHARS: usize = 128;
+
+fn truncate_pending_items(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .take(MAX_PENDING_ITEMS)
+        .map(|s| s.chars().take(MAX_PENDING_ITEM_CHARS).collect())
+        .collect()
 }
 
 fn now_ms_plus(seconds: u64) -> Option<u64> {
@@ -1423,5 +1438,31 @@ mod tests {
             "unexpected error: {error:#}"
         );
         mute.abort();
+    }
+
+    #[test]
+    fn publish_truncates_a_pending_snapshot_under_the_panel_display_limit() {
+        let state = test_state(Arc::new(MockOps::new()));
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut s = state.try_lock().unwrap();
+        s.pending = Some(Pending {
+            sender: "Test Mac".into(),
+            items: (0..350).map(|i| "x".repeat(200) + &i.to_string()).collect(),
+            decision: tx,
+        });
+        s.publish();
+        let pending = s.snapshot.pending.as_ref().expect("pending snapshot");
+        assert_eq!(pending.total_items, 350);
+        assert!(
+            pending.items.len() <= MAX_PENDING_ITEMS,
+            "{} items were not truncated",
+            pending.items.len()
+        );
+        let json = serde_json::to_string(&s.snapshot).unwrap();
+        assert!(
+            json.len() < 65536,
+            "snapshot is {} bytes, still over the panel's display limit",
+            json.len()
+        );
     }
 }

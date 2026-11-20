@@ -39,6 +39,10 @@ pub struct WindowState {
 pub struct PendingTransfer {
     pub sender: String,
     pub items: Vec<String>,
+    /// The sender's full item count, which can exceed `items` once it has
+    /// been truncated to keep the snapshot under the panel's display limit.
+    #[serde(default)]
+    pub total_items: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
