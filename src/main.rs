@@ -274,7 +274,7 @@ enum Cmd {
     Auto {
         #[arg(long)]
         keys: Option<PathBuf>,
-        /// Explicit mDNS instance; otherwise match the triggering BLE address to rpBA.
+        /// Explicit mDNS instance; otherwise the first non-self companion-link service.
         #[arg(long)]
         instance: Option<String>,
         #[arg(long)]

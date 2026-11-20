@@ -27,7 +27,6 @@ type SeenMap = Arc<Mutex<HashMap<String, (u16, [u8; 7])>>>;
 #[derive(Debug, Clone)]
 pub struct CopyEvent {
     pub device: String,
-    pub address: String,
     pub key_id: String,
     pub activity: String,
     pub raw_adv: Vec<u8>,
@@ -252,7 +251,6 @@ impl Worker {
                 .unwrap_or(0);
             if let Err(e) = events.try_send(CopyEvent {
                 device: who.clone(),
-                address: addr.to_string(),
                 key_id: key_id.into(),
                 activity: activity.to_string(),
                 raw_adv,

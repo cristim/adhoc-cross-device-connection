@@ -87,12 +87,8 @@ pub async fn run_with_reporter(
                 let (host, port) = if let (Some(h), Some(p)) = (cfg.host.as_deref(), cfg.port) {
                     (h.to_string(), p)
                 } else {
-                    discover::resolve_preferred(
-                        cfg.instance.as_deref(),
-                        Some(&event.address),
-                        Duration::from_secs(10),
-                    )
-                    .await?
+                    discover::resolve_preferred(cfg.instance.as_deref(), Duration::from_secs(10))
+                        .await?
                 };
                 let mut session = companion_client::connect(
                     &host,

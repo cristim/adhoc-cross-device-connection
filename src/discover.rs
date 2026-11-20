@@ -55,7 +55,7 @@ pub async fn companion_link_target(host: &str, port: u16) -> Result<(String, u16
     if port != 0 {
         return Ok((host.into(), port));
     }
-    resolve_preferred(None, None, Duration::from_secs(10)).await
+    resolve_preferred(None, Duration::from_secs(10)).await
 }
 fn normalized_address(s: &str) -> String {
     s.chars()
@@ -64,17 +64,13 @@ fn normalized_address(s: &str) -> String {
         .collect()
 }
 /// Try LAN mDNS first (works without `awdl0`), then fall back to `awdl0` if present.
-pub async fn resolve_preferred(
-    instance: Option<&str>,
-    ble: Option<&str>,
-    timeout: Duration,
-) -> Result<(String, u16)> {
+pub async fn resolve_preferred(instance: Option<&str>, timeout: Duration) -> Result<(String, u16)> {
     let lan_budget = timeout.min(Duration::from_secs(4));
-    match resolve_on(None, instance, ble, lan_budget).await {
+    match resolve_on(None, instance, lan_budget).await {
         Ok(target) => Ok(target),
         Err(lan_err) => {
             if std::path::Path::new("/sys/class/net/awdl0").exists() {
-                resolve_on(Some("awdl0"), instance, ble, timeout).await
+                resolve_on(Some("awdl0"), instance, timeout).await
             } else {
                 Err(lan_err)
             }
@@ -83,33 +79,23 @@ pub async fn resolve_preferred(
 }
 
 /// Whether a resolved service is a pull target. An explicit `instance` wins;
-/// otherwise our own advertisement is never a target, and a published `rpBA`
-/// must match the BLE address that announced the copy. Another host's service
-/// named `ac-dc` is skipped too; select it with an explicit `instance`.
-fn service_matches(
-    fullname: &str,
-    observed_rpba: &str,
-    instance: Option<&str>,
-    ble: Option<&str>,
-) -> bool {
-    if let Some(want) = instance {
-        return fullname == want;
-    }
-    if fullname.strip_suffix(&format!(".{SERVICE}")) == Some(OWN_INSTANCE) {
-        return false;
-    }
-    match ble {
-        Some(addr) if !observed_rpba.is_empty() => {
-            normalized_address(observed_rpba) == normalized_address(addr)
-        }
-        _ => true,
+/// otherwise our own advertisement is never a target (another host's service
+/// named `ac-dc` is skipped too; select it with an explicit `instance`).
+///
+/// There is deliberately no BLE-address filter: the source address of a 0x0c
+/// advert does not reliably equal the `rpBA` the service publishes (it did not
+/// on a live Mac), so comparing them rejected the right device.
+/// Pair-Verify authenticates the peer.
+fn service_matches(fullname: &str, instance: Option<&str>) -> bool {
+    match instance {
+        Some(want) => fullname == want,
+        None => fullname.strip_suffix(&format!(".{SERVICE}")) != Some(OWN_INSTANCE),
     }
 }
 
 pub async fn resolve_on(
     iface: Option<&str>,
     instance: Option<&str>,
-    ble: Option<&str>,
     timeout: Duration,
 ) -> Result<(String, u16)> {
     if let Some(i) = iface {
@@ -130,8 +116,7 @@ pub async fn resolve_on(
             .await
             .context("companion-link discovery timed out")??;
         if let ServiceEvent::ServiceResolved(info) = evt {
-            let observed = info.get_property_val_str("rpBA").unwrap_or("");
-            if !service_matches(info.get_fullname(), observed, instance, ble) {
+            if !service_matches(info.get_fullname(), instance) {
                 continue;
             }
             let mut addrs: Vec<_> = info.get_addresses().iter().copied().collect();
@@ -251,44 +236,25 @@ mod tests {
     #[test]
     fn never_selects_our_own_advertisement() {
         // Our server publishes no rpBA when it has no BLE address, which the
-        // lenient filter used to accept: the pull then dialed itself and failed
+        // old lenient filter accepted: the pull then dialed itself and failed
         // Pair-Verify with "unknown peer signature".
-        assert!(!service_matches(OWN, "", None, None));
-        assert!(!service_matches(OWN, "", None, Some("02:11:22:33:44:55")));
-        assert!(service_matches(MAC, "", None, None));
+        assert!(!service_matches(OWN, None));
+        assert!(service_matches(MAC, None));
     }
 
     #[test]
-    fn instance_and_ble_filters_still_apply() {
-        assert!(service_matches(MAC, "", Some(MAC), None));
+    fn instance_selection() {
+        assert!(service_matches(MAC, Some(MAC)));
+        assert!(!service_matches(
+            MAC,
+            Some("other._companion-link._tcp.local.")
+        ));
         // An explicit instance beats the self-exclusion.
-        assert!(service_matches(OWN, "", Some(OWN), None));
-        // A service with no rpBA cannot be ruled out by the BLE filter.
-        assert!(service_matches(MAC, "", None, Some("02:11:22:33:44:55")));
+        assert!(service_matches(OWN, Some(OWN)));
         // Only the exact instance label is ours, not one that merely starts with it.
         assert!(service_matches(
             "ac-dc.lab._companion-link._tcp.local.",
-            "",
-            None,
             None
-        ));
-        assert!(!service_matches(
-            MAC,
-            "",
-            Some("other._companion-link._tcp.local."),
-            None
-        ));
-        assert!(service_matches(
-            MAC,
-            "02:11:22:33:44:55",
-            None,
-            Some("02-11-22-33-44-55")
-        ));
-        assert!(!service_matches(
-            MAC,
-            "aa:bb:cc:dd:ee:ff",
-            None,
-            Some("02:11:22:33:44:55")
         ));
     }
 }

@@ -20,7 +20,7 @@ breaking field change requires updating both repositories and their documentatio
 
 1. BlueZ supplies Handoff advertisements; parser/decryption identify copy hints.
 2. A bounded event channel connects scan to `auto`, which pulls one item at a time.
-3. Read radio state; match mDNS `rpBA` to the BLE event or use an explicit instance.
+3. Read radio state; pick the first non-self `_companion-link` service or use an explicit instance.
 4. Use a scoped IPv6 socket. Optional manual pull can fall back to fresh decoded
    management-frame SRV records for an explicitly selected AWDL peer.
 5. Pair-Verify must authenticate a known Ed25519 peer before content exchange.
@@ -56,8 +56,9 @@ without changing the desktop clipboard.
   against captures. Existing local tests establish internal consistency only.
 - Implement/validate the separate large-pasteboard transfer channel. Inline
   pasteboard handling does not cover Apple's bulk channel.
-- Validate `rpBA` correlation across Apple OS versions; explicit instance is the
-  current fallback. `rpAD` authentication is not implemented.
+- Choose among several Apple devices by trying candidates until Pair-Verify
+  verifies; today the first non-self service wins and `--instance` overrides it.
+  `rpAD` authentication is not implemented.
 - Validate Airdrop-compatible TLS/media capabilities and management-frame discoverability
   on a real Mac/iPhone; firmware service templates are not generated here.
 - Implement a genuine Universal Clipboard server before presenting reverse
