@@ -20,7 +20,7 @@ Which device does the Continuity key the Linux side broadcasts with belong to: t
 
 ## Linux setup (user present)
 
-On the Linux laptop, from a Wayland session with `wl-clipboard` installed and Bluetooth powered: `ac-dc -v auto`. With `-v` it logs, at debug level, the exact TXT record it publishes (identifying values replaced by their length) and, per copy, the advert's cleartext status byte, flags byte, counter and length. Ask the user to read those lines out if a result looks odd. A Linux copy broadcasts only when the clipboard is non-empty and was not just pulled from the Mac, and the advert lasts 20 seconds.
+On the Linux laptop, from a Wayland session with `wl-clipboard` installed and Bluetooth powered: `ac-dc -v auto`. Ask the user to confirm `echo $WAYLAND_DISPLAY` prints something non-empty in that same shell before starting it: if it's unset, `ac-dc` logs "skipping Linux -> Mac clipboard watcher" and keeps running without ever watching the clipboard, instead of exiting with an error. With `-v` it logs, at debug level, the exact TXT record it publishes (identifying values replaced by their length) and, per copy, the advert's cleartext status byte, flags byte, counter and length. Ask the user to read those lines out if a result looks odd. A Linux copy broadcasts only when the clipboard is non-empty and was not just pulled from the Mac, and the advert lasts 20 seconds.
 
 ## 1. Does the Mac see and dial the Linux Companion-Link server?
 
