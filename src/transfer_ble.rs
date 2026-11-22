@@ -12,7 +12,6 @@
 //! See the WIRE FORMAT block in `transfer.rs` for the exact handshake order and
 //! chunk layout. The macOS counterpart mirrors it.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -131,7 +130,8 @@ pub async fn receive_key(out: &Path) -> Result<()> {
     let plaintext = transfer::open(&key, &sealed)
         .context("decrypting received payload (bad tag: wrong code or tampering)")?;
 
-    write_0600(out, &plaintext).with_context(|| format!("writing {}", out.display()))?;
+    crate::keystore::write_private_atomic(out, &plaintext)
+        .with_context(|| format!("writing {}", out.display()))?;
     println!(
         "Wrote {} ({} bytes, mode 0600).",
         out.display(),
@@ -242,14 +242,4 @@ async fn confirm_match() -> Result<bool> {
     })
     .await
     .context("reading confirmation")?
-}
-
-/// Write `data` to `path`, creating it with mode 0600 (and tightening an
-/// existing file to 0600 as well).
-fn write_0600(path: &Path, data: &[u8]) -> Result<()> {
-    std::fs::write(path, data)?;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
 }

@@ -5,13 +5,19 @@ mod airdrop;
 mod clipboard_out;
 mod companion;
 mod companion_client;
+mod companion_server;
+mod contacts;
 mod daemon;
 mod discover;
 mod gcm;
 mod health;
+mod ipc;
 mod keystore;
 mod opack;
 mod orchestrate;
+mod pair_setup;
+mod pasteboard_archive;
+mod radio_daemon;
 mod scan;
 mod tlv8;
 mod transfer;
@@ -22,6 +28,16 @@ mod ui_widgets;
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
+
+#[derive(Debug, Subcommand)]
+enum ContactsAction {
+    /// Add a trusted Apple ID email or phone number.
+    Add { identifier: String },
+    /// Remove a trusted Apple ID email or phone number.
+    Remove { identifier: String },
+    /// List configured trusted senders.
+    List,
+}
 
 #[derive(Parser)]
 #[command(name = "ac-dc", version, about)]
@@ -35,8 +51,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Run the privileged local Airdrop-compatible protocol service.
+    /// Run the user-scoped Airdrop-compatible protocol service.
     Daemon {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Run the root-only AWDL radio broker (`/run/ac-dc/radio.sock`).
+    RadioDaemon {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -47,18 +68,32 @@ enum Cmd {
         host: Option<String>,
         #[arg(long)]
         port: Option<u16>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         directory: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         file: Vec<PathBuf>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         link: Vec<String>,
         #[arg(long)]
         seconds: Option<u64>,
         #[arg(long)]
         ble_wake: Option<bool>,
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long)]
+        once: bool,
+        #[arg(long)]
+        contacts_only: bool,
+        #[arg(long, default_value_t = 30)]
+        max_disk_percent: u8,
+        #[arg(long)]
+        copy_clipboard: Option<bool>,
+        /// Binds an `approve`/`reject` decision to the transfer id the
+        /// caller is currently displaying.
+        #[arg(long)]
+        id: Option<u64>,
     },
     /// Open the native Airdrop-compatible send/receive window.
     Ui,
@@ -85,9 +120,9 @@ enum Cmd {
     },
     /// Scan for and decrypt Handoff / Universal Clipboard BLE adverts.
     Scan {
-        /// Path to the key file exported from macOS (see macos/export-keys.sh).
-        #[arg(short, long, default_value = "keys.json")]
-        keys: PathBuf,
+        /// Path to the key file exported from macOS (defaults to ~/.local/share/ac-dc/keys.json).
+        #[arg(short, long)]
+        keys: Option<PathBuf>,
     },
     /// Capture raw Handoff adverts as hex (no keys needed), to grab a packet
     /// for validating the decrypt against your own devices.
@@ -109,6 +144,20 @@ enum Cmd {
         keys: Option<PathBuf>,
         #[arg(long)]
         identity: Option<PathBuf>,
+    },
+    /// Collect a diagnostic report or toggle persistent daemon debug logging.
+    Debug {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+    },
+    /// Manage trusted Apple IDs / phone numbers for Contacts Only mode.
+    Contacts {
+        #[command(subcommand)]
+        action: ContactsAction,
     },
     /// Report observed AWDL state; link readiness is not proof of transport.
     Status {
@@ -151,6 +200,15 @@ enum Cmd {
         /// Advertise a Bluetooth wake hint during receiving.
         #[arg(long)]
         ble_wake: bool,
+        /// Require Apple Contacts Only SenderRecordData.
+        #[arg(long)]
+        contacts_only: bool,
+        /// Maximum transfer size as percentage of free disk space (1..=90).
+        #[arg(long, default_value_t = 30)]
+        max_disk_percent: u8,
+        /// Copy received text, images, links, or saved paths to Wayland clipboard.
+        #[arg(long)]
+        copy_clipboard: Option<bool>,
     },
     /// Receive an exported `keys.json` from a Mac over Bluetooth LE.
     ///
@@ -159,61 +217,79 @@ enum Cmd {
     /// code (SAS) that you must compare before confirming. keys.json is written
     /// (mode 0600) only after you confirm the codes matched.
     ReceiveKey {
-        /// Where to write the received key file.
-        #[arg(short, long, default_value = "keys.json")]
-        out: PathBuf,
+        /// Where to write the received key file (defaults to ~/.local/share/ac-dc/keys.json).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Also auto-pair over Companion-Link LAN mDNS if `ids_device_id` is included.
+        #[arg(long, default_value_t = true, action = ArgAction::Set)]
+        auto_pair: bool,
     },
     /// Decrypt a single advertisement supplied as a hex string (offline test).
     Decrypt {
         #[arg(short, long)]
-        keys: PathBuf,
+        keys: Option<PathBuf>,
         /// Manufacturer data hex, e.g. "0c0e082a0099dead...".
         #[arg(short, long)]
         data: String,
     },
     /// Milestone 2: pull Universal Clipboard content over companion-link.
-    ///
-    /// Runs the transport-independent client: TCP connect, Pair-Verify M1-M4,
-    /// then the system-info and pasteboard-fetch exchanges. Until AWDL is up
-    /// (see docs/architecture.md) this will fail at `connect` against a real
-    /// device — that is expected. Use `--loopback` to exercise the full flow
-    /// against an in-process mock peer with no network.
     Pull {
-        /// Peer address. Normally supplied later by `discover` over awdl0.
-        #[arg(long, default_value = "127.0.0.1")]
+        /// Peer address; needs --port. Normally auto-discovered via mDNS.
+        #[arg(long, default_value = "127.0.0.1", requires = "port")]
         host: String,
-        /// Peer companion-link TCP port.
+        /// Peer companion-link TCP port (0 = auto-discover via LAN/AWDL mDNS).
         #[arg(long, default_value_t = 0)]
         port: u16,
-        /// BLE keystore path (kept for CLI parity; used as the identity source
-        /// if --identity is not given). See macos/export-keys.sh.
-        #[arg(short, long, default_value = "keys.json")]
-        keys: PathBuf,
-        /// RPIdentity keys (Ed25519 signing key + known peers) for Pair-Verify.
-        /// See macos/RPIDENTITY.md for the exporter and expected schema.
+        /// BLE keystore path (fallback if --identity is not given).
+        #[arg(short, long)]
+        keys: Option<PathBuf>,
+        /// RPIdentity keys (saved by `ac-dc pair`, defaults to ~/.local/share/ac-dc/rpidentity.json).
         #[arg(long)]
         identity: Option<PathBuf>,
         /// Run against an in-process loopback mock peer (no network, no keys).
         #[arg(long)]
         loopback: bool,
+        /// Use Transient Pair-Setup M1..M4 (`Flags=0x10`, `fixedPIN="public"`),
+        /// which requires no exported `RPIdentity` keypair.
+        #[arg(long)]
+        transient: bool,
         /// Fresh JSONL from awdlctl events, used if mDNS resolution fails.
         #[arg(long, requires = "peer_mac")]
         events: Option<PathBuf>,
         #[arg(long)]
         peer_mac: Option<String>,
     },
+    /// Pair with a companion-link peer via PairSetup (`_auTy=8 SessionPaired`, `pin="public"`)
+    /// and save `rpidentity.json`.
+    Pair {
+        #[arg(long, default_value = "127.0.0.1", requires = "port")]
+        host: String,
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        pin_file: Option<PathBuf>,
+        /// Client pairing UUID / IDS device UUID (defaults to `ids_device_id` from keys.json if present).
+        #[arg(long)]
+        pairing_id: Option<String>,
+    },
     /// Watch real BLE copy events and pull from the matching companion-link peer.
     Auto {
-        #[arg(long, default_value = "keys.json")]
-        keys: PathBuf,
-        /// Explicit mDNS instance; otherwise match the triggering BLE address to rpBA.
+        #[arg(long)]
+        keys: Option<PathBuf>,
+        /// Explicit mDNS instance; otherwise the first non-self companion-link service.
         #[arg(long)]
         instance: Option<String>,
+        #[arg(long, requires = "port")]
+        host: Option<String>,
+        #[arg(long, requires = "host")]
+        port: Option<u16>,
         #[arg(long)]
         notify: bool,
-        /// RPIdentity keys for Pair-Verify (real flow only).
-        #[arg(long, default_value = "keys.json")]
-        identity: PathBuf,
+        /// RPIdentity keys for Pair-Verify (defaults to ~/.local/share/ac-dc/rpidentity.json).
+        #[arg(long)]
+        identity: Option<PathBuf>,
         /// Drive the wiring against the in-process loopback mock (no AWDL).
         #[arg(long)]
         loopback: bool,
@@ -252,6 +328,10 @@ async fn command(cmd: Cmd) -> Result<()> {
         Cmd::Daemon { socket } => {
             daemon::run(socket.unwrap_or_else(daemon::default_socket)).await?
         }
+        Cmd::RadioDaemon { socket } => {
+            radio_daemon::run(socket.unwrap_or_else(|| PathBuf::from(radio_daemon::DEFAULT_SOCKET)))
+                .await?
+        }
         Cmd::Ctl {
             op,
             host,
@@ -262,23 +342,47 @@ async fn command(cmd: Cmd) -> Result<()> {
             link,
             seconds,
             ble_wake,
+            mode,
+            once,
+            contacts_only,
+            max_disk_percent,
+            copy_clipboard,
+            id,
         } => {
-            let reply = daemon::ctl(
-                daemon::default_socket(),
-                daemon::Request {
-                    op,
-                    host,
-                    port,
-                    name,
-                    directory,
-                    files: file,
-                    links: link,
-                    seconds,
-                    ble_wake,
-                },
-            )
-            .await?;
-            println!("{}", serde_json::to_string(&reply)?);
+            if op == "subscribe" {
+                daemon::ctl_subscribe(daemon::default_socket()).await?;
+            } else {
+                let parsed_mode = match mode.as_deref() {
+                    Some("timed") => Some(ipc::ReceiveMode::Timed),
+                    Some("once") => Some(ipc::ReceiveMode::Once),
+                    Some("always") => Some(ipc::ReceiveMode::Always),
+                    Some(other) => anyhow::bail!("unknown receive mode: {other}"),
+                    None => None,
+                };
+                let reply = daemon::ctl(
+                    daemon::default_socket(),
+                    daemon::Request {
+                        op,
+                        host,
+                        port,
+                        name,
+                        directory,
+                        files: file,
+                        links: link,
+                        seconds,
+                        ble_wake,
+                        mode: parsed_mode,
+                        once: once.then_some(true),
+                        contacts_only: contacts_only.then_some(true),
+                        max_disk_percent: Some(max_disk_percent),
+                        copy_to_clipboard: copy_clipboard,
+                        clipboard: None,
+                        id,
+                    },
+                )
+                .await?;
+                println!("{}", serde_json::to_string(&reply)?);
+            }
         }
         Cmd::Peers {
             iface,
@@ -316,6 +420,9 @@ async fn command(cmd: Cmd) -> Result<()> {
             once,
             notify,
             ble_wake,
+            contacts_only,
+            max_disk_percent,
+            copy_clipboard,
         } => {
             airdrop::run(airdrop::Config {
                 radio_managed: false,
@@ -330,8 +437,42 @@ async fn command(cmd: Cmd) -> Result<()> {
                 once,
                 notify,
                 open_destination: true,
+                visibility: if contacts_only {
+                    airdrop::VisibilityMode::ContactsOnly
+                } else {
+                    airdrop::VisibilityMode::Everyone
+                },
+                max_disk_percent,
+                copy_to_clipboard: copy_clipboard.unwrap_or(true),
             })
             .await?;
+        }
+        Cmd::Contacts { action } => {
+            let path = contacts::default_path();
+            let mut store = contacts::TrustedSenders::load(&path)?;
+            match action {
+                ContactsAction::Add { identifier } => {
+                    if store.add(&identifier)? {
+                        store.save(&path)?;
+                        println!("Added trusted sender.");
+                    } else {
+                        println!("Sender already in trusted list.");
+                    }
+                }
+                ContactsAction::Remove { identifier } => {
+                    if store.remove(&identifier)? {
+                        store.save(&path)?;
+                        println!("Removed trusted sender.");
+                    } else {
+                        println!("Sender not found in trusted list.");
+                    }
+                }
+                ContactsAction::List => {
+                    for entry in store.list() {
+                        println!("{entry}");
+                    }
+                }
+            }
         }
         Cmd::Doctor {
             json,
@@ -347,6 +488,26 @@ async fn command(cmd: Cmd) -> Result<()> {
                     serde_json::to_string_pretty(&report)?
                 }
             );
+        }
+        Cmd::Debug {
+            json,
+            enable,
+            disable,
+        } => {
+            if enable || disable {
+                health::set_daemon_debug(enable)?;
+                println!(
+                    "{}",
+                    if enable {
+                        "Debug logging enabled for ac-dc-daemon.service."
+                    } else {
+                        "Debug logging disabled for ac-dc-daemon.service."
+                    }
+                );
+            } else {
+                let report = health::debug_report(&daemon::default_socket()).await;
+                print!("{}", health::format_debug_report(&report, json)?);
+            }
         }
         Cmd::Status { json } => {
             let report = health::radio().await?;
@@ -373,6 +534,7 @@ async fn command(cmd: Cmd) -> Result<()> {
             advertise::broadcast(data, seconds, interval_ms).await?;
         }
         Cmd::Scan { keys } => {
+            let keys = keystore::resolve_path(keys, keystore::default_keys_path(), "keys.json");
             let store = keystore::KeyStore::load(&keys)?;
             if store.is_empty() {
                 tracing::warn!("no keys loaded; adverts will be detected but not decrypted");
@@ -398,13 +560,53 @@ async fn command(cmd: Cmd) -> Result<()> {
                 _ = shutdown() => tracing::info!("stopping"),
             }
         }
-        Cmd::ReceiveKey { out } => {
+        Cmd::ReceiveKey { out, auto_pair } => {
+            let out = out.unwrap_or_else(keystore::default_keys_path);
             tokio::select! {
                 r = transfer_ble::receive_key(&out) => r?,
-                _ = shutdown() => tracing::info!("stopping"),
+                _ = shutdown() => {
+                    tracing::info!("stopping");
+                    return Ok(());
+                }
+            }
+            if auto_pair {
+                if let Ok(store) = keystore::KeyStore::load(&out) {
+                    if let Some(ids_id) = store.ids_device_id {
+                        let rp_out = keystore::default_rpidentity_path();
+                        println!("Auto-pairing over Companion-Link using IDS device {ids_id}...");
+                        let paired = async {
+                            let (host, port) =
+                                discover::companion_link_target("127.0.0.1", 0).await?;
+                            let addr = discover::socket_target(&host, port).await?;
+                            let stream = tokio::net::TcpStream::connect(addr).await?;
+                            stream.set_nodelay(true).ok();
+                            pair_setup::run_pair_setup(stream, Some(&ids_id), || async {
+                                Ok("public".to_string())
+                            })
+                            .await
+                        }
+                        .await;
+                        let paired = keys_saved_context(paired, &out)?;
+                        pair_setup::write_identity_json(&rp_out, &paired)?;
+                        println!(
+                            "Paired with '{}' and saved {}",
+                            paired.label,
+                            rp_out.display()
+                        );
+                        println!(
+                            "{}",
+                            request_clipboard_start(daemon::default_socket()).await
+                        );
+                    } else {
+                        println!(
+                            "Next step: run `ac-dc pair --pairing-id <Mac-or-iPhone-IDS-UUID>`"
+                        );
+                    }
+                }
             }
         }
         Cmd::Decrypt { keys, data } => {
+            let keys = keystore::resolve_path(keys, keystore::default_keys_path(), "keys.json");
             let store = keystore::KeyStore::load(&keys)?;
             let bytes = hex::decode(data.trim())?;
             let ble = advert::HandoffBle::parse(&bytes)
@@ -442,6 +644,7 @@ async fn command(cmd: Cmd) -> Result<()> {
             keys,
             identity,
             loopback,
+            transient,
             events,
             peer_mac,
         } => {
@@ -453,9 +656,6 @@ async fn command(cmd: Cmd) -> Result<()> {
                 return Ok(());
             }
 
-            // Once awdl0 is up, `companion_link_target` resolves
-            // `_companion-link._tcp` scoped to it (a non-zero --port is still a
-            // manual override). See src/discover.rs and docs/architecture.md §4.
             let (host, port) = match discover::companion_link_target(&host, port).await {
                 Ok(target) => target,
                 Err(e) => {
@@ -476,12 +676,25 @@ async fn command(cmd: Cmd) -> Result<()> {
                 }
             };
 
-            // Pair-Verify uses a separate RPIdentity export, not the BLE key schema.
-            let identity_path = identity.unwrap_or(keys);
-            let ident = companion::PairingIdentity::load(&identity_path)?;
-
-            tracing::info!(%host, port, "connecting companion-link (expected to fail without AWDL)");
-            let mut session = companion_client::connect(&host, port, ident).await?;
+            let mut session = if transient {
+                tracing::info!(%host, port, "connecting companion-link with Transient Pair-Setup (fixedPIN=\"public\")");
+                companion_client::connect_transient(&host, port, "public").await?
+            } else {
+                let rpidentity = keystore::resolve_path(
+                    None,
+                    keystore::default_rpidentity_path(),
+                    "rpidentity.json",
+                );
+                let keys = keystore::resolve_path(keys, keystore::default_keys_path(), "keys.json");
+                match load_pull_identity(identity, rpidentity, keys)? {
+                    Some(ident) => {
+                        tracing::info!(%host, port, "connecting companion-link with Pair-Verify");
+                        companion_client::connect(&host, port, ident).await?
+                    }
+                    None => companion_client::connect_transient(&host, port, "public").await?,
+                }
+            };
+            tracing::info!(peer = ?session.peer_label(), "Pair-Verify authenticated");
             let peer = session
                 .system_info_exchange(&companion_client::SystemInfo {
                     name: "ac-dc (Linux)".into(),
@@ -493,17 +706,88 @@ async fn command(cmd: Cmd) -> Result<()> {
             print_pasteboard(&peer, &board);
             land_on_clipboard(&board);
         }
+        Cmd::Pair {
+            host,
+            port,
+            out,
+            pin_file,
+            pairing_id,
+        } => {
+            let out = out.unwrap_or_else(keystore::default_rpidentity_path);
+            let pairing_id = pairing_id.or_else(|| {
+                let kp = keystore::resolve_path(None, keystore::default_keys_path(), "keys.json");
+                keystore::KeyStore::load(&kp)
+                    .ok()
+                    .and_then(|s| s.ids_device_id)
+            });
+            if pairing_id.is_none() {
+                tracing::warn!(
+                    "no --pairing-id supplied and keys.json has no ids_device_id; \
+                     Mac sharingd may reject clipboard pulls with -6708 unless the UUID is in IDSService.devices"
+                );
+            }
+            let (host, port) = discover::companion_link_target(&host, port).await?;
+            let addr = discover::socket_target(&host, port).await?;
+            let stream = tokio::net::TcpStream::connect(addr).await?;
+            stream.set_nodelay(true).ok();
+            let paired =
+                pair_setup::run_pair_setup(stream, pairing_id.as_deref(), || async move {
+                    if let Some(pf) = pin_file {
+                        tracing::info!(path = %pf.display(), "PairSetup M2 received; waiting for PIN file");
+                        let deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                        loop {
+                            if let Ok(text) = tokio::fs::read_to_string(&pf).await {
+                                let t = text.trim().to_string();
+                                if !t.is_empty() {
+                                    return Ok(t);
+                                }
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                anyhow::bail!("timed out waiting for PIN file {}", pf.display());
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                    } else {
+                        Ok("public".to_string())
+                    }
+                })
+                .await?;
+            pair_setup::write_identity_json(&out, &paired)?;
+            println!(
+                "Paired with '{}' (pairing_id={}) and saved {}",
+                paired.label,
+                paired.pairing_id,
+                out.display()
+            );
+            if out == keystore::default_rpidentity_path() {
+                println!(
+                    "{}",
+                    request_clipboard_start(daemon::default_socket()).await
+                );
+            }
+        }
         Cmd::Auto {
             keys,
             identity,
             instance,
+            host,
+            port,
             loopback,
             notify,
         } => {
+            let keys = keystore::resolve_path(keys, keystore::default_keys_path(), "keys.json");
+            let identity = keystore::resolve_path(
+                identity,
+                keystore::default_rpidentity_path(),
+                "rpidentity.json",
+            );
             orchestrate::run(orchestrate::AutoConfig {
                 keys,
                 identity_path: identity,
                 instance,
+                host,
+                port,
                 loopback,
                 notify,
             })
@@ -511,6 +795,46 @@ async fn command(cmd: Cmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The Pair-Verify identity for `pull`. Only when no identity was asked for and
+/// no `rpidentity.json` exists is it `None` (Transient Pair-Setup); a requested
+/// or existing identity that cannot be loaded is an error, never a silent
+/// downgrade to the public PIN, which authenticates no peer.
+fn load_pull_identity(
+    explicit: Option<PathBuf>,
+    rpidentity: PathBuf,
+    keys: PathBuf,
+) -> Result<Option<companion::PairingIdentity>> {
+    let strict = explicit.is_some() || rpidentity.exists();
+    let path = explicit.unwrap_or(if strict { rpidentity } else { keys });
+    match companion::PairingIdentity::load(&path) {
+        Ok(ident) => Ok(Some(ident)),
+        Err(e) if strict => Err(e.context(format!("load RPIdentity {}", path.display()))),
+        Err(e) => {
+            tracing::warn!(error = %e, "no RPIdentity found; falling back to Transient Pair-Setup (fixedPIN=\"public\")");
+            Ok(None)
+        }
+    }
+}
+
+/// Say how to finish pairing when the keys were already written but pairing failed.
+fn keys_saved_context<T>(result: Result<T>, keys: &std::path::Path) -> Result<T> {
+    use anyhow::Context;
+    result.with_context(|| format!("keys saved to {}; retry with `ac-dc pair`", keys.display()))
+}
+
+/// Tell the running daemon that credentials now exist: it checks them only
+/// when asked, so without this clipboard sync stays `unpaired` until restart.
+/// An unreachable daemon is not an error; it picks the keys up on its next start.
+async fn request_clipboard_start(socket: PathBuf) -> String {
+    match daemon::ctl(socket, daemon::request("clipboard_start")).await {
+        Ok(reply) if reply.ok => format!("clipboard sync: {}", reply.message),
+        Ok(reply) => format!("clipboard sync not started: {}", reply.message),
+        Err(e) => {
+            format!("clipboard sync not started ({e:#}); the daemon starts it on its next launch")
+        }
+    }
 }
 
 /// Put a successfully fetched pasteboard on the Wayland clipboard via
@@ -555,4 +879,135 @@ async fn shutdown() {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("SIGTERM handler");
     tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("ac-dc").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn host_without_port_is_rejected() {
+        assert!(parse(&["pull", "--host", "mac.local"]).is_err());
+        assert!(parse(&["pair", "--host", "mac.local"]).is_err());
+        assert!(parse(&["pull", "--host", "mac.local", "--port", "49152"]).is_ok());
+        assert!(parse(&["pair", "--host", "mac.local", "--port", "49152"]).is_ok());
+        assert!(parse(&["pull"]).is_ok());
+        assert!(parse(&["pair"]).is_ok());
+    }
+
+    #[test]
+    fn auto_endpoint_override_needs_both_host_and_port() {
+        assert!(parse(&["auto", "--port", "1234"]).is_err());
+        assert!(parse(&["auto", "--host", "mac.local"]).is_err());
+        assert!(parse(&["auto", "--host", "mac.local", "--port", "1234"]).is_ok());
+        assert!(parse(&["auto"]).is_ok());
+    }
+
+    #[test]
+    fn receive_key_auto_pair_can_be_turned_off() {
+        let auto_pair = |args: &[&str]| match parse(args).unwrap().cmd {
+            Cmd::ReceiveKey { auto_pair, .. } => auto_pair,
+            _ => unreachable!(),
+        };
+        assert!(auto_pair(&["receive-key"]));
+        assert!(!auto_pair(&["receive-key", "--auto-pair=false"]));
+    }
+
+    const IDENTITY: &str = r#"{"ed_sk":"0101010101010101010101010101010101010101010101010101010101010101","peers":[]}"#;
+
+    #[test]
+    fn explicit_unreadable_identity_never_downgrades_to_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.json");
+        let err = load_pull_identity(
+            Some(missing.clone()),
+            dir.path().join("rpidentity.json"),
+            dir.path().join("keys.json"),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("missing.json"));
+
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "not json").unwrap();
+        assert!(
+            load_pull_identity(Some(bad), dir.path().join("rp"), dir.path().join("k")).is_err()
+        );
+    }
+
+    #[test]
+    fn corrupt_default_identity_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let rp = dir.path().join("rpidentity.json");
+        std::fs::write(&rp, "not json").unwrap();
+        assert!(load_pull_identity(None, rp, dir.path().join("keys.json")).is_err());
+    }
+
+    #[test]
+    fn transient_only_when_no_identity_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys.json");
+        std::fs::write(&keys, r#"{"keys":[]}"#).unwrap();
+        let rp = dir.path().join("rpidentity.json");
+        assert!(load_pull_identity(None, rp.clone(), keys.clone())
+            .unwrap()
+            .is_none());
+        std::fs::write(&rp, IDENTITY).unwrap();
+        assert!(load_pull_identity(None, rp.clone(), keys.clone())
+            .unwrap()
+            .is_some());
+        assert!(load_pull_identity(Some(rp), dir.path().join("x"), keys)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn failed_auto_pair_says_how_to_finish() {
+        let failed: Result<()> = Err(anyhow::anyhow!("companion-link discovery timed out"));
+        let err = keys_saved_context(failed, std::path::Path::new("/k/keys.json")).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("/k/keys.json") && text.contains("ac-dc pair"));
+        assert!(text.contains("discovery timed out"));
+    }
+
+    #[tokio::test]
+    async fn pairing_tells_the_running_daemon_to_start_clipboard_sync() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(read).read_line(&mut line).await.unwrap();
+            let reply = r#"{"ok":true,"state":"idle","message":"clipboard sync started"}"#;
+            write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            line
+        });
+        let said = request_clipboard_start(socket).await;
+        let request: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+        assert_eq!(request["op"], "clipboard_start");
+        assert_eq!(said, "clipboard sync: clipboard sync started");
+    }
+
+    #[tokio::test]
+    async fn unreachable_daemon_is_reported_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let said = request_clipboard_start(dir.path().join("absent.sock")).await;
+        assert!(said.starts_with("clipboard sync not started"));
+    }
 }
